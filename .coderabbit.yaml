@@ -1,0 +1,71 @@
+# CodeRabbit AI code review.
+#
+# NOTE: this file only CONFIGURES the bot. CodeRabbit is a GitHub App, not a workflow — install it on
+# the repo once (https://github.com/apps/coderabbitai) and it will review every PR automatically.
+#
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill                 # "assertive" if you want more nitpicks
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: false
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches: ["main"]
+
+  path_filters:
+    - "!uv.lock"                 # 500KB lockfile — no signal
+    - "!data/**"                 # regenerable datasets (gitignored anyway)
+    - "!logs/**"
+    - "!tests/data/**"           # captured TDX quote + Intel collateral fixtures, not human-reviewable
+
+  # Repo-specific review focus. This subnet's security rests on attestation + fail-closed scoring, so
+  # steer the bot at the ways a change could quietly weaken it.
+  path_instructions:
+    - path: "src/thirtyspokes/koth/{verify,tdx,rtmr,collateral}.py"
+      instructions: >-
+        Attestation + proof-verification path. Treat ANY change that makes verification more permissive
+        as a critical finding: skipping or short-circuiting the MRTD / RTMR1-3 measurement gate, accepting
+        a quote without the full DCAP chain (Intel SGX Root CA, TCB status, CRL, QE identity), loosening
+        the report_data binding, or turning a fail-closed path into fail-open. Verification must reject on
+        missing/unset gates, never silently accept.
+
+    - path: "src/thirtyspokes/koth/neuron.py"
+      instructions: >-
+        Validator daemon. `--insecure` disables the entire security model (mock TEE accepted, measured-image
+        gate skipped) and MUST keep hard-failing on mainnet networks (see MAINNET_NETWORKS). Flag any change
+        that removes that guard, widens it, or re-defaults `--network` away from mainnet.
+
+    - path: "src/thirtyspokes/koth/{validator,evidence,verify}.py"
+      instructions: >-
+        Scoring + incentive logic. Flag anything a miner could exploit to inflate its score: best-of-N
+        grinding (the commit-window binding), withholding bad epochs (the miss=0 rule), copy-mining
+        (behavioral dedup + earliest-commit seniority), or dethroning by regression (the Pareto guard).
+        Scores must be reproducible across independent validators — flag nondeterminism.
+
+    - path: "src/thirtyspokes/koth/confine.py"
+      instructions: >-
+        No-egress sandbox for untrusted miner agent code. Flag anything that could give the agent network
+        access, leak the pool API key or wallet into the child, or let it escape the namespace. The agent's
+        only channel must remain the metered call_model IPC.
+
+    - path: "{Dockerfile,docker-compose.yml,.env.example}"
+      instructions: >-
+        Flag any secret baked into the image or build context, over-broad env injection into the container
+        (only OPENROUTER_API_KEY and HF_TOKEN belong there), or a change that would cause .env to be
+        committed or copied into an image.
+
+    - path: ".github/workflows/**"
+      instructions: >-
+        Flag secrets exposed to fork PRs, unpinned third-party actions, and any workflow granting more
+        permissions than it needs (the Docker publish job needs only contents:read + packages:write).
+
+chat:
+  auto_reply: true

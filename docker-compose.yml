@@ -1,0 +1,48 @@
+# ThirtySpokes KOTH validator. Quickstart:
+#   cp .env.example .env          # set HF_TOKEN, NETUID, VALIDATOR_WALLET (no LLM key needed)
+#   docker compose up -d --build
+#
+# The validator is verify-only (no GPU / no CVM). Its wallet hotkey signs set_weights, so your
+# ~/.bittensor is mounted in; reign standings persist across restarts. It runs fail-closed on mainnet:
+# a proof is scored only if its hardware quote matches the owner's pinned measured image.
+# See docs/VALIDATOR.md.
+
+services:
+  validator:
+    build: .
+    image: thirtyspokes-validator:latest
+    container_name: thirtyspokes-validator
+    restart: unless-stopped
+    # The daemon finishes any active atomic score/save/weight step after SIGTERM. Chain RPCs are
+    # bounded to 20s, so this prevents an orchestrator SIGKILL in the middle of that recovery path.
+    stop_grace_period: 30s
+    environment:                            # explicit allow-list from .env; no ambient secrets
+      # OPTIONAL: a grounding-mode validator does ZERO inference and needs no LLM key.
+      # Only the opt-in --audit-mode probe uses this (and bills you for miner inference).
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Official publisher: owner token writes standings.json to the Thirty Spokes org.
+      # Prefer a fine-grained token scoped to that repo/org.
+      OWNER_HF_TOKEN: ${OWNER_HF_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-}               # compatibility / gated datasets
+      TAO_USD: ${TAO_USD:-}                 # optional; enables real $/hr dashboard columns
+    volumes:
+      - ${HOME}/.bittensor:/root/.bittensor        # wallet — holds the hotkey that signs set_weights
+      - validator-state:/state                     # reign + king baseline survive restarts
+      # opt-in secret memorization probe (see --probe-bank below):
+      # - ${PROBE_BANK_FILE:-/dev/null}:/secrets/probe_bank.json:ro
+    command:
+      - --netuid=${NETUID:?set NETUID in .env}
+      - --wallet=${VALIDATOR_WALLET:?set VALIDATOR_WALLET in .env}
+      - --hotkey=${VALIDATOR_HOTKEY:-default}
+      - --network=${NETWORK:-finney}               # mainnet
+      - --state=/state/koth_validator_state.json
+      - --standings-repo=${STANDINGS_REPO:-}        # e.g. thirtyspokes/standings; blank disables
+      # --- optional (uncomment to enable) -----------------------------------------------------------
+      # anti-grind (F7) + grace (F2) windows — opt-in; calibrate first (docs/VALIDATOR.md):
+      # - --commit-window=${COMMIT_WINDOW:-8}
+      # - --grace-blocks=${GRACE_BLOCKS:-40}
+      # secret memorization probe bank (also mount PROBE_BANK_FILE above):
+      # - --probe-bank=/secrets/probe_bank.json
+
+volumes:
+  validator-state:

@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Secrets & credentials — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_rsa
+id_ed25519*
+.bittensor/
+wallets/
+
+# Data & run outputs (regenerable — see README / docs).
+# Root-anchored (leading /) so tests/data/ CI fixtures still ship.
+/data/
+/logs/
+*.npz
+
+# OS
+.DS_Store

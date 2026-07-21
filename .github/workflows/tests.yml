@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: pip install --no-cache-dir uv
+
+      # dev = pytest + math_verify (required by the unconditional MATH grader tests); tee =
+      # cryptography + dcap-qvl (unlocks full DCAP quote-verification coverage). Dataset clients stay
+      # in the optional eval extra so this offline suite never depends on a live dataset download.
+      - name: Install package + test deps
+        run: uv pip install --system --no-cache -e ".[dev,tee]"
+
+      - name: Run test suite
+        run: pytest -q

@@ -1,0 +1,53 @@
+[project]
+name = "thirtyspokes"
+version = "0.0.1"
+description = "ThirtySpokes — Phase 0 offline prototype for a TinyRouter-style LLM-routing Bittensor subnet"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Everything required by the unconditional offline test suite. Keep network-backed dataset clients
+# in `eval`; the two MATH grader regressions still require math_verify in a clean test environment.
+dev = ["pytest>=8.0", "math_verify>=0.5"]
+# Optional real-LLM outcome backends (offline runs work without these)
+llm = ["httpx>=0.27", "openai>=1.40"]
+# Live Bittensor chain integration (offline simulator works without it)
+chain = ["bittensor>=8.0", "huggingface_hub>=0.24"]
+# Metered-gateway linchpin: ed25519 receipt signing
+gateway = ["cryptography>=42.0"]
+# Real Intel-TDX attestation: pure-Python DCAP cert-chain (cryptography) + full DCAP
+# quote verification incl. TCB status / CRL / QE-identity (dcap-qvl, Phala's Rust+PyO3 QVL)
+tee = ["cryptography>=42.0", "dcap-qvl>=0.5"]
+# Live evaluation: OpenRouter client + real task datasets (GSM8K, SWE-bench Pro),
+# math_verify for robust MATH-500 grading, math_verify pulls sympy
+eval = ["cryptography>=42.0", "openai>=1.40", "datasets>=2.14", "math_verify>=0.5", "dcap-qvl>=0.5"]
+
+[project.scripts]
+thirtyspokes = "thirtyspokes.cli:main"
+orchestra-sim = "thirtyspokes.subnet.simulate:main"
+orchestra2-sim = "thirtyspokes.gateway.subnet:main"
+orchestra-tee-sim = "thirtyspokes.tee.subnet:main"
+orchestra-koth-sim = "thirtyspokes.koth.subnet:main"
+orchestra-koth-local = "thirtyspokes.koth.neuron:main"
+orchestra-koth-miner = "thirtyspokes.koth.miner:main"
+orchestra-koth-gcp-miner = "thirtyspokes.koth.gcp_operator:main"
+orchestra-koth-validator = "thirtyspokes.koth.neuron:validator_main"
+orchestra-koth-dev = "thirtyspokes.koth.devkit:main"
+orchestra-koth-owner = "thirtyspokes.koth.owner:main"
+orchestra-miner = "thirtyspokes.subnet.miner:main"
+orchestra-validator = "thirtyspokes.subnet.validator:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/thirtyspokes"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

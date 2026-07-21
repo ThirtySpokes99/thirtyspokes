@@ -1,0 +1,11 @@
+# Keep secrets, local state, and bulk out of the build context.
+.env
+.env.*
+!.env.example
+.venv/
+data/
+logs/
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc

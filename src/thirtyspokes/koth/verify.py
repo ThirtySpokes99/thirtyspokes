@@ -8,7 +8,7 @@ Cheap and re-execution-free. `verify_proof`:
   2. re-derives the SAME nonce-seeded task slice the runtime ran, so it knows the
      public gold for every task without re-running the agent;
   3. grades the attested answers (missing/substituted tasks count as wrong) and
-     returns per-benchmark accuracy + a bootstrap lower confidence bound and the
+     returns per-benchmark accuracy + a Wilson lower confidence bound and the
      reign scalar `Q_lcb = Σ_b w_b·lcb_b`. Cost is NOT folded into the score — it is
      a budget ceiling applied separately by `eligible`.
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from math import sqrt
+from statistics import NormalDist
 
 import numpy as np
 
@@ -33,6 +34,7 @@ from ..gateway import signing
 from ..gateway.grader import extract_number
 from ..tee.attestation import verify_quote
 from .benchmarks import Benchmark, bench_seed, extract_choice, grade_choice, grade_patch
+from .evidence import wilson_lcb
 from .proof import Proof
 from .store import hash_source
 
@@ -41,7 +43,7 @@ from .store import hash_source
 class BenchStat:
     n: int
     acc: float          # point accuracy over the assigned slice
-    lcb: float          # bootstrap lower confidence bound (noise can't dethrone)
+    lcb: float          # Wilson lower confidence bound (noise can't dethrone)
     cost_usd: float
 
 
@@ -57,12 +59,23 @@ class ProofVerdict:
 
 
 def _bootstrap_lcb(correct: list[float], alpha: float, boot: int, seed: int) -> float:
-    x = np.asarray(correct, dtype=float)
-    if x.size == 0:
+    """Lower confidence bound on the slice accuracy. Wilson, NOT the resampling bootstrap.
+
+    The bootstrap is DEGENERATE on the all-same slices that matter most here: resampling 8 identical
+    values yields 8 identical means, so a perfect 8/8 slice reported `lcb = 1.000` — zero claimed
+    uncertainty from eight questions. That defeated the entire premise of scoring on the lower bound
+    (`dethrone_guard` then cleared `lcb_c > acc_king + margin` against ANY king below 0.97), making
+    "resubmit every epoch until a slice comes up perfect" a free lottery ticket for the crown.
+    Wilson is exact on the same counts and correctly prices small samples: 8/8 -> 0.747, and it is
+    already what the accumulate path uses (`evidence.wilson_lcb`), so the two modes now agree.
+
+    `boot` is retained for call compatibility and unused; `seed` likewise (Wilson is deterministic,
+    which is a bonus — two validators no longer depend on drawing the same resamples).
+    """
+    if not correct:
         return 0.0
-    rng = np.random.default_rng(seed)
-    means = x[rng.integers(0, x.size, size=(boot, x.size))].mean(axis=1)
-    return float(np.quantile(means, alpha))
+    z = NormalDist().inv_cdf(1.0 - alpha)        # one-sided, matching the accumulate path
+    return wilson_lcb(float(np.sum(correct)), float(len(correct)), z)
 
 
 def verify_proof(

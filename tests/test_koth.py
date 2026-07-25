@@ -58,7 +58,9 @@ def _verify(env, proof, artifact, hotkey, **over):
 def test_valid_proof_verifies_and_scores(env):
     a = _art(_ROUTER_SRC, env.allk)
     v = _verify(env, _proof(env, a, "hk"), a, "hk")
-    assert v.valid and v.score > 0.9
+    # A perfect slice must NOT certify Q_lcb = 1.0: eight questions cannot rule out a worse true
+    # accuracy, and claiming they can is what made a lucky slice able to dethrone anyone.
+    assert v.valid and 0.7 < v.score < 1.0
     assert all(bs.acc == 1.0 for bs in v.per_bench.values())
 
 
@@ -206,6 +208,93 @@ def test_proof_json_roundtrip_preserves_binding(env):
     assert _verify(env, back, a, "hk").valid                 # downloaded proof still verifies
 
 
+def test_freeloader_that_stops_mining_earns_nothing_end_to_end(env):
+    """END-TO-END emission-capture regression, through the real validator (verify_proof -> grounding
+    -> dedup -> eligibility -> KingChain -> set_weights).
+
+    Measured before the fix: a miner running the CHEAPEST pool model took the vacant crown in one
+    epoch, went permanently dark, and still captured 54% of emissions over 12 epochs — out-earning
+    the honest miner that worked every single epoch. The validator recorded `no_proof` for it every
+    epoch and paid it anyway, because payout read seat membership rather than work.
+    """
+    import json
+    import tempfile
+
+    from thirtyspokes.gateway.signing import Signer
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS, current_epoch
+    from thirtyspokes.koth.miner import KOTHMinerNeuron
+    from thirtyspokes.koth.neuron import store_get_proof
+    from thirtyspokes.koth.pool import MockPool
+    from thirtyspokes.koth.runtime import runtime_measurement
+    from thirtyspokes.koth.store import LocalBundleStore
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    from thirtyspokes.subnet.chain import LocalFileChain
+
+    root = tempfile.mkdtemp()
+    chain = LocalFileChain(f"{root}/chain"); store = LocalBundleStore(f"{root}/store")
+    chain.register("burn")
+    relay = ("import json\ndef build_agent(w):\n m=json.loads(w.decode())['model']\n"
+             " def agent(p,cm):\n  return cm(m,[{'role':'user','content':p}],{'max_tokens':16})\n return agent\n")
+    art = lambda m: Artifact(relay, json.dumps({"model": m}).encode(), m)  # noqa: E731
+    val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain, KingChain(),
+                        env.suite, store, MockPool(), n_per_bench=8, budget_per_task=1.0, f_min=0.0)
+    mk = lambda m, r: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
+                                      chain, store, art(m), r)
+    freeloader, honest = mk("cheap", "f/repo"), mk("strong", "h/repo")
+    for m in (freeloader, honest):
+        m.publish()
+    gp = store_get_proof(store)
+
+    earned = {freeloader.hotkey: 0.0, honest.hotkey: 0.0}
+    for i in range(12):
+        chain.advance(EPOCH_BLOCKS)
+        e = current_epoch(chain)
+        for m in ([freeloader] if i == 0 else [honest]):     # freeloader mines ONCE, then goes dark
+            m.run_once(e)
+        rep = val.run_epoch(gp)
+        uid_hk = chain.hotkeys()
+        for uid, w in rep.weights_by_uid.items():
+            hk = uid_hk.get(uid, "")
+            if hk in earned:
+                earned[hk] += w
+
+    assert earned[freeloader.hotkey] <= 1.0, "one mined epoch must not pay out for eleven idle ones"
+    assert earned[honest.hotkey] > earned[freeloader.hotkey] * 5, \
+        "the miner doing the work must dominate the one that quit"
+    assert val.reign.king.sub.hotkey == honest.hotkey
+
+
+def test_epoch_with_no_submissions_burns_instead_of_freezing_weights(env):
+    """If nobody submits, the validator must still settle the epoch and BURN.
+
+    It used to skip `set_weights` entirely when there was nothing to score, leaving the previous
+    slate standing on-chain — so a network where every miner stopped kept paying its last five
+    miners in full, forever, for producing nothing."""
+    import tempfile
+
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    from thirtyspokes.koth.neuron import store_get_proof
+    from thirtyspokes.koth.pool import MockPool
+    from thirtyspokes.koth.runtime import runtime_measurement
+    from thirtyspokes.koth.store import LocalBundleStore
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    from thirtyspokes.subnet.chain import LocalFileChain
+
+    root = tempfile.mkdtemp()
+    chain = LocalFileChain(f"{root}/chain"); store = LocalBundleStore(f"{root}/store")
+    chain.register("burn")
+    val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain, KingChain(),
+                        env.suite, store, MockPool(), n_per_bench=8)
+    chain.advance(EPOCH_BLOCKS)
+    rep = val.run_epoch(store_get_proof(store))              # no miners committed at all
+    assert rep.weights_by_uid == {0: 1.0}, "an empty epoch must burn to uid 0"
+    # it must actually reach the chain — the bug was that set_weights was skipped entirely
+    assert val._last_submitted_weights == {0: 1.0}
+    assert chain._load()["weights"] == {"0": 1.0}
+
+
 def test_decoupled_neuron_flow_scores_via_store():
     """Miner uploads proof to its repo; validator downloads from the chain+store and
     scores it — the two never call each other."""
@@ -296,7 +385,49 @@ def test_copy_dedup_on_scored_answers():
     assert losers == {"copy": "orig"}                    # earliest commit kept; identical vector DQ'd
 
 
-# --- docs/DESIGN.md §5b: evidence accumulation (opt-in scoring_mode="accumulate") ------------------------
+# --- small-sample honesty: the LCB must actually price 8-question uncertainty --------------------
+def test_lcb_never_certifies_a_perfect_small_slice():
+    """A perfect slice must not report lcb = 1.0.
+
+    The resampling bootstrap was degenerate on all-same slices — resampling 8 identical values gives
+    8 identical means, so 8/8 returned lcb = 1.000, i.e. *zero* claimed uncertainty from eight
+    questions. That cleared `dethrone_guard`'s `lcb_c > acc_king + margin` against any king below
+    0.97, making "resubmit until a slice comes up perfect" a free lottery ticket for the crown.
+    """
+    from thirtyspokes.koth.verify import _bootstrap_lcb
+    perfect8 = _bootstrap_lcb([1.0] * 8, 0.05, 1000, 7)
+    assert 0.7 < perfect8 < 0.8, "8/8 must be bounded well below 1.0"
+    # more evidence at the same accuracy must bind tighter — that is the whole incentive to keep mining
+    assert _bootstrap_lcb([1.0] * 32, 0.05, 1000, 7) > perfect8
+    # monotone in accuracy, and an empty/zero slice floors at 0
+    seq = [_bootstrap_lcb([1.0] * k + [0.0] * (8 - k), 0.05, 1000, 7) for k in range(9)]
+    assert seq == sorted(seq) and seq[0] == 0.0
+    # deterministic: two validators must agree without drawing the same resamples
+    assert _bootstrap_lcb([1.0] * 5 + [0.0] * 3, 0.05, 1000, 1) == \
+           _bootstrap_lcb([1.0] * 5 + [0.0] * 3, 0.05, 1000, 999)
+
+
+def test_lucky_perfect_slice_cannot_dethrone_a_better_king():
+    """End of the variance-grinding lottery: a genuinely worse agent that draws a perfect 8-question
+    slice must NOT clear the guard against a king with higher true accuracy."""
+    from thirtyspokes.koth.verify import BenchStat, ProofVerdict, _bootstrap_lcb, dethrone_guard
+    lucky_lcb = _bootstrap_lcb([1.0] * 8, 0.05, 1000, 7)            # the REAL bound, not a stub
+    lucky = ProofVerdict(True, "ok", {"math": BenchStat(8, 1.0, lucky_lcb, 0.01)}, 0.01, lucky_lcb, 1.0)
+    king = ProofVerdict(True, "ok", {"math": BenchStat(8, 0.95, 0.80, 0.01)}, 0.01, 0.95, 0.95)
+    ok, why = dethrone_guard(lucky, king)
+    assert not ok and why == "no_confident_gain"
+
+
+def test_scoring_mode_defaults_to_accumulate(env):
+    """Per-epoch scoring makes the crown a per-epoch lottery and charges nothing for a hidden epoch.
+    Accumulation is the default so ranking is stable and decoupled validators agree."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    val = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None)
+    assert val.scoring_mode == "accumulate"
+
+
+# --- docs/DESIGN.md §5b: evidence accumulation (scoring_mode="accumulate", the DEFAULT) -----------
 def test_accumulate_mode_crowns_and_pools(env):
     """Accumulate mode pools per-artifact evidence over epochs, crowns the stronger miner, and the
     accumulator holds MORE than one epoch's tasks (the whole point — 32 q/epoch ranks stably)."""
@@ -385,7 +516,7 @@ def test_commit_window_binds_proof_to_one_run(env):
     W = 5
     val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain,
                         Reign(eps0=0.0, eps_floor=0.0), env.suite, store, MockPool(), n_per_bench=8,
-                        budget=999.0, f_min=0.0, commit_window=W)
+                        budget=999.0, f_min=0.0, commit_window=W, scoring_mode="per_epoch")
     mk = lambda repo, cp: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
                                           chain, store, art(), repo, commit_proofs=cp)
     honest, nocommit, swap, late = mk("h/r", True), mk("n/r", False), mk("s/r", False), mk("l/r", True)
@@ -484,7 +615,7 @@ def test_fresh_suite_disjoint_and_solvable(env):
         assert s and p and not (s & p)                              # disjoint
     r = evaluate(reference_artifact("strong"), pool_backend=MockPool(), suite=suite,
                  n_per_bench=8, nonce="f1")
-    assert r["valid"] and r["Q_lcb"] > 0.8                          # solver still grades fresh tasks
+    assert r["valid"] and r["Q_lcb"] > 0.7          # solver still grades fresh tasks (8/8 -> LCB .747)
 
 
 def test_devkit_matches_validator(env):

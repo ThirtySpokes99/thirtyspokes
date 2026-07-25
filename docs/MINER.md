@@ -80,9 +80,17 @@ you're at the ceiling, **being cheaper is how you keep climbing.**
 
 To take the **crown** you must be not-worse than the king on every benchmark, and then either be
 **confidently better on ≥1 benchmark**, *or* **match its quality at ≥10% lower cost**. Emissions split
-**equally** across the king + a chain of up to 4 recent ex-kings (5 slots, ≈20% each when full — a
-dethroned king keeps earning while it decays out of the chain, so there's no cliff to camp against),
-with an epsilon incumbency margin protecting the king + earliest-commit tiebreak.
+**equally** across the king + a chain of up to 4 recent ex-kings (5 slots, ≈20% each when all five are
+paid — a dethroned king that keeps competing goes on earning while it decays out of the chain, so
+there's no cliff to camp against), with an epsilon incumbency margin protecting the king +
+earliest-commit tiebreak.
+
+**A seat pays only while you keep mining.** You are paid for an epoch only if you submitted a valid
+proof *in that epoch* — holding the crown once does not vest anything. Miss **3 consecutive epochs**
+and you lose the seat entirely and must retake the crown to get back in. A missed epoch or two is
+forgiven (real CVM boots are flaky), and while you are the king, being absent costs you the epoch's
+pay but not the crown — you keep the title, and challengers still have to clear your epsilon margin,
+until your grace runs out.
 
 You are **eligible** only if ALL hold, else you earn nothing that epoch: `total_cost ≤ B` (the owner's
 per-slice budget — a hard ceiling); accuracy ≥ `f_min` on **every** benchmark; ≥1 pool call on every

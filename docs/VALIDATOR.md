@@ -25,8 +25,9 @@ committed miner:
    response, else `ungrounded`). Proof-inspection only — no miner code runs.
 5. **Behavioral dedup** — near-identical attested-answer vectors keep the earliest commit (`copy_of:…`).
 6. **Score + reign** — the cost-budgeted `Q_lcb`, the Pareto dethrone guard vs the persisted king,
-   commit-block seniority → `KingChain` → `set_weights` (equal split across the king + registered
-   ex-kings; burns to uid 0 only if nobody in the chain is still registered).
+   commit-block seniority → `KingChain` → `set_weights` (equal split across the seats that are
+   registered **and submitted this epoch**; a seat absent `absent_grace`=3 consecutive epochs is
+   evicted, and an epoch with no live miner burns to uid 0 — see [`DESIGN.md`](DESIGN.md) §5a).
 
 Scoring detail and the evidence-accumulation / anti-grind refinements are in [`DESIGN.md`](DESIGN.md) §5–5b.
 

@@ -86,16 +86,18 @@ class KOTHValidator:
                  tcb_accept: frozenset | None = None, collateral: str | None = None,
                  pccs_url: str | None = None, enforce: bool = False, probe_bank=None,
                  min_cohort: int = 3, max_probe_drop: float = 0.25,
-                 audit_mode: str = "grounding", scoring_mode: str = "per_epoch",
+                 audit_mode: str = "grounding", scoring_mode: str = "accumulate",
                  half_life_epochs: float = 200.0, budget_per_task: float = 0.02,
                  n_expected: int | None = None, commit_window: int | None = None,
                  grace_blocks: int = 0, cost_tiebreak: float = 0.02):
         # memorization backstop: "grounding" (default) = pure proof-inspection, validator runs NO
         # miner code; "probe" = the legacy re-execution fresh-probe (null-pool/secret-bank upgrade).
         self.audit_mode = audit_mode
-        # scoring: "per_epoch" (default) scores each epoch's slice independently; "accumulate"
-        # (docs/DESIGN.md §5b) pools per-artifact evidence (Wilson-LCB, EWMA decay, reset-on-recommit, miss=0)
-        # so 32 q/epoch ranks stably and decoupled validators agree. Budget is cost-PER-TASK there.
+        # scoring: "accumulate" (DEFAULT, docs/DESIGN.md §5b) pools per-artifact evidence (Wilson-LCB,
+        # EWMA decay, reset-on-recommit, miss=0) so 32 q/epoch ranks stably and decoupled validators
+        # agree; budget is cost-PER-TASK there. "per_epoch" scores each slice independently — kept for
+        # the offline sim, but it makes the crown a per-epoch lottery: a single lucky slice can
+        # dethrone, and nothing costs a miner for the epochs it hides.
         self.scoring_mode = scoring_mode
         self.budget_per_task = budget_per_task
         self._evidence = EvidenceStore(half_life_epochs)
@@ -200,10 +202,14 @@ class KOTHValidator:
                     "weight": round(share, 9), **pay(share)}
 
         members = self.reign.members
-        # every paid miner's share, straight from the emission mechanism (equal-share king + chain)
-        share = round(1.0 / len(members), 9) if members else 0.0
-        king = entry(members[0].sub.hotkey, members[0].sub.score, king=True, share=share) if members else None
-        chain = [entry(m.sub.hotkey, m.sub.score, king=False, share=share) for m in members[1:]]
+        # Each seat's share comes from the emission mechanism's ACTUAL last payout, not from
+        # 1/len(members): a seat whose holder missed the epoch is seated but unpaid (liveness), so
+        # assuming an even split across seats would advertise emissions nobody received.
+        last_w = getattr(self.reign, "_last_weights", None) or {}
+        sh = lambda m: round(float(last_w.get(m.sub.miner_id, 0.0)), 9)   # noqa: E731
+        king = entry(members[0].sub.hotkey, members[0].sub.score, king=True,
+                     share=sh(members[0])) if members else None
+        chain = [entry(m.sub.hotkey, m.sub.score, king=False, share=sh(m)) for m in members[1:]]
 
         kvd = self._king_vd
         return {
@@ -214,7 +220,9 @@ class KOTHValidator:
             "epoch": (rep.epoch if rep else self.reign._epoch),
             "mechanism": {"kind": "king+equal_share_chain",
                           "chain_size": getattr(self.reign, "chain_size", None),
-                          "weight_each": share},
+                          # equal across the seats PAID this epoch (absent seats pay nothing)
+                          "weight_each": round(max(last_w.values()), 9) if last_w else 0.0,
+                          "n_paid": sum(1 for m in last_w if m != self.reign.burn_uid)},
             "king": ({**king,
                       "cost_usd": round(kvd.total_cost_usd, 6) if kvd else None,
                       "per_bench": ({n: {"acc": round(bs.acc, 4), "lcb": round(bs.lcb, 4), "n": bs.n}
@@ -711,17 +719,24 @@ class KOTHValidator:
         dereg = {m.sub.hotkey for m in self.reign.members if m.sub.hotkey not in current}
         for hk in dereg:
             self._evidence.drop(hk)                     # deregistered -> forget its accumulated evidence
-        res = self.reign.update(subs, deregistered=dereg) if subs else None
+        # LIVENESS: who actually produced a valid, payable proof THIS epoch. `subs` is not the same
+        # set — in accumulate mode an absent miner is still scored (miss=0) and so is still a
+        # candidate, and paying on candidacy is what let a miner take the crown once, go dark, and
+        # draw its share forever. Only the intersection can be paid or crowned.
+        live = set(scored_out) & set(verdicts)
+        # ALWAYS settle the epoch, even with nothing to score: skipping `set_weights` leaves the
+        # PREVIOUS weights standing on-chain, so a network where everyone stopped submitting kept
+        # paying its last slate in full, forever. No live miners -> the reign burns to uid 0.
+        res = self.reign.update(subs, deregistered=dereg, live=live)
 
         weights: dict[int, float] = {}
-        if res is not None:
-            hk_to_uid = {hk: uid for uid, hk in self.chain.hotkeys().items()}
-            for mid, w in res.weights.items():
-                uid = 0 if mid == self.reign.burn_uid else hk_to_uid.get(mid, 0)  # unmapped -> burn
-                weights[uid] = weights.get(uid, 0.0) + w
-            if self.reign.members:                      # persist the king baseline for next epoch's guard
-                self._king_id = self.reign.members[0].sub.miner_id
-                self._king_vd = verdicts.get(self._king_id) or self._king_vd
+        hk_to_uid = {hk: uid for uid, hk in self.chain.hotkeys().items()}
+        for mid, w in res.weights.items():
+            uid = 0 if mid == self.reign.burn_uid else hk_to_uid.get(mid, 0)  # unmapped -> burn
+            weights[uid] = weights.get(uid, 0.0) + w
+        if self.reign.members:                          # persist the king baseline for next epoch's guard
+            self._king_id = self.reign.members[0].sub.miner_id
+            self._king_vd = verdicts.get(self._king_id) or self._king_vd
 
         # rolling history for the public feed — the ONLY record of what happened per epoch, since
         # EpochReport is otherwise discarded by the daemon loop.
@@ -731,17 +746,16 @@ class KOTHValidator:
             "king": king_hk,
             "king_q_lcb": (round(float(self.reign.members[0].sub.score), 6)
                            if self.reign.members else None),
-            "coronation": bool(res.coronation) if res else False,
+            "coronation": bool(res.coronation),
             "n_scored": len(scored_out),
             "dq": dict(dq),
         })
         self._history = self._history[-HISTORY_LEN:]
 
-        report = EpochReport(epoch, scored_out, dq, res.slots if res else [], weights, audit_detail)
+        report = EpochReport(epoch, scored_out, dq, res.slots, weights, audit_detail)
         if submit_weights:
-            if res is not None:
-                self.chain.set_weights(weights)
-                self.record_submitted_weights(weights)
+            self.chain.set_weights(weights)
+            self.record_submitted_weights(weights)
             self._last_scored_epoch = epoch
         else:
             self._last_scored_epoch = epoch

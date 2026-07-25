@@ -107,9 +107,9 @@ comparable), for each committed miner:
    DQ the rest.
 7. apply the **Pareto dethrone guard** (clamp on *any* failure, strictly below the king)
    against the persisted king baseline, feed the cost-aware scalar + commit-block
-   seniority to `KingChain` → `set_weights` (burn to uid 0 only if nobody in the chain is
-   still registered — a partially-filled or deregistered chain just repays its remaining
-   registered members a bigger equal share).
+   seniority + the epoch's **live** set to `KingChain` → `set_weights`. Only seats whose holder
+   submitted a valid proof this epoch are paid, split equally; if no seat is live the epoch burns
+   to uid 0 (§5a).
 
 ## 5. The scoring formula + parameters
 
@@ -154,21 +154,59 @@ trading a regression — `reign.py` is untouched; the guard lives in the validat
 | `cost_tol` | 0.10 | this design |
 | `cost_margin` (cheaper-at-parity dethrone) | 0.10 | this design — the anti-ossification axis |
 | `cost_tiebreak` λ (cost term in the reign scalar) | 0.02 | small enough to never outrank a real accuracy gain |
-| `lcb` bootstrap α / resamples | 0.05 / 1000 | Teutonic bootstrap-LCB (α 0.001, B 10000 in prod) |
-| king-chain size / eps schedule | 5 slots (king + 4 ex-kings), equal share 20% each when full · eps0 0.02 → floor 0.002, τ 8 | `reign.py` `KingChain` (SN9→IOTA anti-hoarding pension tail) |
+| `lcb` α (one-sided **Wilson**, not a resampling bootstrap) | 0.05 | `evidence.wilson_lcb`; see the small-sample note below |
+| `scoring_mode` | **`accumulate`** (default) · `per_epoch` (sim only) | §5b |
+| king-chain size / eps schedule | 5 slots (king + 4 ex-kings), equal share 20% each when all five are paid · eps0 0.02 → floor 0.002, τ 8 | `reign.py` `KingChain` (SN9→IOTA anti-hoarding pension tail) |
+| `absent_grace` (consecutive missed epochs before a seat is evicted) | 3 | tolerates the ~30% flaky-CVM-boot rate measured on testnet 526 |
 | memorization test `z_crit` | 2.33 (one-sided ~99%, two-proportion) | `memorization_collapsed_relative` |
 | `min_cohort` (miners needed to calibrate probe difficulty) | 3 | this design |
 | `max_probe_drop` (owner: "no honest probe is harder than this") | 0.25 | this design |
 | copy-dedup agreement | 0.95 answer-vector agreement | `behavioral_duplicates` |
 
-## 5b. Scoring over time — evidence accumulation + anti-grind (opt-in)
+### 5a. Emissions pay for work, not for a seat (liveness)
+
+**A seat pays only while its holder is still submitting valid proofs.** `KingChain` receives the set
+of miners that produced a valid proof this epoch (`live`) and pays only those; a seat missing
+`absent_grace` consecutive epochs is evicted; an absent king keeps its title (**unpaid**) and goes on
+setting the eps bar until its grace runs out; a king that loses the crown by going dark gets **no**
+pension seat. An epoch with no live miner **burns to uid 0** rather than leaving the previous weights
+standing on-chain.
+
+This closes an emission-capture class found by auditing the mining side, where payout consulted only
+seat *membership* + registration and never *work*. Measured against the pre-fix mechanism:
+
+- a miner that took the vacant crown with the **cheapest** pool model, then went permanently dark,
+  captured **54% of emissions over 12 epochs** — out-earning the honest miner that worked every one
+  of them (it now earns 8% for 1 of 12 epochs, i.e. exactly its share of the work);
+- because the king earned exactly what an idle ex-king earned, a cartel could rotate the crown
+  through 5 self-owned hotkeys and then stop entirely, holding **100%** of emissions and capping an
+  arbitrarily better honest miner at 1/5 of the pot;
+- withholding a **single** epoch handed the crown to any submitter, unguarded (`incumbent is None`
+  ⇒ `ranked[0]` wins): a 21-epoch champion lost to a 0.01-scoring agent by missing one upload;
+- a network where every miner stopped submitting kept paying its last slate in full, forever,
+  because `set_weights` was skipped when there was nothing to score.
+
+Note the interaction with §5b: under `accumulate` a miner that missed the epoch is still *scored*
+(miss=0) and therefore still a *candidate*, so liveness is passed explicitly rather than inferred
+from the candidate list — inferring it there would re-open the pension.
+
+> **Small-sample honesty.** The reign scalar's LCB is a one-sided **Wilson** bound, not a resampling
+> bootstrap. The bootstrap is degenerate on the all-same slices that matter most: resampling 8
+> identical values yields 8 identical means, so a perfect 8/8 slice reported `lcb = 1.000` — zero
+> claimed uncertainty from eight questions. That cleared `dethrone_guard` against any king below
+> 0.97, making "resubmit every epoch until a slice comes up perfect" a free lottery ticket for the
+> crown. Wilson prices the sample correctly (8/8 → 0.747, 32/32 → 0.922), is deterministic (two
+> validators no longer depend on drawing the same resamples), and is already what §5b pools on — so
+> the two modes now agree.
+
+## 5b. Scoring over time — evidence accumulation + anti-grind
 
 A single epoch samples only ~32 tasks (8 per benchmark), which is noisy: per-epoch scoring lets a
 lucky slice dethrone and makes two decoupled validators — drawing independent slices — disagree.
-Three refinements (all landed, off by default, enabled per validator) make the ranking stable and
-consensus-friendly; the simulation that motivated them is `scripts/scoring_v2_sim.py`.
+**Evidence accumulation is therefore the default**; the two anti-grind windows below remain opt-in
+per validator. The simulation that motivated them is `scripts/scoring_v2_sim.py`.
 
-- **Evidence accumulation** (`scoring_mode="accumulate"`, `koth/evidence.py`). Each epoch's *verified*
+- **Evidence accumulation** (`scoring_mode="accumulate"`, **the default**, `koth/evidence.py`). Each epoch's *verified*
   per-benchmark result for a **fixed artifact** is pooled into one decayed binomial, keyed by
   `(hotkey, source_hash, weights_hash, suite_version)`; the reign scalar is the **Wilson lower bound**
   on the pooled counts. An EWMA (`half_life_epochs`, default 200) gives liveness — stop submitting and

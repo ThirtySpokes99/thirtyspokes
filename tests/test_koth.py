@@ -2022,3 +2022,64 @@ def test_governance_record_is_content_addressed_and_tamper_evident():
     # and the digest is stable regardless of key order / whitespace
     assert governance.digest({"pool_allow_list": ["openai/gpt-4o"], "rtmr": {"1": "6d" * 48},
                               "version": 1}) == d
+
+
+# --- CRITICAL-1: the enclave's pool connection must not be steerable by the miner ----------------
+# The measured runtime takes its pool credential from a blob the MINER supplies (GCE metadata
+# `koth-secrets`). It used to be splatted wholesale into os.environ, and the HTTP client reads its
+# TLS trust store and proxy routing FROM the environment. Two extra metadata lines therefore let a
+# miner MITM its own pool: fabricate answers (inject memorised gold), fabricate `usage.cost` and
+# token counts (cost is read out of the response body), spend nothing — and still emit a fully
+# valid attested proof, because the enclave faithfully reports what it was told.
+
+def test_secrets_blob_is_allowlisted():
+    """Only the pool credential may cross from the miner-supplied blob into the environment."""
+    import tempfile
+
+    from thirtyspokes.eval import config
+    blob = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+    blob.write(
+        "OPENROUTER_API_KEY=sk-or-real\n"
+        "SSL_CERT_FILE=/run/koth/agent/weights.bin\n"      # CA smuggled in as 'weights'
+        "HTTPS_PROXY=http://127.0.0.1:8080\n"
+        "export REQUESTS_CA_BUNDLE=/tmp/evil.pem\n"
+        "OPENAI_BASE_URL=http://127.0.0.1:9/v1\n"
+        "# a comment\n")
+    blob.close()
+    env: dict = {}
+    accepted, rejected = config.load_secrets_env(blob.name, env=env)
+    assert accepted == ["OPENROUTER_API_KEY"]
+    assert env == {"OPENROUTER_API_KEY": "sk-or-real"}, "nothing else may reach the environment"
+    assert set(rejected) == {"SSL_CERT_FILE", "HTTPS_PROXY", "REQUESTS_CA_BUNDLE", "OPENAI_BASE_URL"}
+
+
+def test_scrub_network_env_clears_every_tls_and_proxy_override():
+    from thirtyspokes.eval import config
+    env = {k: "x" for k in config.UNSAFE_NET_ENV} | {"OPENROUTER_API_KEY": "keep", "PATH": "keep"}
+    dropped = config.scrub_network_env(env)
+    assert set(dropped) == set(config.UNSAFE_NET_ENV)
+    assert env == {"OPENROUTER_API_KEY": "keep", "PATH": "keep"}
+
+
+def test_pool_client_ignores_env_tls_and_proxy_overrides(monkeypatch, tmp_path):
+    """The backstop: even with the attack env set, the client must keep the real trust anchor.
+
+    This is the PoC that proved the hole, inverted into a regression test — it fails loudly if
+    anyone reconstructs the client without `trust_env=False`.
+    """
+    import certifi
+    from thirtyspokes.gateway.gateway import OpenRouterBackend
+
+    evil_ca = tmp_path / "evil_ca.pem"          # a CA the miner controls
+    evil_ca.write_text(open(certifi.where()).read().split("-----END CERTIFICATE-----")[0]
+                       + "-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(evil_ca))
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:8080")
+
+    be = OpenRouterBackend("sk-test")
+    client = be._client._client
+    assert client.trust_env is False, "env-derived TLS/proxy must be off"
+    assert not [m for m in client._mounts.values() if m is not None], "no proxy may be mounted"
+    n_roots = len(client._transport._pool._ssl_context.get_ca_certs())
+    assert n_roots > 20, f"trust store was replaced by the miner's CA (only {n_roots} roots)"

@@ -192,12 +192,15 @@ def meta(key, default=""):
         return default
 
 
-# secrets were fetched to tmpfs by koth-secrets.service (never baked into the public image)
-for line in open("/run/koth/secrets.env"):
-    line = line.strip().removeprefix("export ")
-    if "=" in line and not line.startswith("#"):
-        k, _, v = line.partition("=")
-        os.environ[k.strip()] = v.strip().strip('"').strip("'")
+# Secrets were fetched to tmpfs by koth-secrets.service (never baked into the public image). The
+# blob is MINER-SUPPLIED, so it is read through an ALLOWLIST: splatting it into the environment let
+# a miner set SSL_CERT_FILE/HTTPS_PROXY and MITM its own pool connection, fabricating answers and
+# cost behind a genuine attestation. Rejected keys are printed (not their values) so an attempt is
+# visible on the attested console rather than silently dropped. See eval/config.py.
+_accepted, _rejected = config.load_secrets_env("/run/koth/secrets.env")
+_scrubbed = config.scrub_network_env()
+print(f"KOTH-SECRETS accepted={sorted(_accepted)} rejected={sorted(_rejected)} "
+      f"scrubbed={sorted(_scrubbed)}", flush=True)
 
 epoch = int(meta("koth-epoch", "0"))
 nonce = meta("koth-nonce")

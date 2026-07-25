@@ -73,9 +73,27 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
 
     def __init__(self, api_key: str, base_url: str = "https://openrouter.ai/api/v1",
                  timeout: float = 120.0, max_retries: int = 3, price_fn=None):
+        import ssl  # noqa: PLC0415
+
+        import certifi  # noqa: PLC0415
+        import httpx  # noqa: PLC0415
         from openai import OpenAI  # noqa: PLC0415
+        # `trust_env=False` + an explicit CA bundle is a SECURITY boundary, not a preference.
+        # The default client reads its trust store and proxy routing from the environment
+        # (`httpx.create_ssl_context` passes `os.environ["SSL_CERT_FILE"]` straight to
+        # `ssl.create_default_context`), and in the measured enclave the environment is fed from a
+        # blob the MINER supplies. Setting `SSL_CERT_FILE` + `HTTPS_PROXY` therefore let a miner
+        # MITM its own pool: fabricate answers, fabricate `usage.cost` (cost is read out of the
+        # response body), pay nothing, and still emit a fully valid attested proof. Pinning the
+        # bundled `certifi` roots means the miner still owns the network but cannot forge a cert,
+        # which is what makes the metered cost and the graded answers mean anything.
+        # `eval.config.scrub_network_env()` clears those vars too; this is the backstop that holds
+        # even if something reaches the environment by another route.
         self._client = OpenAI(base_url=base_url, api_key=api_key,
-                              timeout=timeout, max_retries=max_retries)
+                              timeout=timeout, max_retries=max_retries,
+                              http_client=httpx.Client(
+                                  trust_env=False, timeout=timeout,
+                                  verify=ssl.create_default_context(cafile=certifi.where())))
         self._price_fn = price_fn   # model -> (prompt_$per1k, completion_$per1k)
 
     def complete(self, model, messages, params):

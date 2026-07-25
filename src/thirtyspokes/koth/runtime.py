@@ -35,7 +35,10 @@ KOTH_RUNTIME_VERSION = "orchestra-koth-runtime-1"
 # Bumped to 2: real_suite now loads 1000/benchmark (was 16), so the per-epoch slice is a real
 # 8-of-500 draw instead of the whole 8-item pool. Changes the task set => miners and validators must
 # upgrade in lockstep, and accumulated evidence keyed on the suite version correctly resets.
-SUITE_VERSION = "koth-suite-2"
+# Bumped to 3: the RANKING weights moved to 100% free-form (mmlu 0.5->0.0, math 0.5->1.0). MCQ is
+# undefendable against memorization by proof-inspection, so it is a floor-only gate now. This
+# changes every miner's score, so the accumulated evidence must reset with it.
+SUITE_VERSION = "koth-suite-3"
 
 
 def runtime_measurement() -> str:

@@ -40,6 +40,7 @@ from .verify import (
     grounding_check,
     memorization_collapsed_relative,
     scan_source,
+    scan_weights,
     verify_proof,
 )
 
@@ -552,8 +553,15 @@ class KOTHValidator:
                     for t in b.sample(self.n_per_bench, bench_seed(nonce, epoch, b.name))]
         if any(calls.get(tid, 0) < 1 for tid in assigned):
             return E(dq="no_pool_call")
-        # 4. cheap public-source audit (bound: we scanned the artifact we downloaded)
+        # 4. cheap public-artifact audit (bound: we scanned the artifact we downloaded). Source
+        #    catches a literal table; weights catch the same table moved into the opaque blob, which
+        #    `scan_source` never looked at.
         hard, reason = scan_source(artifact.source_text)
+        if hard:
+            return E(dq=reason)
+        golds = [t.gold for b in self.suite
+                 for t in b.sample(self.n_per_bench, bench_seed(nonce, epoch, b.name))]
+        hard, reason = scan_weights(artifact.weights, golds, salt=nonce)
         if hard:
             return E(dq=reason)
         # 5. memorization backstop. DEFAULT "grounding": every scored answer must derive from a

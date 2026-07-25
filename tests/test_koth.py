@@ -863,7 +863,9 @@ def test_simulation_every_defense_fires():
     assert dq.get("fake-quote") == "bad_platform_quote"
     assert dq.get("replayer") == "epoch_nonce_mismatch"
     assert dq.get("hardcoder") == "hardcoded_answers"
-    assert dq.get("memorizer") == "memorization"
+    # the memorizer keeps its answer table in weights.bin. `scan_weights` now catches it BEFORE the
+    # probe audit runs — a cheaper, earlier catch — so accept either memorization defense firing.
+    assert dq.get("memorizer") in {"answers_in_weights", "memorization", "ungrounded", "laundered"}
     assert dq.get("substituter") == "artifact_binding_mismatch"     # binding enforced
     assert dq.get("copier", "").startswith("copy_of:")              # behavioral dedup
     em = out["emissions"]
@@ -2159,3 +2161,68 @@ def test_enforcing_validator_rejects_an_unconfined_proof(env):
     v = _verify(env, p, a, "hk", enforce=True, approved_mrtd={"m"},
                 approved_rtmr={1: "a", 2: "b", 3: "c"}, tcb_accept=frozenset({"UpToDate"}))
     assert not v.valid and v.reason in {"unconfined_agent", "mock_quote_rejected"}
+
+
+# --- CRITICAL-2: memorization of the PUBLIC benchmark ------------------------------------------
+# The scored pool is 500 public items/benchmark with public gold. The beacon makes the SLICE
+# unpredictable but not the POOL, so a miner memorises all 500 -- a few hundred KB in weights.bin,
+# which `scan_source` never looked at. Plain grounding ("answer appears in some response") was
+# defeated by laundering: put the memorised answer in your own prompt and the model echoes it.
+
+def _tr(*pairs):
+    return [{"task_id": "t", "prompt": p, "response": r} for p, r in pairs]
+
+
+def test_first_appearance_grounding_catches_laundering():
+    """The provenance question: did the answer surface on the RESPONSE side before it ever
+    surfaced on the PROMPT side? Information the agent already had shows up in a prompt first."""
+    from thirtyspokes.koth.verify import _grounded_one
+    # free-form: the answer (11) is NOT in the prompt by construction
+    assert _grounded_one("11", _tr(("Compute 3+4*2.", "11")), "number") == (True, "ok")
+    assert _grounded_one("11", _tr(("hi", "hello")), "number") == (False, "ungrounded")
+    assert _grounded_one("11", _tr(("Repeat exactly: 11", "11")), "number") == (False, "laundered")
+
+
+def test_first_appearance_does_not_flag_honest_orchestration():
+    """Verify-loops and cheap->strong escalation must keep passing: their answer still ORIGINATES
+    in a response, it is merely quoted back afterwards."""
+    from thirtyspokes.koth.verify import _grounded_one
+    verify_loop = _tr(("Compute 3+4*2.", "11"), ("Is 11 correct?", "11"))
+    escalation = _tr(("Compute 3+4*2.", "10"), ("Compute 3+4*2.", "11"))
+    assert _grounded_one("11", verify_loop, "number") == (True, "ok")
+    assert _grounded_one("11", escalation, "number") == (True, "ok")
+
+
+def test_multiple_choice_is_exempt_from_the_provenance_rule():
+    """MCQ is undefendable here BY CONSTRUCTION -- every option is in the prompt, so the rule would
+    flag every honest agent. It must fall back to plain grounding rather than DQ everyone. This is
+    why the ranking weights are 100% free-form (`real_suite`)."""
+    from thirtyspokes.koth.verify import _grounded_one, answer_token
+    mcq = _tr(("Q: 2+2? A) 3 B) 4", "B"))
+    assert answer_token(mcq[0]["prompt"], "choice") == "B", "the gold is in the prompt already"
+    assert _grounded_one("B", mcq, "choice") == (True, "ok"), "must not flag an honest MCQ agent"
+
+
+def test_ranking_weights_are_entirely_free_form():
+    """No ranked benchmark may use an answer format whose provenance cannot be checked."""
+    from thirtyspokes.koth.verify import _PROVENANCE_KINDS, _bench_kind
+    from thirtyspokes.koth.benchmarks import default_suite
+    for b in default_suite():
+        if b.weight > 0:
+            assert _bench_kind(b) in _PROVENANCE_KINDS, f"{b.name} is ranked but undefendable"
+
+
+def test_scan_weights_finds_an_answer_table_but_not_random_weights():
+    """weights.bin was the obvious hiding place and was never examined. Decoys of the same
+    digit-length are the control, so short numeric golds matching by chance don't false-positive."""
+    import json
+    import numpy as np
+    from thirtyspokes.koth.verify import scan_weights
+    golds = [18, 7, 4213, 96, 51, 8, 1240, 33]
+    table = json.dumps({f"q{i}": g for i, g in enumerate(golds)}).encode()
+    assert scan_weights(table, golds, salt="n1") == (True, "answers_in_weights")
+    # a real float32 weight blob must NOT trip it, however numerically dense
+    rng = np.random.default_rng(0)
+    real = rng.standard_normal(200_000).astype("float32").tobytes()
+    assert scan_weights(real, golds, salt="n1")[0] is False
+    assert scan_weights(b"", golds, salt="n1")[0] is False

@@ -120,7 +120,7 @@ def _math_pool(prefix: str, lo: int, hi: int, count: int, seed: int):
 def make_math() -> PooledBenchmark:
     pool, a1 = _math_pool("pool", 2, 40, 40, seed=101)
     held, a2 = _math_pool("held", 41, 80, 40, seed=202)   # disjoint operand range
-    return PooledBenchmark("math", 0.30, pool, held, grade_math, {**a1, **a2})
+    return PooledBenchmark("math", 0.60, pool, held, grade_math, {**a1, **a2})
 
 
 _VALID_DIFF = "diff --git a/fix.py b/fix.py\n@@ -1 +1 @@\n-old\n+new  # resolves {tid}\n"
@@ -141,11 +141,14 @@ def _swe_pool(prefix: str, base: int, count: int):
 def make_swe() -> PooledBenchmark:
     pool, a1 = _swe_pool("pool", 0, 30)
     held, a2 = _swe_pool("held", 1000, 30)
-    return PooledBenchmark("swe", 0.25, pool, held, grade_patch, {**a1, **a2})
+    return PooledBenchmark("swe", 0.40, pool, held, grade_patch, {**a1, **a2})
 
 
 def default_suite() -> list[Benchmark]:
-    """The four owner-given benchmarks. Weights sum to 1.0 (math/MMLU/GPQA/SWE)."""
+    """The four owner-given benchmarks. RANKING weight sums to 1.0 across the free-form pair
+    (math 0.60 / swe 0.40); MMLU + GPQA are weight 0 — eligibility floors only, because multiple
+    choice cannot be defended against memorization by proof-inspection (the answer is in the prompt
+    by construction). Same policy as the live suite, `real_suite`."""
     from . import gpqa, mmlu
     return [make_math(), mmlu.make_mmlu(), gpqa.make_gpqa(), make_swe()]
 
@@ -191,8 +194,24 @@ def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
     half = lambda xs: (xs[: len(xs) // 2], xs[len(xs) // 2:])  # noqa: E731
     mp, mh = half(mt)
     gp, gh = half(g)
-    return [RealBenchmark("mmlu", 0.5, mp, mh, grade_choice),
-            RealBenchmark("math", 0.5, gp, gh, math_tasks.grade)]
+    # WEIGHTS: the RANKING scalar is 100% free-form, MMLU is a floor-only sanity gate (weight 0).
+    #
+    # Multiple choice cannot be defended against memorization by any proof-inspection rule: every
+    # option is in the prompt by construction, so `extract_choice(prompt)` already yields the gold
+    # and the provenance rule in `verify._grounded_one` would flag every honest agent. MMLU at 0.5
+    # therefore meant HALF the score sat on a benchmark where memorizing the 500-item public pool
+    # was undetectable in principle — and the memorizer is also the CHEAPEST miner, so it dominated
+    # both axes of `S = Q_lcb − λ·cost`. Weight 0 keeps it as an eligibility floor (`eligible`
+    # checks `acc >= f_min` on EVERY benchmark regardless of weight), so a broken agent is still
+    # caught while memorizing it earns exactly nothing.
+    #
+    # `math` is free-form numeric: the answer is not in the prompt, so first-appearance grounding
+    # catches both naive memorization and prompt-laundering. SWE is the intended second ranked
+    # benchmark and is deliberately NOT wired here yet — `grade_patch` is a stand-in that scores any
+    # well-formed diff 1.0, so ranking on it today would be trivially gameable. It needs
+    # `eval.swe_tasks.SWEGrader` (Docker + the SWE-bench Pro harness) first.
+    return [RealBenchmark("mmlu", 0.0, mp, mh, grade_choice),
+            RealBenchmark("math", 1.0, gp, gh, math_tasks.grade)]
 
 
 # --- FRESH benchmarks (WS4): tasks generated per-epoch from the seed, so there is nothing

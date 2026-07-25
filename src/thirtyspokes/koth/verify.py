@@ -292,31 +292,74 @@ def answer_token(text, kind: str):
     return s or None
 
 
+# Answer kinds where the answer is NOT structurally present in the prompt, so "who produced it
+# first" is a meaningful question. MULTIPLE CHOICE IS EXCLUDED ON PURPOSE: every option is in the
+# prompt by construction, so `extract_choice(prompt)` already returns the gold and a provenance rule
+# would flag every honest agent. That is not a tuning problem — it means no prompt/response rule can
+# ever defend an MCQ benchmark against memorization, which is why the scored suite ranks on
+# free-form answers (see `benchmarks.real_suite`).
+_PROVENANCE_KINDS = frozenset({"number", "patch"})
+
+
+def _grounded_one(answer, calls: list[dict], kind: str) -> tuple[bool, str]:
+    """Provenance of ONE scored answer, walking that task's calls in order.
+
+    Grounded  — the token first appears in a RESPONSE: the pool produced it.
+    Laundered — the token first appears in a PROMPT: the agent already had it and used the pool as
+                an echo chamber, which is exactly how a memorizer defeats plain grounding.
+    Ungrounded— it never appears at all: the agent answered without the pool.
+    """
+    tok = answer_token(answer, kind)
+    check_prompts = kind in _PROVENANCE_KINDS
+    for e in calls:                                   # trace is in call order
+        if check_prompts and answer_token(e.get("prompt", ""), kind) == tok:
+            return False, "laundered"
+        # an unparseable answer relaying an equally-unparseable response is still grounded
+        if answer_token(str(e.get("response", "")), kind) == tok:
+            return True, "ok"
+    return False, "ungrounded"
+
+
 def grounding_check(proof: Proof, trace: list[dict], suite: list[Benchmark], *,
                     max_ungrounded: float = 0.15) -> tuple[bool, str]:
-    """Each scored answer must match a pool response logged for its task. Reads only the proof
-    + the hash-attested trace (no re-execution). DQs `ungrounded` when the ungrounded fraction
-    exceeds `max_ungrounded` (slack for synthesis orchestration + parser noise). KNOWN residual:
-    prompt-injection laundering (the agent tells the model the answer and the model echoes it)
-    passes — the null-pool re-execution probe is the counterfactual upgrade path."""
+    """Each scored answer must DERIVE FROM the pool — not merely appear next to it.
+
+    Reads only the proof + the hash-attested trace: no re-execution, no secret bank, no private
+    data, deterministic across validators. DQs when the unexplained fraction exceeds
+    `max_ungrounded` (slack for synthesis orchestration and parser noise); the reported reason is
+    whichever failure dominates.
+
+    Plain "answer ∈ some response" was defeatable by laundering — put the memorized answer in your
+    own prompt and the model echoes it back, so the answer is 'grounded' in a response the agent
+    itself authored. Ordering closes that: information the agent already had surfaces on the prompt
+    side first, information the pool supplied surfaces on the response side first. Verified against
+    honest verify-loops and cheap→strong escalation, which both keep passing because their answer
+    still originates in a response.
+
+    Residual: a few-shot prompt whose trailing number happens to equal the task's answer reads as
+    laundered. `extract_number` takes the LAST number, which is normally part of the question rather
+    than an example's answer, and `max_ungrounded` absorbs the occasional collision.
+    """
     kind = {b.name: _bench_kind(b) for b in suite}
-    resp_by_task: dict[str, list[str]] = {}
+    calls_by_task: dict[str, list[dict]] = {}
     for e in trace:
-        resp_by_task.setdefault(e.get("task_id"), []).append(str(e.get("response", "")))
-    total = ungrounded = 0
+        calls_by_task.setdefault(e.get("task_id"), []).append(e)
+    total = laundered = ungrounded = 0
     for r in proof.results:
         total += 1
-        k = kind.get(r.benchmark, "number")
-        at = answer_token(r.answer, k)
-        # grounded iff the answer's token matches SOME logged response's token (an unparseable
-        # answer that relays an equally-unparseable response is still grounded: None in {None}).
-        toks = {answer_token(resp, k) for resp in resp_by_task.get(r.task_id, [])}
-        if at not in toks:
-            ungrounded += 1
+        ok, why = _grounded_one(r.answer, calls_by_task.get(r.task_id, []),
+                                kind.get(r.benchmark, "number"))
+        if not ok:
+            if why == "laundered":
+                laundered += 1
+            else:
+                ungrounded += 1
     if total == 0:
         return True, "ok"
-    frac = ungrounded / total
-    return (frac <= max_ungrounded, "ok" if frac <= max_ungrounded else "ungrounded")
+    frac = (laundered + ungrounded) / total
+    if frac <= max_ungrounded:
+        return True, "ok"
+    return False, "laundered" if laundered >= ungrounded else "ungrounded"
 
 
 # --- optimistic anti-cheat backstops (applied by the validator on the artifact it
@@ -410,6 +453,55 @@ def scan_source(source_text: str) -> tuple[bool, str]:
     stand-in for an AST/human audit; the validator runs it on the artifact it
     downloads, so it is bound to the committed source by construction."""
     return (True, "hardcoded_answers") if _HARDCODE.search(source_text) else (False, "clean")
+
+
+def _decoys(golds: list[str], salt: str) -> list[str]:
+    """One deterministic control per gold, with the SAME digit-length — so a decoy is exactly as
+    likely to occur by chance as the real answer it stands in for. Derived from a shared salt, so
+    every validator computes the identical control set."""
+    out = []
+    for i, s in enumerate(golds):
+        n = len(s)
+        h = int(signing.sha256_hex(f"{salt}|{i}|{s}")[:8], 16)
+        d = str(h % (10 ** n)).zfill(n)
+        if d == s:                                  # never let a control BE the answer
+            d = str((h + 1) % (10 ** n)).zfill(n)
+        out.append(d)
+    return out
+
+
+def scan_weights(weights: bytes, golds: list, *, salt: str = "", min_golds: int = 4,
+                 min_hit: float = 0.5, ratio: float = 3.0) -> tuple[bool, str]:
+    """Flag an answer table hidden in the OPAQUE weights blob.
+
+    `scan_source` only ever sees `source_text`, so `weights.bin` was the obvious place to keep a
+    lookup table — public, bound, and never examined.
+
+    Naive substring search is useless: a short gold like "8" occurs in essentially any binary. So
+    the real answers are measured against DECOYS OF THE SAME DIGIT-LENGTH and flagged only when they
+    hit substantially more often than the controls. Single-digit golds then hit in both sets and
+    correctly discriminate nothing, while a table of multi-digit answers stands out sharply.
+
+    Only digit-bearing golds are usable: an MCQ letter has no same-shape decoy (and "A" matches
+    almost any text), so a choice benchmark is skipped entirely rather than measured without a
+    control — getting that wrong flagged every honest miner in the offline sim.
+
+    This raises the bar on lazy memorization; it is NOT a proof of absence, since a compressed or
+    learned encoding defeats it. `grounding_check` is the defence that targets the behaviour
+    regardless of how the answers are stored.
+    """
+    if not weights:
+        return False, "clean"
+    # only golds that are numeric enough to build a same-shape control for
+    usable = [s for s in (str(g) for g in golds) if s.isdigit()]
+    if len(usable) < min_golds:
+        return False, "clean"
+    text = weights.decode("latin-1")
+    present = lambda vals: sum(1 for v in vals if v in text) / len(vals)   # noqa: E731
+    real, ctrl = present(usable), present(_decoys(usable, salt))
+    if real >= min_hit and real >= ratio * max(ctrl, 1e-9):
+        return True, "answers_in_weights"
+    return False, "clean"
 
 
 @dataclass(frozen=True)

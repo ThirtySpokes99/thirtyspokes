@@ -124,6 +124,14 @@ def verify_proof(
             return bad("rtmr_gate_unset")                 # need boot RTMR1/2 + runtime RTMR3
         if tcb_accept is None:
             return bad("tcb_policy_unset")                # enforce ⇒ full DCAP (TCB/CRL/QE)
+        if not proof.confined:
+            # The agent ran with network egress. The measured-image gates above prove WHICH image
+            # booted, not what it did inside — and an unconfined agent can reach an off-allow-list
+            # model using a key embedded in its own weights, voiding the pool pinning, the metered
+            # cost and the budget ceiling while still satisfying `no_pool_call` with one token call.
+            # `run_agent_confined` degrades silently when the namespace probe fails, so this is
+            # gated on the ATTESTED fact rather than on the miner's configuration.
+            return bad("unconfined_agent")
     if is_tdx:                                            # WS7: real Intel-TDX hardware quote
         # `tcb_accept` set -> full DCAP (TCB status/CRL/QE-identity via dcap-qvl, H1);
         # else the offline crypto-chain-only path (cert chain to Intel root + binding).

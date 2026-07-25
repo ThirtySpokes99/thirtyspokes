@@ -45,6 +45,17 @@ class Proof:
     n_calls: int
     call_log_hash: str
     measurement: str      # runtime image hash; must be on the approved list
+    # Was the untrusted agent actually run under no-egress confinement (koth/confine.py)?
+    # ATTESTED, because the guarantee used to be unobservable: `run_agent_confined` silently
+    # degrades to a plain subprocess when `confinement_available()` is False (it returns False on
+    # ANY exception, including its own 10s probe timeout, and lru_caches that for the boot). An
+    # unconfined agent has network egress and can call an off-allow-list model with a key embedded
+    # in its own weights.bin — bypassing PinnedBackend, the MeteringProxy, the budget ceiling and
+    # the cost tiebreak at once — while `no_pool_call` is satisfied by one token call. The
+    # MRTD/RTMR gates prove WHICH IMAGE booted, not what it did inside, so without this field a
+    # fully-enforcing validator could not tell the two runs apart. In the payload ⇒ covered by
+    # `report_data()` ⇒ covered by the quote ⇒ un-forgeable.
+    confined: bool = False
     quote: Quote | None = None
 
     def _payload(self) -> dict:
@@ -79,5 +90,8 @@ class Proof:
             results=tuple(BenchmarkResult(**r) for r in d["results"]),
             total_cost_usd=d["total_cost_usd"], n_calls=d["n_calls"],
             call_log_hash=d["call_log_hash"], measurement=d["measurement"],
+            # absent ⇒ False: an old proof that never asserted confinement must not be read as
+            # having had it. Fails closed under a validator that gates on it.
+            confined=bool(d.get("confined", False)),
             quote=Quote(**q) if q else None,
         )

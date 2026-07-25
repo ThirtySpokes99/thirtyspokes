@@ -756,7 +756,7 @@ def test_confine_meters_parent_side():
     authoritative trace + per-task cost. Works with or without netns (portable path)."""
     from thirtyspokes.koth.confine import run_agent_confined
     from thirtyspokes.koth.pool import MockPool
-    results, trace = run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool())
+    results, trace, _hardened = run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool())
     assert results[0]["answer"] == "4"
     assert len(trace) == 1 and trace[0]["cost_usd"] > 0
     assert results[0]["cost_usd"] == trace[0]["cost_usd"]     # cost attributed from the trace
@@ -775,7 +775,7 @@ def test_confine_blocks_network_egress():
            "        except Exception as e:\n"
            "            return 'BLOCKED:'+type(e).__name__\n"
            "    return agent\n")
-    results, _ = run_agent_confined(src, b"{}", _TASK, backend=MockPool())
+    results, _tr, _hardened = run_agent_confined(src, b"{}", _TASK, backend=MockPool())
     assert results[0]["answer"].startswith("BLOCKED")
 
 
@@ -802,7 +802,7 @@ def test_confined_run_retries_a_transient_spawn_crash(monkeypatch):
     from thirtyspokes.koth.pool import MockPool, PinnedBackend
 
     calls = {"n": 0}
-    real_rows = ([{"benchmark": "b", "task_id": "t1", "answer": "ok", "cost_usd": 0.0}], [])
+    real_rows = ([{"benchmark": "b", "task_id": "t1", "answer": "ok", "cost_usd": 0.0}], [], True)
 
     def flaky(*a, **kw):
         calls["n"] += 1
@@ -814,8 +814,8 @@ def test_confined_run_retries_a_transient_spawn_crash(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda s: None)     # no real backoff delay in tests
 
     rt = KOTHRuntime(PinnedBackend(MockPool(), MockPool().allowed), Platform(), confine=True)
-    results, trace = rt._run_confined(reference_artifact("strong"), _TASK)
-    assert calls["n"] == 3 and results[0].answer == "ok"
+    results, trace, hardened = rt._run_confined(reference_artifact("strong"), _TASK)
+    assert calls["n"] == 3 and results[0].answer == "ok" and hardened is True
 
 
 def test_confined_run_gives_up_after_repeated_crashes(monkeypatch):
@@ -2083,3 +2083,79 @@ def test_pool_client_ignores_env_tls_and_proxy_overrides(monkeypatch, tmp_path):
     assert not [m for m in client._mounts.values() if m is not None], "no proxy may be mounted"
     n_roots = len(client._transport._pool._ssl_context.get_ca_certs())
     assert n_roots > 20, f"trust store was replaced by the miner's CA (only {n_roots} roots)"
+
+
+# --- CRITICAL-3: the no-egress guarantee must fail CLOSED and be ATTESTED -----------------------
+# `run_agent_confined` silently degraded to a plain subprocess when the namespace probe failed
+# (which it did on ANY exception, including its own probe timeout, then lru_cached that for the
+# boot). An unconfined agent has network egress: it can call an off-allow-list model with a key
+# embedded in its own weights.bin, voiding PinnedBackend + the MeteringProxy + the budget ceiling,
+# while one token call through call_model satisfies `no_pool_call`. Nothing recorded the downgrade,
+# so a fully-enforcing validator could not tell the two runs apart.
+
+def test_confinement_probe_does_not_cache_a_timeout(monkeypatch):
+    """A slow probe is inconclusive, not a 'no'. Caching it disabled confinement for the whole
+    boot — a load-sensitive trigger on a machine whose size the miner chooses."""
+    import subprocess as sp
+
+    from thirtyspokes.koth import confine
+    monkeypatch.setattr(confine, "_probe_cache", None)
+    monkeypatch.setattr(confine.shutil, "which", lambda _: "/usr/bin/unshare")
+    monkeypatch.setattr(confine.sys, "platform", "linux")
+    calls = {"n": 0}
+
+    def always_timeout(*a, **kw):
+        calls["n"] += 1
+        raise sp.TimeoutExpired(cmd="unshare", timeout=30)
+
+    monkeypatch.setattr(confine.subprocess, "run", always_timeout)
+    assert confine.confinement_available() is False
+    assert calls["n"] == 3, "a timeout must be retried, not taken as a verdict"
+    assert confine._probe_cache is None, "an inconclusive probe must NOT be cached"
+
+
+def test_require_confinement_refuses_to_run_unconfined():
+    """Production fails closed instead of silently handing the agent a network."""
+    from thirtyspokes.koth.confine import SandboxError, run_agent_confined
+    from thirtyspokes.koth.pool import MockPool
+    with pytest.raises(SandboxError, match="refusing to run the agent unconfined"):
+        run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool(),
+                           hardened=False, require=True)
+
+
+def test_proof_attests_the_confinement_mode(env):
+    """The proof records what ACTUALLY happened, and the quote covers it."""
+    import dataclasses
+
+    from thirtyspokes.koth.proof import Proof
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")                     # in-process runtime -> not confined
+    assert p.confined is False
+    assert "confined" in p._payload(), "must be inside report_data, i.e. covered by the quote"
+    # flipping the flag breaks the binding — a miner cannot claim confinement it did not have
+    forged = dataclasses.replace(p, confined=True)
+    assert forged.report_data() != p.quote.report_data
+    assert Proof.from_json(p.to_json()).confined is False
+
+
+def test_absent_confined_field_reads_as_false():
+    """An older proof that never asserted confinement must not be read as having had it."""
+    import json
+
+    from thirtyspokes.koth.proof import Proof
+    p = Proof(epoch=1, nonce="n", hotkey="hk", source_hash="sh", weights_hash="wh",
+              model_id="m", results=(), total_cost_usd=0.0, n_calls=0,
+              call_log_hash="x", measurement="m", confined=True)
+    d = json.loads(p.to_json()); d.pop("confined")
+    assert Proof.from_json(json.dumps(d)).confined is False
+
+
+def test_enforcing_validator_rejects_an_unconfined_proof(env):
+    """The gate that makes this enforceable regardless of how the miner configured its runtime:
+    the measured-image gates prove WHICH image booted, not what it did inside."""
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert p.confined is False
+    v = _verify(env, p, a, "hk", enforce=True, approved_mrtd={"m"},
+                approved_rtmr={1: "a", 2: "b", 3: "c"}, tcb_accept=frozenset({"UpToDate"}))
+    assert not v.valid and v.reason in {"unconfined_agent", "mock_quote_rejected"}

@@ -94,13 +94,21 @@ class KOTHRuntime:
     non-Linux host; identical proof shape either way."""
 
     def __init__(self, backend: ModelBackend, platform: Platform, *, confine: bool = False,
-                 confine_timeout: float = 120.0):
+                 confine_timeout: float = 120.0, require_confinement: bool = False):
         if confine_timeout <= 0:
             raise ValueError("confine_timeout must be positive")
+        if require_confinement and not confine:
+            raise ValueError("require_confinement=True is meaningless without confine=True")
         self.backend = backend
         self.platform = platform
         self.confine = confine
         self.confine_timeout = confine_timeout
+        # Production (the measured enclave) sets this: refuse to run rather than fall back to an
+        # unconfined child. `confine=True` alone is best-effort, which is what offline sims and CI
+        # need — GitHub's Ubuntu 24.04 blocks unprivileged userns, so a hard requirement there would
+        # fail every run. Either way the ACTUAL mode is stamped into the proof (`Proof.confined`),
+        # so a validator gates on what happened, not on how the miner configured its runtime.
+        self.require_confinement = require_confinement
 
     def measure_self(self, pool_allow_list) -> str | None:
         """On a TDX guest with an extendable RTMR3, bind this runtime's identity
@@ -143,7 +151,7 @@ class KOTHRuntime:
             answer = agent(t["prompt"], rec_call)
             results.append(BenchmarkResult(t["benchmark"], t["task_id"], str(answer),
                                            proxy.total_cost_usd - c0))
-        return results, trace
+        return results, trace, False        # in-process: the agent is NOT confined
 
     def _run_confined(self, artifact: Artifact, tasks: list[dict]):
         import time
@@ -160,9 +168,9 @@ class KOTHRuntime:
             if attempt:
                 time.sleep(2.0)
             try:
-                rows, trace = run_agent_confined(artifact.source_text, artifact.weights, tasks,
-                                                 backend=self.backend,
-                                                 timeout=self.confine_timeout)
+                rows, trace, hardened = run_agent_confined(
+                    artifact.source_text, artifact.weights, tasks, backend=self.backend,
+                    timeout=self.confine_timeout, require=self.require_confinement)
                 last_exc = None
                 break
             except SandboxError as e:
@@ -171,7 +179,7 @@ class KOTHRuntime:
             raise last_exc
         results = [BenchmarkResult(r["benchmark"], r["task_id"], str(r["answer"]), r["cost_usd"])
                    for r in rows]
-        return results, trace
+        return results, trace, hardened
 
     def run(self, artifact: Artifact, *, hotkey: str, epoch: int, nonce: str,
             suite: list[Benchmark], n_per_bench: int) -> tuple[Proof, list[dict]]:
@@ -179,8 +187,8 @@ class KOTHRuntime:
         pool call `(task_id, model, prompt, response, cost)` and is bound into the proof
         via `call_log_hash`; the miner publishes it and the validator hash-checks it."""
         tasks = self._sample_tasks(suite, epoch, nonce, n_per_bench)
-        results, trace = (self._run_confined(artifact, tasks) if self.confine
-                          else self._run_inprocess(artifact, tasks))
+        results, trace, confined = (self._run_confined(artifact, tasks) if self.confine
+                                    else self._run_inprocess(artifact, tasks))
         proof = Proof(
             epoch=epoch, nonce=nonce, hotkey=hotkey,
             source_hash=artifact.source_hash,        # computed from what actually ran
@@ -189,5 +197,6 @@ class KOTHRuntime:
             results=tuple(results), total_cost_usd=sum(e["cost_usd"] for e in trace),
             n_calls=len(trace), call_log_hash=signing.sha256_hex(trace),   # binds the published trace
             measurement=runtime_measurement(),
+            confined=confined,          # what ACTUALLY happened, not what was requested
         )
         return proof.attested_by(self.platform), trace

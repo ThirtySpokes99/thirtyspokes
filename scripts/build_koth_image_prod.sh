@@ -223,7 +223,10 @@ else:
     price_fn = config.price_for
 backend = PinnedBackend(
     OpenRouterBackend(cfg.api_key, cfg.base_url, price_fn=price_fn), set(pool_list))
-rt = KOTHRuntime(backend, tdx.TDXPlatform(), confine=True,
+# require_confinement: in the enclave an unconfined agent has network egress and could call
+# an off-allow-list model with a key of its own, voiding the pinning and the metering. Refuse
+# to run rather than degrade; the actual mode is also stamped into the proof for the validator.
+rt = KOTHRuntime(backend, tdx.TDXPlatform(), confine=True, require_confinement=True,
                  confine_timeout=float(meta("koth-confine-timeout", "7200")))
 rt.measure_self(pool_list)                                   # bind runtime+suite+pool -> RTMR3
 

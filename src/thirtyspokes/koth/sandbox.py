@@ -40,7 +40,8 @@ def run_agent_probe(source_text: str, weights: bytes, prompts: list[str],
     SandboxError → caller fails closed."""
     backend = _build_backend(pool_spec or {"kind": "mock"})
     tasks = [{"task_id": i, "benchmark": "probe", "prompt": p} for i, p in enumerate(prompts)]
-    results, _trace = run_agent_confined(source_text, weights, tasks, backend=backend, timeout=timeout)
+    results, _trace, _hardened = run_agent_confined(source_text, weights, tasks,
+                                                    backend=backend, timeout=timeout)
     by_id = {r["task_id"]: r["answer"] for r in results}
     if len(by_id) != len(prompts):
         raise SandboxError("probe produced fewer answers than prompts")

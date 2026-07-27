@@ -518,3 +518,86 @@ def adjudicate_challenge(ch: Challenge, committed_source_hash: str) -> tuple[boo
     if hash_source(ch.source_text) != committed_source_hash:
         return (False, "unbound_source")
     return scan_source(ch.source_text)
+
+
+# --- the router-agent scalar: "best answer at the lowest price, for a given ask" ---------------
+# The old scalar (Q_lcb - lambda*cost) has three defects for a ROUTING competition:
+#   1. It scores the OUTCOME, not the DECISION. "Always call the frontier model" and a router that
+#      correctly predicts which asks the cheap model handles score almost identically at lambda=0.02.
+#   2. It is ABSOLUTE, not baseline-relative. On a 95%-accurate pool every router scores ~95%, so
+#      ~98% of the number measures the POOL and ~2% measures the miner.
+#   3. It is a POINT, not a frontier. A fixed lambda bakes in one quality/price exchange rate -- the
+#      owner's -- but that tradeoff belongs to the user: a throwaway ask wants the cheapest adequate
+#      answer, a critical one wants the best available.
+#
+# `router_headroom` fixes all three: 0.0 = no better than randomising over fixed pool models AT YOUR
+# PRICE, 1.0 = matched the budget-constrained per-query oracle there. It needs a POOL REFERENCE for
+# the epoch's slice -- every (task, pool-model) score and cost -- which the OWNER publishes, since a
+# validator runs no inference and cannot know what other models would have answered.
+
+def _upper_hull(points):
+    """Non-decreasing upper convex hull of (cost, quality). Every interpolated point is physically
+    realisable by randomising between the two neighbouring policies."""
+    out, best = [], -1.0
+    for c, q in sorted(points):
+        best = max(best, q)
+        out.append((c, best))
+    h = []
+    for c, q in out:
+        while len(h) >= 2 and (h[-1][1] - h[-2][1]) * (c - h[-2][0]) <= (q - h[-2][1]) * (h[-1][0] - h[-2][0]):
+            h.pop()
+        h.append((c, q))
+    return h
+
+
+def _on_hull(h, cost):
+    if not h or cost <= h[0][0]:
+        return h[0][1] if h else 0.0
+    for (c1, q1), (c2, q2) in zip(h, h[1:]):
+        if c1 <= cost <= c2:
+            t = (cost - c1) / (c2 - c1) if c2 > c1 else 0.0
+            return q1 + t * (q2 - q1)
+    return h[-1][1]
+
+
+def zero_frontier(pool_scores, pool_costs):
+    """RouterBench's Zero router: what a FEATURELESS policy reaches at each price, by randomising
+    over fixed pool models. The bar a real router must clear to have demonstrated anything."""
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    return _upper_hull([(C[:, j].mean(), S[:, j].mean()) for j in range(S.shape[1])])
+
+
+def oracle_frontier(pool_scores, pool_costs):
+    """The budget-constrained PER-QUERY upper bound: start from the cheapest model on each ask, then
+    buy the cheapest per-ask upgrades first. For binary scores the only upgrade worth buying on an
+    ask is to the cheapest model correct there, so this is exact rather than greedy-approximate."""
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    T, M = S.shape
+    base = C.argmin(axis=1)
+    cur_s, cur_c = S[np.arange(T), base].copy(), C[np.arange(T), base].copy()
+    ups = []
+    for t in range(T):
+        better = [j for j in range(M) if S[t, j] > cur_s[t]]
+        if better:
+            j = min(better, key=lambda j: C[t, j])
+            ups.append((C[t, j] - cur_c[t], t, j))
+    pts = [(cur_c.mean(), cur_s.mean())]
+    for _dc, t, j in sorted(ups):
+        cur_c[t], cur_s[t] = C[t, j], S[t, j]
+        pts.append((cur_c.mean(), cur_s.mean()))
+    return _upper_hull(pts)
+
+
+def router_headroom(acc: float, cost: float, pool_scores, pool_costs) -> float:
+    """Share of the ACHIEVABLE headroom this router captured, at its own price.
+
+      0.0  -> no better than randomising over fixed pool models at this cost
+      1.0  -> matched the budget-constrained per-query oracle at this cost
+      <0   -> worse than the featureless baseline
+
+    Unlike a quality-only measure, matching quality at a fraction of the price scores WELL rather
+    than negative -- which is the whole point of "best answer at the lowest price".
+    """
+    z = _on_hull(zero_frontier(pool_scores, pool_costs), cost)
+    o = _on_hull(oracle_frontier(pool_scores, pool_costs), cost)
+    return float((acc - z) / (o - z)) if o - z > 1e-12 else 0.0

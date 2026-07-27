@@ -39,6 +39,7 @@ from .verify import (
     eligible,
     grounding_check,
     memorization_collapsed_relative,
+    router_headroom,
     scan_source,
     scan_weights,
     verify_proof,
@@ -90,7 +91,8 @@ class KOTHValidator:
                  audit_mode: str = "grounding", scoring_mode: str = "accumulate",
                  half_life_epochs: float = 200.0, budget_per_task: float = 0.02,
                  n_expected: int | None = None, commit_window: int | None = None,
-                 grace_blocks: int = 0, cost_tiebreak: float = 0.02):
+                 grace_blocks: int = 0, cost_tiebreak: float = 0.02,
+                 pool_reference=None):
         # memorization backstop: "grounding" (default) = pure proof-inspection, validator runs NO
         # miner code; "probe" = the legacy re-execution fresh-probe (null-pool/secret-bank upgrade).
         self.audit_mode = audit_mode
@@ -132,6 +134,17 @@ class KOTHValidator:
         # (0.02) so it cannot override a genuine per-benchmark accuracy difference — quality first,
         # cost as the tiebreak. `dethrone_guard(cost_margin=…)` is the matching rule for slot 1.
         self.cost_tiebreak = cost_tiebreak
+        # ROUTER SCALAR (the product goal: best answer at the lowest price, for a given ask).
+        # `pool_reference(epoch, nonce) -> (scores, costs)` gives every (task, pool-model) cell for
+        # this epoch's slice, published by the OWNER -- a validator runs no inference and so cannot
+        # know what the other models would have answered. With it the scalar becomes
+        # `router_headroom`: 0.0 = no better than randomising over fixed pool models AT THIS PRICE,
+        # 1.0 = matched the budget-constrained per-query oracle there. That scores the DECISION
+        # rather than the outcome, cancels out the pool's own capability (on a 95%-accurate pool the
+        # old absolute scalar was ~98% pool and ~2% miner), and prices quality against cost on a
+        # frontier instead of at one owner-chosen lambda. Without a reference it falls back to the
+        # old Q_lcb - lambda*cost, so offline sims and existing deployments are unchanged.
+        self.pool_reference = pool_reference
         self.dedup_agree = dedup_agree
         # cohort-relative memorization test: need >= min_cohort audited miners to calibrate the
         # probe's difficulty; max_probe_drop caps the allowance so a colluding all-memorizer
@@ -588,13 +601,39 @@ class KOTHValidator:
                 return E(dq=why)
         return E(verdict=vd, fingerprint=fp, audit=audit)
 
-    def _reign_scalar(self, vd: ProofVerdict) -> float:
+    def _router_scalar(self, acc: float, cost: float, epoch: int, nonce: str) -> float | None:
+        """Frontier-relative headroom against the owner-published pool reference, or None if no
+        reference is available for this epoch (then the caller keeps the legacy scalar)."""
+        if self.pool_reference is None:
+            return None
+        try:
+            ref = self.pool_reference(epoch, nonce)
+        except Exception:      # noqa: BLE001 — a reference outage must never break scoring
+            return None
+        if not ref:
+            return None
+        scores, costs = ref
+        # len(), not truthiness: `not scores` raises on a numpy array ("truth value is ambiguous")
+        if len(scores) == 0 or len(costs) == 0:
+            return None
+        return router_headroom(acc, cost, scores, costs)
+
+    def _reign_scalar(self, vd: ProofVerdict, epoch: int | None = None,
+                      nonce: str | None = None) -> float:
         """Q_lcb minus a small cost term — the quality-first, cost-as-tiebreak ranking scalar.
 
         Quality alone saturates: once an agent is at the accuracy ceiling nothing can rank above it,
         every good miner ties, and the reign falls back to commit-block seniority forever. The cost
         term is a gradient that never runs out (you can always be cheaper) and points at the axis
         where routing actually has headroom."""
+        if epoch is not None:
+            # UNITS: the frontiers are per-ask ($/query), but `total_cost_usd` is the whole slice.
+            # Comparing them directly puts the miner far to the right of the frontier and scores it
+            # ~0 no matter how well it routed.
+            n = sum(bs.n for bs in vd.per_bench.values()) or 1
+            h = self._router_scalar(vd.total_score, vd.total_cost_usd / n, epoch, nonce or "")
+            if h is not None:
+                return h            # frontier-relative headroom: the router scalar
         if self.budget <= 0 or not self.cost_tiebreak:
             return vd.score
         return vd.score - self.cost_tiebreak * min(1.0, vd.total_cost_usd / self.budget)
@@ -715,13 +754,14 @@ class KOTHValidator:
             king_vd = verdicts.get(king_id) or self._king_vd
             subs = []
             for hk, vd in verdicts.items():
-                s = self._reign_scalar(vd)
+                s = self._reign_scalar(vd, epoch, nonce)
                 if king_vd is not None and hk != king_id:
                     ok, _why = dethrone_guard(vd, king_vd, **self.guard)
                     if not ok:                                # cannot dethrone by trading a regression
-                        s = min(s, self._reign_scalar(king_vd)) - 1e-9
+                        s = min(s, self._reign_scalar(king_vd, epoch, nonce)) - 1e-9
                 subs.append(Submission(hk, hk, commit_block.get(hk, 0), s))   # commit-block seniority
-            scored_out = {hk: self._reign_scalar(vd) for hk, vd in verdicts.items()}
+            scored_out = {hk: self._reign_scalar(vd, epoch, nonce)
+                          for hk, vd in verdicts.items()}
 
         current = set(self.chain.hotkeys().values())
         dereg = {m.sub.hotkey for m in self.reign.members if m.sub.hotkey not in current}

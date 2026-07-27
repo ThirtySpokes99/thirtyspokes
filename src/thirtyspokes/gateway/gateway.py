@@ -99,9 +99,19 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
     def complete(self, model, messages, params):
         p = {"temperature": 0.0, **params}
         p.pop("finalize", None)     # gateway-internal flag, not a provider param
+        # `reasoning` is an OpenRouter body param, not a top-level kwarg, so it has to be merged
+        # into extra_body. Without it a reasoning model spends its ENTIRE max_tokens budget thinking
+        # and never emits an answer -- measured on SWE-bench Pro oracle prompts, where raising the
+        # cap from 8k to 32k did not help and simply bought more thinking: kimi-k3 burned the full
+        # 32k on 5 of 7 cells and returned nothing. Bounding thinking separately from output is the
+        # only lever that works, and the failure is silent (an empty answer, graded wrong), so it
+        # would otherwise read as a capability difference between models.
+        body = {"usage": {"include": True}}
+        reasoning = p.pop("reasoning", None)
+        if reasoning is not None:
+            body["reasoning"] = reasoning
         r = self._client.chat.completions.create(
-            model=model, messages=messages,
-            extra_body={"usage": {"include": True}}, **p)
+            model=model, messages=messages, extra_body=body, **p)
         u = r.usage
         tin, tout = u.prompt_tokens, u.completion_tokens
         cost = None

@@ -2226,3 +2226,75 @@ def test_scan_weights_finds_an_answer_table_but_not_random_weights():
     real = rng.standard_normal(200_000).astype("float32").tobytes()
     assert scan_weights(real, golds, salt="n1")[0] is False
     assert scan_weights(b"", golds, salt="n1")[0] is False
+
+
+# --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------
+# The old scalar (Q_lcb - lambda*cost) scores the OUTCOME, is ABSOLUTE rather than baseline-relative
+# (on a 95%-accurate pool ~98% of it measures the POOL), and fixes ONE quality/price exchange rate.
+# `router_headroom` scores the DECISION against what was achievable AT THAT PRICE.
+
+def _ref():
+    """3 asks x 2 models. cheap solves only ask0; pricey solves all."""
+    import numpy as np
+    return np.array([[1., 1.], [0., 1.], [0., 1.]]), np.array([[0.001, 0.10]] * 3)
+
+
+def test_router_headroom_is_zero_on_the_featureless_frontier():
+    """Both 'always cheapest' and 'always priciest' are ON the Zero frontier -- neither demonstrated
+    any routing skill, so both must score 0 regardless of their very different accuracy."""
+    from thirtyspokes.koth.verify import router_headroom
+    S, C = _ref()
+    assert abs(router_headroom(1 / 3, 0.001, S, C)) < 1e-9      # always cheap
+    assert abs(router_headroom(1.0, 0.10, S, C)) < 1e-9         # always pricey
+
+
+def test_router_headroom_rewards_matching_quality_at_lower_price():
+    """The property the OLD quality-only measure got backwards: an oracle router that reaches full
+    quality by paying the cheap model where it suffices scores 1.0, not negative."""
+    from thirtyspokes.koth.verify import router_headroom
+    S, C = _ref()
+    oracle_cost = (0.001 + 0.10 + 0.10) / 3        # cheap on ask0, pricey on the other two
+    assert router_headroom(1.0, oracle_cost, S, C) == pytest.approx(1.0, abs=1e-6)
+    assert router_headroom(0.0, 0.05, S, C) < 0     # worse than the baseline -> negative
+
+
+def test_router_headroom_ignores_asks_nobody_can_solve():
+    """A query no pool model answers must not drag every miner down -- routing cannot fix it."""
+    from thirtyspokes.koth.verify import oracle_frontier, zero_frontier
+    import numpy as np
+    S = np.array([[1., 1.], [0., 0.]]); C = np.array([[0.001, 0.10]] * 2)
+    # both frontiers cap at 0.5: the unsolvable ask is simply unreachable for anyone
+    assert max(q for _, q in zero_frontier(S, C)) == pytest.approx(0.5)
+    assert max(q for _, q in oracle_frontier(S, C)) == pytest.approx(0.5)
+
+
+def test_validator_uses_the_router_scalar_when_a_pool_reference_exists(env):
+    """With a reference the reign scalar becomes frontier-relative headroom; without one it falls
+    back to the legacy Q_lcb - lambda*cost, so existing deployments are unchanged."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.koth.verify import BenchStat, ProofVerdict
+    from thirtyspokes.reign import KingChain
+    S, C = _ref()
+    vd = ProofVerdict(True, "ok", {"math": BenchStat(3, 1.0, 0.7, 0.201)}, 0.201, 0.7, 1.0)
+
+    plain = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None)
+    legacy = plain._reign_scalar(vd, epoch=1, nonce="n")
+    assert legacy == pytest.approx(vd.score - 0.02 * min(1.0, 0.201 / 0.5))
+
+    routed = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                           pool_reference=lambda e, n: (S, C))
+    assert routed._reign_scalar(vd, epoch=1, nonce="n") == pytest.approx(1.0, abs=1e-6)
+
+
+def test_pool_reference_outage_falls_back_instead_of_breaking_scoring():
+    """A reference fetch that raises must never take the subnet down."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.koth.benchmarks import default_suite
+    from thirtyspokes.reign import KingChain
+
+    def boom(epoch, nonce):
+        raise RuntimeError("reference unavailable")
+
+    v = KOTHValidator({"m"}, "pub", None, KingChain(), default_suite(), None, None,
+                      pool_reference=boom)
+    assert v._router_scalar(0.9, 0.01, 1, "n") is None

@@ -142,9 +142,12 @@ class KOTHRuntime:
         def rec_call(model, messages, params=None):    # the agent's only channel; records the trace
             c0 = proxy.total_cost_usd
             resp = proxy.call_model(model, messages, params)   # meters + pins (PinnedBackend)
+            tin, tout = getattr(proxy, "last_tokens", (0, 0))
             trace.append({"task_id": cur["tid"], "model": model,
                           "prompt": str(messages[-1]["content"]), "response": str(resp),
-                          "cost_usd": proxy.total_cost_usd - c0})
+                          "cost_usd": proxy.total_cost_usd - c0,
+                          "tokens_in": tin, "tokens_out": tout,
+                          "latency_s": getattr(proxy, "last_latency_s", 0.0)})
             return resp
 
         results: list[BenchmarkResult] = []
@@ -201,5 +204,11 @@ class KOTHRuntime:
             n_calls=len(trace), call_log_hash=signing.sha256_hex(trace),   # binds the published trace
             measurement=runtime_measurement(),
             confined=confined,          # what ACTUALLY happened, not what was requested
+            # float(): sum([]) is int 0, and `from_json` coerces to 0.0 -- 0 and 0.0 hash
+            # differently in the canonical payload, so an agent that makes NO pool calls would
+            # produce a proof whose report_data changed across serialization (report_data_mismatch).
+            latency_s=float(round(sum(e.get("latency_s", 0.0) for e in trace), 3)),
+            tokens_in=sum(int(e.get("tokens_in", 0)) for e in trace),
+            tokens_out=sum(int(e.get("tokens_out", 0)) for e in trace),
         )
         return proof.attested_by(self.platform), trace

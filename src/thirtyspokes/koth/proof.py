@@ -56,6 +56,12 @@ class Proof:
     # fully-enforcing validator could not tell the two runs apart. In the payload ⇒ covered by
     # `report_data()` ⇒ covered by the quote ⇒ un-forgeable.
     confined: bool = False
+    # Latency and tokens are part of the product promise ("best answer at the lowest price" is also
+    # a speed claim) and were measured by the metering proxy but discarded before the proof. In the
+    # payload => covered by report_data => covered by the quote, so they are as un-forgeable as cost.
+    latency_s: float = 0.0          # wall-clock across every pool call in the run
+    tokens_in: int = 0
+    tokens_out: int = 0
     quote: Quote | None = None
 
     def _payload(self) -> dict:
@@ -93,5 +99,7 @@ class Proof:
             # absent ⇒ False: an old proof that never asserted confinement must not be read as
             # having had it. Fails closed under a validator that gates on it.
             confined=bool(d.get("confined", False)),
+            latency_s=float(d.get("latency_s", 0.0)),
+            tokens_in=int(d.get("tokens_in", 0)), tokens_out=int(d.get("tokens_out", 0)),
             quote=Quote(**q) if q else None,
         )

@@ -39,9 +39,11 @@ from .verify import (
     eligible,
     grounding_check,
     memorization_collapsed_relative,
+    per_ask_regret,
     router_headroom,
     scan_source,
     scan_weights,
+    trajectory_stats,
     verify_proof,
 )
 
@@ -75,6 +77,7 @@ class _MinerEval:
     audit: tuple | None = None
     sh: str | None = None
     wh: str | None = None
+    trajectory: dict | None = None      # intelligence-layer diagnostics (never a reward term)
 
 
 class KOTHValidator:
@@ -599,7 +602,14 @@ class KOTHValidator:
             ok, why = eligible(vd, budget=self.budget, f_min=self.f_min)
             if not ok:
                 return E(dq=why)
-        return E(verdict=vd, fingerprint=fp, audit=audit)
+        # INTELLIGENCE-LAYER diagnostics. The scalar sees only the final answer and the total
+        # cost, so escalation/early-stop behaviour is invisible to it. Recorded, never rewarded --
+        # any of these pays the moment it scores, and a miner would farm it.
+        try:
+            traj = trajectory_stats(proof, trace)
+        except Exception:                       # noqa: BLE001 — diagnostics must never fail a miner
+            traj = {}
+        return E(verdict=vd, fingerprint=fp, audit=audit, trajectory=traj)
 
     def _router_scalar(self, acc: float, cost: float, epoch: int, nonce: str) -> float | None:
         """Frontier-relative headroom against the owner-published pool reference, or None if no
@@ -724,6 +734,8 @@ class KOTHValidator:
             ev = self._score_one_miner(hk, c.data, parsed[0], parsed[1], epoch, nonce, get_proof,
                                        gov, probe)
             evals[hk] = ev
+            if ev.trajectory:
+                audit_detail.setdefault("trajectory", {})[hk] = ev.trajectory
             if ev.dq:
                 dq[hk] = ev.dq
                 continue

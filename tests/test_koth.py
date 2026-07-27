@@ -2298,3 +2298,75 @@ def test_pool_reference_outage_falls_back_instead_of_breaking_scoring():
     v = KOTHValidator({"m"}, "pub", None, KingChain(), default_suite(), None, None,
                       pool_reference=boom)
     assert v._router_scalar(0.9, 0.01, 1, "n") is None
+
+
+# --- workstream 1: what the scalar could not see --------------------------------------------------
+
+def test_miners_can_bound_their_own_thinking():
+    """`max_tokens` counts THINKING tokens, so without a separate bound a reasoning model spends its
+    whole budget deliberating and returns an empty answer — measured at 8k AND 32k. It grades as
+    wrong, so it reads as incapability. Miners must be able to send `reasoning`."""
+    from thirtyspokes.tee.runtime import ALLOWED_PARAMS, MeteringProxy
+    assert "reasoning" in ALLOWED_PARAMS
+
+    seen = {}
+
+    class Spy:
+        def complete(self, model, messages, params):
+            seen.update(params)
+            return "ok", 3, 4, 0.001
+
+    MeteringProxy(Spy()).call_model("m", [{"role": "user", "content": "hi"}],
+                                    {"reasoning": {"effort": "low"}, "stream": True})
+    assert seen["reasoning"] == {"effort": "low"}
+    assert "stream" not in seen, "the allowlist must still reject everything else"
+
+
+def test_latency_and_tokens_are_attested(env):
+    """Speed is half of 'best answer at the lowest price' and was measured then discarded. In the
+    payload => covered by report_data => covered by the quote."""
+    import dataclasses
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert "latency_s" in p._payload() and "tokens_out" in p._payload()
+    assert p.tokens_out > 0, "the metering proxy measures these; they must reach the proof"
+    forged = dataclasses.replace(p, latency_s=p.latency_s + 100.0)
+    assert forged.report_data() != p.quote.report_data     # cannot be edited after attestation
+
+
+def test_empty_trace_proof_survives_serialization(env):
+    """Regression: sum([]) is int 0 but from_json coerces to 0.0, and 0 vs 0.0 hash differently in
+    the canonical payload — an agent making NO pool calls produced report_data_mismatch."""
+    from thirtyspokes.koth.proof import Proof
+    a = _art(_NOCALL_SRC if "_NOCALL_SRC" in globals() else _ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert Proof.from_json(p.to_json()).report_data() == p.report_data()
+
+
+def test_per_ask_regret_ignores_asks_nobody_solves():
+    """An ask no pool model answers must cost every miner ZERO quality regret — routing cannot fix
+    it, and an accuracy average would drag everyone down for it."""
+    import numpy as np
+    from thirtyspokes.koth.verify import per_ask_regret
+    S = np.array([[1., 1.], [0., 1.], [0., 0.]])
+    C = np.array([[0.001, 0.10]] * 3)
+    qual, cost = per_ask_regret([1., 0., 0.], [0.001] * 3, S, C)
+    assert list(qual) == [0.0, 1.0, 0.0]          # ask2 unsolvable -> no regret charged
+    assert cost[1] < 0                            # underspent on the ask it got wrong
+
+
+def test_trajectory_stats_sees_the_intelligence_layer(env):
+    """The scalar sees only the final answer and total cost. These diagnostics distinguish an agent
+    that escalated and RECOVERED from one that escalated blindly."""
+    from thirtyspokes.koth.proof import BenchmarkResult, Proof
+    from thirtyspokes.koth.verify import trajectory_stats
+    p = Proof(epoch=1, nonce="n", hotkey="hk", source_hash="s", weights_hash="w", model_id="m",
+              results=(BenchmarkResult("math", "t1", "42", 0.02),), total_cost_usd=0.02,
+              n_calls=2, call_log_hash="x", measurement="m")
+    trace = [{"task_id": "t1", "model": "cheap", "prompt": "q", "response": "17", "cost_usd": 0.001},
+             {"task_id": "t1", "model": "strong", "prompt": "q", "response": "42", "cost_usd": 0.019}]
+    s = trajectory_stats(p, trace)
+    assert s["escalations"] == 1
+    assert s["escalations_that_changed_the_answer"] == 1    # the escalation RECOVERED the answer
+    assert s["escalation_yield"] == 1.0
+    assert s["calls_per_ask"] == 2.0

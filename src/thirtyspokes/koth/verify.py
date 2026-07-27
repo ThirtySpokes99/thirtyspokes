@@ -601,3 +601,71 @@ def router_headroom(acc: float, cost: float, pool_scores, pool_costs) -> float:
     z = _on_hull(zero_frontier(pool_scores, pool_costs), cost)
     o = _on_hull(oracle_frontier(pool_scores, pool_costs), cost)
     return float((acc - z) / (o - z)) if o - z > 1e-12 else 0.0
+
+
+def per_ask_regret(miner_scores, miner_costs, pool_scores, pool_costs):
+    """Per-ASK attribution: what did this router give up, on each individual question?
+
+      quality_regret[q] = max_m s(q,m) - s(q, chosen)      # a better model was available
+      cost_regret[q]    = cost(q, chosen) - cheapest_correct(q)
+
+    Why per-ask rather than the aggregate `router_headroom` takes: aggregates cannot separate a
+    router that made good decisions from one that got lucky overall, and they waste information.
+    Binary accuracy carries ~1 bit per ask; regret is CONTINUOUS and graded against every known
+    alternative, so a paired comparison needs materially fewer asks to resolve the same gap. That
+    matters directly at n_per_bench=8.
+
+    An ask nobody in the pool solves contributes ZERO quality regret to everyone -- routing cannot
+    fix it, so it must not drag every miner down the way an accuracy average does.
+    """
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    ms, mc = np.asarray(miner_scores, float), np.asarray(miner_costs, float)
+    qual = S.max(axis=1) - ms
+    cheapest_ok = np.array([
+        min([C[t, j] for j in range(S.shape[1]) if S[t, j] >= S[t].max()], default=C[t].min())
+        for t in range(S.shape[0])])
+    return qual, mc - cheapest_ok
+
+
+def trajectory_stats(proof, trace: list[dict]) -> dict:
+    """Diagnostics for the INTELLIGENCE LAYER — the half of "routing model + intelligence layer"
+    that the scalar cannot see.
+
+    The mechanism scores the final answer and the total cost, so it cannot tell an agent that
+    escalated BECAUSE its verifier caught an error from one that escalated blindly, nor one that
+    stopped early because it was confident from one that got lucky. The trace already records every
+    call and is hash-attested (`call_log_hash`), so the signal is present and simply discarded.
+
+    Reported as DIAGNOSTICS, never as reward terms: any of these becomes trivially gameable the
+    moment it pays (a miner would escalate constantly to farm `escalations`), exactly as
+    RouterEval's selection-entropy metric is maximised by a random router.
+    """
+    by_task: dict = {}
+    for e in trace:
+        by_task.setdefault(e.get("task_id"), []).append(e)
+    final = {r.task_id: r.answer for r in proof.results}
+    n_esc = n_rec = n_waste = 0
+    calls = []
+    for tid, es in by_task.items():
+        calls.append(len(es))
+        costs = [float(e.get("cost_usd", 0.0)) for e in es]
+        for i in range(1, len(es)):                       # escalation = a pricier call after a cheaper
+            if costs[i] > costs[i - 1] > 0:
+                n_esc += 1
+                # did the escalation actually change the answer that was finally submitted?
+                if str(es[i].get("response", "")).strip() == str(final.get(tid, "")).strip() \
+                        and str(es[i - 1].get("response", "")).strip() != str(final.get(tid, "")).strip():
+                    n_rec += 1
+        # a call whose response never became the answer and was not followed by an escalation
+        for e in es[:-1]:
+            if str(e.get("response", "")).strip() != str(final.get(tid, "")).strip():
+                n_waste += 1
+    return {
+        "calls_per_ask": round(float(np.mean(calls)), 2) if calls else 0.0,
+        "escalations": n_esc,
+        "escalations_that_changed_the_answer": n_rec,
+        "escalation_yield": round(n_rec / n_esc, 3) if n_esc else 0.0,
+        "superseded_calls": n_waste,
+        "latency_s": round(float(getattr(proof, "latency_s", 0.0)), 3),
+        "tokens_out": int(getattr(proof, "tokens_out", 0)),
+    }

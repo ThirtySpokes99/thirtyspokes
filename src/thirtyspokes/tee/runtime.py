@@ -18,8 +18,12 @@ from .attestation import AttestationReport, Platform
 
 # Bump on any runtime change → new measurement → must be re-approved on-chain.
 RUNTIME_VERSION = "orchestra-tee-runtime-1"
-# Whitelist of params the runtime forwards to the provider (rejects stream/n/etc.)
-ALLOWED_PARAMS = {"max_tokens", "temperature", "top_p", "stop"}
+# Whitelist of params the runtime forwards to the provider (rejects stream/n/etc.).
+# `reasoning` is allowed because `max_tokens` counts THINKING tokens: without a separate bound a
+# reasoning model spends its whole budget deliberating and returns an empty answer, which grades as
+# wrong and is indistinguishable from incapability. Measured at 8k AND at 32k -- raising the cap only
+# buys more thinking. It is also cost-REDUCING, so a miner has no incentive to abuse it.
+ALLOWED_PARAMS = {"max_tokens", "temperature", "top_p", "stop", "reasoning"}
 
 
 def runtime_measurement() -> str:
@@ -36,10 +40,14 @@ class MeteringProxy:
     calls: list = field(default_factory=list)
 
     def call_model(self, model: str, messages: list, params: dict | None = None) -> str:
+        import time  # noqa: PLC0415
         p = {k: v for k, v in (params or {}).items() if k in ALLOWED_PARAMS}
         p.setdefault("max_tokens", 1024)
         p.setdefault("temperature", 0.0)
+        t0 = time.time()
         text, tin, tout, cost = self.backend.complete(model, messages, p)
+        self.last_latency_s = round(time.time() - t0, 3)
+        self.last_tokens = (tin, tout)
         self.total_cost_usd += float(cost)
         self.calls.append({"model": model, "tin": tin, "tout": tout, "cost": cost})
         return text

@@ -188,9 +188,12 @@ def run_agent_confined(source_text: str, weights: bytes, tasks: list[dict], *, b
             if msg["type"] == "call":
                 c0 = proxy.total_cost_usd
                 resp = proxy.call_model(msg["model"], msg["messages"], msg.get("params"))
+                tin, tout = getattr(proxy, "last_tokens", (0, 0))
                 trace.append({"task_id": msg.get("task_id"), "model": msg["model"],
                               "prompt": str(msg["messages"][-1]["content"]),
-                              "response": str(resp), "cost_usd": proxy.total_cost_usd - c0})
+                              "response": str(resp), "cost_usd": proxy.total_cost_usd - c0,
+                              "tokens_in": tin, "tokens_out": tout,
+                              "latency_s": getattr(proxy, "last_latency_s", 0.0)})
                 _send(proc.stdin, {"type": "resp", "response": resp})
             elif msg["type"] == "result":
                 results.append(msg["result"])

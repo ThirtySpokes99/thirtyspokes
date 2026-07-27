@@ -30,8 +30,15 @@ jobs:
       # dev = pytest + math_verify (required by the unconditional MATH grader tests); tee =
       # cryptography + dcap-qvl (unlocks full DCAP quote-verification coverage). Dataset clients stay
       # in the optional eval extra so this offline suite never depends on a live dataset download.
+      #
+      # `llm` (httpx + openai + certifi) is here for ONE test that must not be allowed to skip:
+      # `test_pool_client_ignores_env_tls_and_proxy_overrides` is the inverted PoC for the hole where
+      # a miner could point the pool client at its own CA/proxy and forge every response. Without the
+      # client stack installed it does not skip quietly — it fails collection — and the obvious
+      # "fix" of making it skippable would retire the regression test for a live security property.
+      # It adds no network dependency: nothing in the offline suite makes a request.
       - name: Install package + test deps
-        run: uv pip install --system --no-cache -e ".[dev,tee]"
+        run: uv pip install --system --no-cache -e ".[dev,tee,llm]"
 
       - name: Run test suite
         run: pytest -q

@@ -13,8 +13,11 @@ dependencies = [
 # Everything required by the unconditional offline test suite. Keep network-backed dataset clients
 # in `eval`; the two MATH grader regressions still require math_verify in a clean test environment.
 dev = ["pytest>=8.0", "math_verify>=0.5"]
-# Optional real-LLM outcome backends (offline runs work without these)
-llm = ["httpx>=0.27", "openai>=1.40"]
+# Optional real-LLM outcome backends (offline runs work without these).
+# `certifi` is declared explicitly rather than leaned on as an httpx transitive: the pool client's
+# TLS regression test imports it DIRECTLY to build a hostile CA, and a transitive dependency that
+# silently stops being pulled would turn that security test into a collection error.
+llm = ["httpx>=0.27", "openai>=1.40", "certifi"]
 # Live Bittensor chain integration (offline simulator works without it)
 chain = ["bittensor>=8.0", "huggingface_hub>=0.24"]
 # Metered-gateway linchpin: ed25519 receipt signing

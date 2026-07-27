@@ -47,6 +47,17 @@ class BenchStat:
     cost_usd: float
 
 
+@dataclass(frozen=True)
+class TaskStat:
+    """One graded ask. The per-benchmark aggregate cannot answer "which ask did this router get
+    wrong, and what did it pay for it", which is what per-ask regret and the frontier's cost axis
+    both need — so the grading loop keeps its working detail instead of discarding it."""
+    benchmark: str
+    task_id: str
+    correct: float
+    cost_usd: float
+
+
 @dataclass
 class ProofVerdict:
     valid: bool
@@ -56,6 +67,7 @@ class ProofVerdict:
     score: float = 0.0          # Q_lcb = Σ w·lcb, the bounded [0,1] reign scalar
     total_score: float = 0.0    # Σ w·acc (point) — display + per-benchmark floor
     eligible: bool = True        # passes cost budget + floors + pool-call gate
+    per_task: tuple[TaskStat, ...] = ()   # per-ask detail, in the validator's re-derived slice order
 
 
 def _bootstrap_lcb(correct: list[float], alpha: float, boot: int, seed: int) -> float:
@@ -170,6 +182,7 @@ def verify_proof(
     # re-derive the assigned slice + gold, and index the attested answers
     submitted = {(r.benchmark, r.task_id): r for r in proof.results}
     per_bench: dict[str, BenchStat] = {}
+    per_task: list[TaskStat] = []
     q_lcb = 0.0          # Σ w·lcb  (bounded reign scalar)
     total_score = 0.0    # Σ w·acc  (point)
     seen: set[tuple[str, str]] = set()
@@ -182,9 +195,10 @@ def verify_proof(
             seen.add(key)
             r = submitted.get(key)
             ans = r.answer if r is not None else ""    # missing task -> graded wrong
-            if r is not None:
-                cost += float(r.cost_usd)
+            task_cost = float(r.cost_usd) if r is not None else 0.0
+            cost += task_cost
             correct.append(bench.grade(ans, t.gold))
+            per_task.append(TaskStat(bench.name, t.task_id, correct[-1], task_cost))
         lcb = _bootstrap_lcb(correct, alpha, boot,
                              seed=int(signing.sha256_hex(f"{proof.nonce}|{bench.name}")[:8], 16))
         acc = float(np.mean(correct)) if correct else 0.0
@@ -195,7 +209,7 @@ def verify_proof(
     if any(k not in seen for k in submitted):
         return bad("unexpected_task")
 
-    return ProofVerdict(True, "ok", per_bench, c, q_lcb, total_score)
+    return ProofVerdict(True, "ok", per_bench, c, q_lcb, total_score, per_task=tuple(per_task))
 
 
 def dethrone_guard(
@@ -288,6 +302,18 @@ def answer_token(text, kind: str):
     if kind == "number":
         v = extract_number(text)
         return None if v is None else format(v, ".6g")
+    if kind == "code":
+        # THE PARSER MUST MATCH THE GRADER'S, and for code that parser is `extract_code`. Comparing
+        # raw text here instead disqualified every honest agent: a model answers a code ask with
+        # prose plus a ```python fence, so an agent that strips the fence — exactly what the grader
+        # does before running the program — produces an answer that matches no response verbatim.
+        # All 8 code answers then read `ungrounded`, blowing past `max_ungrounded` (0.15) and DQ'ing
+        # the miner for behaving normally. Extracting both sides makes the fenced response and the
+        # cleaned answer the same token, while a memorized program that never came from the pool
+        # still matches nothing.
+        from .lcb import extract_code
+        s = " ".join(extract_code(text).split())
+        return s or None
     s = " ".join(str(text).split())                  # patch/text: whitespace-normalized
     return s or None
 
@@ -298,6 +324,14 @@ def answer_token(text, kind: str):
 # would flag every honest agent. That is not a tuning problem — it means no prompt/response rule can
 # ever defend an MCQ benchmark against memorization, which is why the scored suite ranks on
 # free-form answers (see `benchmarks.real_suite`).
+#
+# CODE IS ALSO EXCLUDED, and this one is a judgement call worth stating. Ordering would catch the
+# laundering vector (put a memorized program in your own prompt, let the model echo it back), but
+# `extract_code` pulls the fenced block out of a PROMPT just as readily as out of a response — so
+# every self-refining agent ("here is my draft, find the bug") would be flagged `laundered` for the
+# iterative orchestration this subnet exists to reward. Plain grounding still applies: the program
+# must appear in a pool RESPONSE, so an agent that answers from its own weights without consulting
+# the pool is still caught. The residual is a memorizer who launders through a self-authored prompt.
 _PROVENANCE_KINDS = frozenset({"number", "patch"})
 
 
@@ -535,6 +569,21 @@ def adjudicate_challenge(ch: Challenge, committed_source_hash: str) -> tuple[boo
 # the epoch's slice -- every (task, pool-model) score and cost -- which the OWNER publishes, since a
 # validator runs no inference and cannot know what other models would have answered.
 
+def _wmean(x, w) -> float:
+    """Row-weighted mean, or the plain mean when no weights are given.
+
+    ROW WEIGHTS EXIST BECAUSE THE TWO SIDES OF THE COMPARISON MUST BE WEIGHTED ALIKE. The miner's
+    score is `Σ_b w_b·acc_b`, but the reference matrix holds one row per TASK across every benchmark,
+    so an unweighted row mean silently re-weights the pool by how many tasks each benchmark
+    contributed. On the live suite that is not a rounding error: `mmlu` carries weight 0 (an
+    eligibility floor, never ranked — see `benchmarks.real_suite`) yet supplies half the rows, so an
+    unweighted frontier would be half-built from a benchmark the miner is not scored on. Passing
+    `w_row = w_b / n_b` makes the frontier the same weighted average as the miner's own number, and
+    drops weight-0 benchmarks out of it automatically."""
+    return float(np.average(np.asarray(x, float), weights=w)) if w is not None \
+        else float(np.mean(np.asarray(x, float)))
+
+
 def _upper_hull(points):
     """Non-decreasing upper convex hull of (cost, quality). Every interpolated point is physically
     realisable by randomising between the two neighbouring policies."""
@@ -560,17 +609,22 @@ def _on_hull(h, cost):
     return h[-1][1]
 
 
-def zero_frontier(pool_scores, pool_costs):
+def zero_frontier(pool_scores, pool_costs, row_weights=None):
     """RouterBench's Zero router: what a FEATURELESS policy reaches at each price, by randomising
     over fixed pool models. The bar a real router must clear to have demonstrated anything."""
     S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
-    return _upper_hull([(C[:, j].mean(), S[:, j].mean()) for j in range(S.shape[1])])
+    return _upper_hull([(_wmean(C[:, j], row_weights), _wmean(S[:, j], row_weights))
+                        for j in range(S.shape[1])])
 
 
-def oracle_frontier(pool_scores, pool_costs):
+def oracle_frontier(pool_scores, pool_costs, row_weights=None):
     """The budget-constrained PER-QUERY upper bound: start from the cheapest model on each ask, then
     buy the cheapest per-ask upgrades first. For binary scores the only upgrade worth buying on an
-    ask is to the cheapest model correct there, so this is exact rather than greedy-approximate."""
+    ask is to the cheapest model correct there, so this is exact rather than greedy-approximate.
+
+    The purchase ORDER is unaffected by `row_weights`: an upgrade on ask `t` buys `w_t·Δs_t` quality
+    for `w_t·Δc_t`, so the weight cancels out of the cost-effectiveness ratio and (with binary
+    scores, where every upgrade is the same 0->1 step) ordering by raw `Δc_t` stays exact."""
     S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
     T, M = S.shape
     base = C.argmin(axis=1)
@@ -581,14 +635,39 @@ def oracle_frontier(pool_scores, pool_costs):
         if better:
             j = min(better, key=lambda j: C[t, j])
             ups.append((C[t, j] - cur_c[t], t, j))
-    pts = [(cur_c.mean(), cur_s.mean())]
+    pts = [(_wmean(cur_c, row_weights), _wmean(cur_s, row_weights))]
     for _dc, t, j in sorted(ups):
         cur_c[t], cur_s[t] = C[t, j], S[t, j]
-        pts.append((cur_c.mean(), cur_s.mean()))
+        pts.append((_wmean(cur_c, row_weights), _wmean(cur_s, row_weights)))
     return _upper_hull(pts)
 
 
-def router_headroom(acc: float, cost: float, pool_scores, pool_costs) -> float:
+def achievable_gap(pool_scores, pool_costs, row_weights=None) -> float:
+    """The most quality a perfect per-ask router could add over the featureless baseline, anywhere
+    on the price range. MINER-INDEPENDENT: it is a property of the traffic and the pool, not of
+    anyone competing, so it is the honest answer to "is this suite worth routing at all".
+
+    This is the same oracle-gap statistic this project measured across eight experiments — ~0.019 on
+    the saturated math suite, ~0.083 on LiveCodeBench. Publishing it each epoch means a saturated
+    benchmark announces itself in the feed instead of being silently amplified into a ranking."""
+    zf = zero_frontier(pool_scores, pool_costs, row_weights)
+    of = oracle_frontier(pool_scores, pool_costs, row_weights)
+    costs = sorted({c for c, _ in zf} | {c for c, _ in of})
+    return max((_on_hull(of, c) - _on_hull(zf, c) for c in costs), default=0.0)
+
+
+def frontier_bounds(cost: float, pool_scores, pool_costs, row_weights=None) -> tuple[float, float]:
+    """`(zero, oracle)` quality at this price — the two ends of the achievable band.
+
+    Returned as a PAIR rather than pre-divided into a ratio because the accumulator pools them
+    across epochs before dividing (`evidence.Evidence.headroom_lcb`), and because their DIFFERENCE
+    is itself the diagnostic that says whether the traffic is worth routing at all."""
+    z = _on_hull(zero_frontier(pool_scores, pool_costs, row_weights), cost)
+    o = _on_hull(oracle_frontier(pool_scores, pool_costs, row_weights), cost)
+    return z, o
+
+
+def router_headroom(acc: float, cost: float, pool_scores, pool_costs, row_weights=None) -> float:
     """Share of the ACHIEVABLE headroom this router captured, at its own price.
 
       0.0  -> no better than randomising over fixed pool models at this cost
@@ -597,9 +676,12 @@ def router_headroom(acc: float, cost: float, pool_scores, pool_costs) -> float:
 
     Unlike a quality-only measure, matching quality at a fraction of the price scores WELL rather
     than negative -- which is the whole point of "best answer at the lowest price".
+
+    Single-slice form, kept for analysis and the `per_epoch` sim path. The DEFAULT `accumulate`
+    scoring mode pools the frontier across epochs instead (`evidence.Evidence.headroom_lcb`), so a
+    single 8-question slice cannot decide a crown.
     """
-    z = _on_hull(zero_frontier(pool_scores, pool_costs), cost)
-    o = _on_hull(oracle_frontier(pool_scores, pool_costs), cost)
+    z, o = frontier_bounds(cost, pool_scores, pool_costs, row_weights)
     return float((acc - z) / (o - z)) if o - z > 1e-12 else 0.0
 
 
@@ -625,6 +707,50 @@ def per_ask_regret(miner_scores, miner_costs, pool_scores, pool_costs):
         min([C[t, j] for j in range(S.shape[1]) if S[t, j] >= S[t].max()], default=C[t].min())
         for t in range(S.shape[0])])
     return qual, mc - cheapest_ok
+
+
+def row_weights_for(row_benchmarks, bench_weights: dict[str, float]) -> list[float] | None:
+    """Per-ROW weights that make a reference-matrix mean equal the miner's `Σ_b w_b·acc_b`.
+
+    Each benchmark `b` gets total mass `w_b`, split evenly over the rows it contributed
+    (`w_b / n_b`), so a benchmark supplying more tasks does not thereby count for more — and a
+    weight-0 benchmark (the MMLU eligibility floor) contributes nothing to the frontier at all.
+    Returns None when no row carries any weight, so the caller can decline to score rather than
+    divide by zero."""
+    counts: dict[str, int] = {}
+    for b in row_benchmarks:
+        counts[b] = counts.get(b, 0) + 1
+    w = [bench_weights.get(b, 0.0) / counts[b] for b in row_benchmarks]
+    return w if sum(w) > 0 else None
+
+
+def regret_stats(per_task, ref: dict) -> dict:
+    """Per-ask ATTRIBUTION against the pool reference — what this router gave up, ask by ask.
+
+    Diagnostics, not a reward term. Regret and the frontier scalar are both measured against the
+    SAME reference, so paying for regret on top of headroom would price one decision twice; and
+    unlike headroom, regret has no scale on which "good" is defined without a second calibration.
+    Its job is to EXPLAIN a headroom number: a router that lost quality reads differently from one
+    that merely overpaid, and the aggregate scalar cannot tell them apart.
+    """
+    rows = {tid: i for i, tid in enumerate(ref.get("task_ids", []))}
+    S, C = np.asarray(ref["scores"], float), np.asarray(ref["costs"], float)
+    idx = [(rows[t.task_id], t) for t in per_task if t.task_id in rows]
+    if not idx:
+        return {}
+    order = [i for i, _ in idx]
+    qual, cost = per_ask_regret([t.correct for _, t in idx], [t.cost_usd for _, t in idx],
+                                S[order], C[order])
+    return {
+        "asks_matched": len(idx),
+        # mean quality given up per ask: 0.0 == never picked worse than the best available model
+        "quality_regret": round(float(np.mean(qual)), 4),
+        # mean overpayment per ask vs the cheapest model that was just as good
+        "cost_regret_usd": round(float(np.mean(cost)), 6),
+        # asks no pool model solves: they charge zero regret to everyone, so they are reported
+        # separately rather than silently diluting the average
+        "asks_nobody_solves": int(np.sum(S[order].max(axis=1) <= 0.0)),
+    }
 
 
 def trajectory_stats(proof, trace: list[dict]) -> dict:

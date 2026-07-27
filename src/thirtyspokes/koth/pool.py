@@ -95,6 +95,11 @@ class MockPool:
         h = int(signing.sha256_hex(f"{model}|{prompt}")[:8], 16) / 0xFFFFFFFF
         ans = solve_synthetic(prompt) if h < acc else "wrong"
         tin = max(1, len(signing.canonical(messages)) // 4)
-        tout = int(params.get("max_tokens", 32))
+        # bill what was actually PRODUCED, not the cap. `max_tokens` is a ceiling — a real provider
+        # charges for the tokens it emitted — and billing the ceiling made an agent's cost depend on
+        # a number it never spent. That matters now the ranked benchmark is code: a sane agent asks
+        # for a 16k ceiling so a program is not truncated mid-function, and under cap-billing that
+        # alone put the reference agent 32x over budget while emitting a two-token answer.
+        tout = min(int(params.get("max_tokens", 32)), max(1, len(ans) // 4 + 1))
         cost = (tin + tout) / 1000.0 * price
         return ans, tin, tout, cost

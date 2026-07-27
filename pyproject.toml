@@ -38,6 +38,7 @@ orchestra-koth-gcp-miner = "thirtyspokes.koth.gcp_operator:main"
 orchestra-koth-validator = "thirtyspokes.koth.neuron:validator_main"
 orchestra-koth-dev = "thirtyspokes.koth.devkit:main"
 orchestra-koth-owner = "thirtyspokes.koth.owner:main"
+orchestra-koth-reference = "thirtyspokes.koth.reference:main"
 orchestra-miner = "thirtyspokes.subnet.miner:main"
 orchestra-validator = "thirtyspokes.subnet.validator:main"
 

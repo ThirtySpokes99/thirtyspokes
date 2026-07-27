@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 
 from collections import Counter
 
+import numpy as np
+
 from ..gateway import signing
 from ..gateway.gateway import ModelBackend
 from ..reign import Reign, Submission
@@ -28,6 +30,7 @@ from . import commit as commitmod
 from .benchmarks import bench_seed
 from .epoch import EPOCH_BLOCKS, current_epoch, epoch_nonce
 from .evidence import EvidenceStore
+from .lcb import GradingUnavailable
 from .sandbox import SandboxError, run_agent_probe
 from .store import hash_source, hash_weights, is_pinned_revision
 from .verify import (
@@ -36,13 +39,16 @@ from .verify import (
     behavioral_duplicates,
     cohort_probe_allowance,
     dethrone_guard,
+    achievable_gap,
     eligible,
+    frontier_bounds,
     grounding_check,
     memorization_collapsed_relative,
-    per_ask_regret,
-    router_headroom,
+    regret_stats,
+    row_weights_for,
     scan_source,
     scan_weights,
+    TaskStat,
     trajectory_stats,
     verify_proof,
 )
@@ -95,7 +101,7 @@ class KOTHValidator:
                  half_life_epochs: float = 200.0, budget_per_task: float = 0.02,
                  n_expected: int | None = None, commit_window: int | None = None,
                  grace_blocks: int = 0, cost_tiebreak: float = 0.02,
-                 pool_reference=None):
+                 pool_reference=None, min_headroom_gap: float = 0.05):
         # memorization backstop: "grounding" (default) = pure proof-inspection, validator runs NO
         # miner code; "probe" = the legacy re-execution fresh-probe (null-pool/secret-bank upgrade).
         self.audit_mode = audit_mode
@@ -138,16 +144,28 @@ class KOTHValidator:
         # cost as the tiebreak. `dethrone_guard(cost_margin=…)` is the matching rule for slot 1.
         self.cost_tiebreak = cost_tiebreak
         # ROUTER SCALAR (the product goal: best answer at the lowest price, for a given ask).
-        # `pool_reference(epoch, nonce) -> (scores, costs)` gives every (task, pool-model) cell for
+        # `pool_reference(epoch, nonce) -> record | None` gives every (task, pool-model) cell for
         # this epoch's slice, published by the OWNER -- a validator runs no inference and so cannot
-        # know what the other models would have answered. With it the scalar becomes
-        # `router_headroom`: 0.0 = no better than randomising over fixed pool models AT THIS PRICE,
+        # know what the other models would have answered. With it the scalar becomes frontier-
+        # relative headroom: 0.0 = no better than randomising over fixed pool models AT THIS PRICE,
         # 1.0 = matched the budget-constrained per-query oracle there. That scores the DECISION
         # rather than the outcome, cancels out the pool's own capability (on a 95%-accurate pool the
         # old absolute scalar was ~98% pool and ~2% miner), and prices quality against cost on a
         # frontier instead of at one owner-chosen lambda. Without a reference it falls back to the
         # old Q_lcb - lambda*cost, so offline sims and existing deployments are unchanged.
+        #
+        # In the DEFAULT `accumulate` mode the frontier is pooled across epochs alongside the
+        # counts (`evidence.Evidence.headroom_lcb`), so the scalar stays lower-bounded: a single
+        # 8-question slice can no more buy a crown frontier-relatively than it could absolutely.
         self.pool_reference = pool_reference
+        # DEGENERACY FLOOR. Headroom divides by `oracle - zero` — the quality routing could possibly
+        # add on this traffic. On saturated traffic that gap is smaller than the sampling noise in
+        # the numerator, and dividing by it manufactures a ranking out of noise. Measured on this
+        # project's own data the live math suite sits at ~0.019 and LiveCodeBench at ~0.083, so a
+        # 0.05 floor is the line between "there is something here to compete over" and "there is
+        # not". Below it the validator declines to score frontier-relatively and says so in the
+        # feed, rather than reporting a confident number about nothing.
+        self.min_headroom_gap = min_headroom_gap
         self.dedup_agree = dedup_agree
         # cohort-relative memorization test: need >= min_cohort audited miners to calibrate the
         # probe's difficulty; max_probe_drop caps the allowance so a colluding all-memorizer
@@ -252,6 +270,20 @@ class KOTHValidator:
             "budget_usd": self.budget,
             "scored": {hk: round(float(s), 6) for hk, s in (rep.scored if rep else {}).items()},
             "dq": dict(rep.dq) if rep else {},
+            # THE INTELLIGENCE LAYER, MADE VISIBLE. None of these is a reward term — each becomes
+            # trivially gameable the moment it pays (a miner would escalate constantly to farm
+            # `escalations`, exactly as RouterEval's selection-entropy metric is maximised by a
+            # random router). But "not rewarded" is not a reason to discard them: the trace is
+            # hash-attested, latency and tokens are inside the quote, and without publishing them
+            # the orchestration half of the product is invisible to everyone, not just to scoring.
+            # `pool_reference.routable` is the one to read first — it says whether this epoch's
+            # traffic had enough achievable headroom for the router scalar to mean anything.
+            "diagnostics": {
+                "pool_reference": (rep.audit.get("pool_reference") if rep else None),
+                "headroom": (rep.audit.get("headroom") if rep else {}) or {},
+                "regret": (rep.audit.get("regret") if rep else {}) or {},
+                "trajectory": (rep.audit.get("trajectory") if rep else {}) or {},
+            },
             "weights_by_uid": {str(u): round(w, 9) for u, w in (rep.weights_by_uid if rep else {}).items()},
             "burn_uid": self.reign.burn_uid,
             "market": market,             # None offline / on a price-read failure -> no $ columns
@@ -302,7 +334,12 @@ class KOTHValidator:
             king = {"id": self._king_id, "total_cost_usd": self._king_vd.total_cost_usd,
                     "score": self._king_vd.score, "total_score": self._king_vd.total_score,
                     "per_bench": {n: {"n": bs.n, "acc": bs.acc, "lcb": bs.lcb, "cost_usd": bs.cost_usd}
-                                  for n, bs in self._king_vd.per_bench.items()}}
+                                  for n, bs in self._king_vd.per_bench.items()},
+                    # per-ask detail too: without it a restored king can only be scored on the
+                    # ABSOLUTE scalar while its challengers are scored frontier-relatively, and the
+                    # dethrone guard would then clamp one scale against the other.
+                    "per_task": [[t.benchmark, t.task_id, t.correct, t.cost_usd]
+                                 for t in self._king_vd.per_task]}
         pending_report = None
         if self._pending_report is not None:
             rep = self._pending_report
@@ -347,7 +384,9 @@ class KOTHValidator:
                 True, "ok",
                 {n: BenchStat(bs["n"], bs["acc"], bs["lcb"], bs["cost_usd"])
                  for n, bs in k["per_bench"].items()},
-                k["total_cost_usd"], k["score"], k.get("total_score", 0.0))
+                k["total_cost_usd"], k["score"], k.get("total_score", 0.0),
+                per_task=tuple(TaskStat(b, t, float(c), float(u))
+                               for b, t, c, u in k.get("per_task") or ()))
 
     def save_state(self, path: str) -> None:
         import json
@@ -537,13 +576,21 @@ class KOTHValidator:
         if sub is None:
             return E(dq="no_proof")
         proof, trace = sub
-        vd = verify_proof(
-            proof, approved_measurements=approved, platform_public_hex=self.platform_pub,
-            expect_epoch=epoch, expect_nonce=nonce, expect_hotkey=hk,
-            expect_source_hash=sh, expect_weights_hash=wh,          # <- recomputed, not miner-supplied
-            suite=self.suite, n_per_bench=self.n_per_bench,
-            approved_mrtd=approved_mrtd, approved_rtmr=approved_rtmr, tcb_accept=tcb_accept,
-            collateral=self.collateral, pccs_url=self.pccs_url, enforce=self.enforce)
+        try:
+            vd = verify_proof(
+                proof, approved_measurements=approved, platform_public_hex=self.platform_pub,
+                expect_epoch=epoch, expect_nonce=nonce, expect_hotkey=hk,
+                expect_source_hash=sh, expect_weights_hash=wh,      # <- recomputed, not miner-supplied
+                suite=self.suite, n_per_bench=self.n_per_bench,
+                approved_mrtd=approved_mrtd, approved_rtmr=approved_rtmr, tcb_accept=tcb_accept,
+                collateral=self.collateral, pccs_url=self.pccs_url, enforce=self.enforce)
+        except GradingUnavailable as e:
+            # The GRADER broke, not the miner (an execution-graded benchmark needs Docker). Scoring a
+            # 0 here would charge the validator's infrastructure to the miner, and a miss=0 would do
+            # the same through the accumulator — so this reason is deliberately NOT in `_MISS_REASONS`
+            # and the miner is simply left out of this epoch: neither credited nor penalised.
+            print(f"[koth-validator] grading unavailable for {hk[:8]}: {e}", flush=True)
+            return E(dq="grading_unavailable")
         if not vd.valid:
             return E(dq=vd.reason)
         # 2b. F7 anti-grind: the proof must have been COMMITTED on-chain inside the intra-epoch window
@@ -611,22 +658,82 @@ class KOTHValidator:
             traj = {}
         return E(verdict=vd, fingerprint=fp, audit=audit, trajectory=traj)
 
-    def _router_scalar(self, acc: float, cost: float, epoch: int, nonce: str) -> float | None:
-        """Frontier-relative headroom against the owner-published pool reference, or None if no
-        reference is available for this epoch (then the caller keeps the legacy scalar)."""
+    def _load_reference(self, epoch: int, nonce: str) -> dict | None:
+        """The owner's pool reference record for this epoch, or None. NEVER raises: a reference
+        outage is an owner problem, and it must degrade to the legacy scalar rather than stall the
+        subnet."""
         if self.pool_reference is None:
             return None
         try:
             ref = self.pool_reference(epoch, nonce)
         except Exception:      # noqa: BLE001 — a reference outage must never break scoring
             return None
-        if not ref:
+        if not ref or not len(ref.get("scores") or []) or not len(ref.get("costs") or []):
             return None
-        scores, costs = ref
-        # len(), not truthiness: `not scores` raises on a numpy array ("truth value is ambiguous")
-        if len(scores) == 0 or len(costs) == 0:
+        return ref
+
+    def _reference_health(self, ref: dict) -> dict:
+        """Is this epoch's traffic worth routing? Reported every epoch, miner-independent.
+
+        `achievable_gap` below `min_headroom_gap` means the pool is saturated on this suite: the
+        best possible per-ask router beats a coin flip over fixed models by less than the noise in
+        an 8-question slice. The subnet then scores absolutely and SAYS SO, because the alternative
+        — dividing by a gap that small — turns sampling noise into a leaderboard."""
+        benches = ref.get("benchmarks") or []
+        w = (row_weights_for(benches, {b.name: b.weight for b in self.suite}) if benches else None)
+        try:
+            gap = achievable_gap(ref["scores"], ref["costs"], w)
+        except Exception:                       # noqa: BLE001 — presentational, never breaks scoring
+            return {}
+        return {"asks": len(ref.get("task_ids") or ref["scores"]),
+                "models": len(ref.get("models") or []),
+                "achievable_gap": round(float(gap), 4),
+                "min_headroom_gap": self.min_headroom_gap,
+                # the headline: False => the router scalar is not measurable on this traffic
+                "routable": bool(gap >= self.min_headroom_gap)}
+
+    def _epoch_frontier(self, vd: ProofVerdict, ref: dict) -> tuple[int, float, float] | None:
+        """`(n, zero, oracle)` for ONE miner's slice — where the featureless baseline and the
+        per-ask oracle sat at the price THIS miner actually paid. None if the miner's graded asks
+        and the reference don't line up (a reference for another slice scores nobody).
+
+        Both the miner's price and the two frontiers are computed on the SAME row weights, so the
+        comparison is like-for-like: the miner's score is `Σ_b w_b·acc_b`, and without weighting the
+        reference rows the frontier would instead be an unweighted average over every benchmark that
+        contributed tasks — including the weight-0 MMLU floor.
+        """
+        rows = {tid: i for i, tid in enumerate(ref.get("task_ids") or [])}
+        aligned = [(rows[t.task_id], t) for t in vd.per_task if t.task_id in rows]
+        if not aligned:
             return None
-        return router_headroom(acc, cost, scores, costs)
+        idx = [i for i, _ in aligned]
+        benches = ref.get("benchmarks") or []
+        w = (row_weights_for([benches[i] for i in idx], {b.name: b.weight for b in self.suite})
+             if len(benches) == len(rows) else None)
+        if benches and w is None:
+            return None                       # every ranked benchmark carries weight 0 here
+        S = np.asarray(ref["scores"], float)[idx]
+        C = np.asarray(ref["costs"], float)[idx]
+        cost = float(np.average([t.cost_usd for _, t in aligned], weights=w))
+        z, o = frontier_bounds(cost, S, C, w)
+        return len(aligned), z, o
+
+    def _router_scalar(self, vd: ProofVerdict, epoch: int, nonce: str) -> float | None:
+        """SINGLE-SLICE frontier-relative headroom — the `per_epoch` path. None -> keep legacy.
+
+        `accumulate` (the default) does not use this: it pools the frontier across epochs so the
+        scalar keeps a confidence bound. Here there is only one slice, so the number is as noisy as
+        the 8 questions behind it — which is one more reason `per_epoch` is sim-only."""
+        ref = self._load_reference(epoch, nonce)
+        if ref is None:
+            return None
+        fr = self._epoch_frontier(vd, ref)
+        if fr is None:
+            return None
+        _n, z, o = fr
+        if o - z < self.min_headroom_gap:
+            return None                       # saturated traffic: the ratio would be noise
+        return (vd.total_score - z) / (o - z)
 
     def _reign_scalar(self, vd: ProofVerdict, epoch: int | None = None,
                       nonce: str | None = None) -> float:
@@ -637,22 +744,24 @@ class KOTHValidator:
         term is a gradient that never runs out (you can always be cheaper) and points at the axis
         where routing actually has headroom."""
         if epoch is not None:
-            # UNITS: the frontiers are per-ask ($/query), but `total_cost_usd` is the whole slice.
-            # Comparing them directly puts the miner far to the right of the frontier and scores it
-            # ~0 no matter how well it routed.
-            n = sum(bs.n for bs in vd.per_bench.values()) or 1
-            h = self._router_scalar(vd.total_score, vd.total_cost_usd / n, epoch, nonce or "")
+            h = self._router_scalar(vd, epoch, nonce or "")
             if h is not None:
                 return h            # frontier-relative headroom: the router scalar
         if self.budget <= 0 or not self.cost_tiebreak:
             return vd.score
         return vd.score - self.cost_tiebreak * min(1.0, vd.total_cost_usd / self.budget)
 
-    def _accumulate(self, evals, dq) -> dict:
+    def _accumulate(self, evals, dq, ref: dict | None = None, audit: dict | None = None) -> dict:
         """docs/DESIGN.md §5b: pool each committed artifact's per-epoch evidence into one Wilson-LCB (EWMA
-        decay, reset-on-recommit) and return {hotkey: accumulated Q_lcb} for the eligible candidates.
+        decay, reset-on-recommit) and return {hotkey: accumulated score} for the eligible candidates.
         A no-proof epoch counts as (n_expected, 0) — miss=0, which penalizes withholding; a cheat/copy
-        DQ is skipped; eligibility is on the ACCUMULATED cost-per-task + per-benchmark accuracy floor."""
+        DQ is skipped; eligibility is on the ACCUMULATED cost-per-task + per-benchmark accuracy floor.
+
+        With a pool reference the epoch's frontier is banked alongside the counts and the scalar
+        becomes accumulated frontier-relative HEADROOM (`Evidence.headroom_lcb`) instead of absolute
+        accuracy — the router scalar, finally on the production path. Without one (or on saturated
+        traffic, or when the frontier covers too little of the pooled evidence) it stays the legacy
+        `Q_lcb − λ·cost`."""
         from .runtime import SUITE_VERSION
         self._evidence.decay_all()
         weights = {b.name: b.weight for b in self.suite}
@@ -671,6 +780,14 @@ class KOTHValidator:
             else:                                          # valid verdict this epoch
                 for b, bs in ev.verdict.per_bench.items():
                     acc.add(b, bs.n, bs.acc * bs.n, bs.cost_usd)
+                # bank this epoch's frontier at the price this miner paid. A MISSED epoch adds
+                # counts but no frontier, so a miner that keeps skipping epochs sees its reference
+                # coverage decay and drops back to the absolute scalar — where miss=0 has already
+                # tanked it anyway.
+                if ref is not None:
+                    fr = self._epoch_frontier(ev.verdict, ref)
+                    if fr is not None:
+                        acc.add_reference(*fr)
             # eligibility on the ACCUMULATED evidence (cost is a per-task ceiling, not a divisor)
             if acc.cost_per_task() > self.budget_per_task:
                 dq[hk] = "over_budget"
@@ -678,6 +795,16 @@ class KOTHValidator:
             bad = next((b.name for b in self.suite if acc.bench_acc(b.name) < self.f_min), None)
             if bad is not None:
                 dq[hk] = f"below_floor:{bad}"
+                continue
+            # THE ROUTER SCALAR, on the accumulated evidence. No cost tiebreak is subtracted from
+            # it: the frontier already prices cost (both baselines are evaluated at the miner's own
+            # price, so matching quality more cheaply raises headroom by construction), and charging
+            # for cost again on top would price the same decision twice.
+            h = acc.headroom_lcb(weights, min_gap=self.min_headroom_gap)
+            if h is not None:
+                scores[hk] = h
+                if audit is not None:
+                    audit.setdefault("headroom", {})[hk] = round(float(h), 6)
                 continue
             # same quality-first / cost-tiebreak gradient as per_epoch (`_reign_scalar`), on the
             # ACCUMULATED cost-per-task — otherwise saturated miners tie and freeze on seniority.
@@ -725,6 +852,13 @@ class KOTHValidator:
         audit_detail: dict[str, dict] = {}
         evals: dict[str, _MinerEval] = {}      # every committed miner's outcome (for accumulation)
 
+        # The owner's pool reference for this slice: every (ask, pool-model) cell. It turns the
+        # scalar frontier-relative and is what per-ask regret is measured against. Absent -> the
+        # legacy absolute scalar, unchanged.
+        ref = self._load_reference(epoch, nonce)
+        if ref is not None:
+            audit_detail["pool_reference"] = self._reference_health(ref)
+
         gov = (approved, approved_mrtd, approved_rtmr, tcb_accept)
         for hk, c in commits.items():
             parsed = commitmod.parse_commit(c.data)
@@ -736,6 +870,16 @@ class KOTHValidator:
             evals[hk] = ev
             if ev.trajectory:
                 audit_detail.setdefault("trajectory", {})[hk] = ev.trajectory
+            # PER-ASK ATTRIBUTION. The scalar is one number per miner; regret says which asks it was
+            # earned or lost on — whether a router gave up quality or merely overpaid. Diagnostics,
+            # never a reward term (see `verify.regret_stats`).
+            if ref is not None and ev.verdict is not None:
+                try:
+                    rs = regret_stats(ev.verdict.per_task, ref)
+                except Exception:               # noqa: BLE001 — diagnostics must never fail a miner
+                    rs = {}
+                if rs:
+                    audit_detail.setdefault("regret", {})[hk] = rs
             if ev.dq:
                 dq[hk] = ev.dq
                 continue
@@ -759,7 +903,7 @@ class KOTHValidator:
         # 6. reign scores. accumulate: pooled per-artifact Q_lcb (incumbency is endogenous, so the
         #    Pareto guard is not needed). per_epoch: this slice's score + the Pareto dethrone guard.
         if self.scoring_mode == "accumulate":
-            scored_out = self._accumulate(evals, dq)
+            scored_out = self._accumulate(evals, dq, ref, audit_detail)
             subs = [Submission(hk, hk, commit_block.get(hk, 0), s) for hk, s in scored_out.items()]
         else:
             king_id = self.reign.members[0].sub.miner_id if self.reign.members else self._king_id

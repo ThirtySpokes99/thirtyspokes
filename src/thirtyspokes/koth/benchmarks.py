@@ -159,9 +159,13 @@ class RealBenchmark:
     memorization audit's held-out slice is genuinely unseen by the scored slice."""
 
     def __init__(self, name: str, weight: float, pool: list[BenchTask],
-                 held: list[BenchTask], grade_fn):
+                 held: list[BenchTask], grade_fn, answer_kind: str | None = None):
         self.name, self.weight = name, weight
         self._pool, self._held, self._grade = pool, held, grade_fn
+        # declared, not inferred: `verify._bench_kind` otherwise guesses from the grader's identity
+        # and falls through to "number", which would parse a program as a numeric answer.
+        if answer_kind is not None:
+            self.answer_kind = answer_kind
 
     def _draw(self, tasks: list[BenchTask], n: int, seed: int) -> list[BenchTask]:
         rng = np.random.default_rng(seed)
@@ -174,8 +178,25 @@ class RealBenchmark:
 
 
 def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
-    """Load real MMLU + GSM8K, split each into disjoint pool/held-out. (SWE/GPQA are
-    heavier seams — GPQA gated, SWE needs the Docker patch loop.)
+    """The live scored suite: rank on LiveCodeBench; MMLU + GSM8K are weight-0 eligibility floors.
+
+    WHY CODE CARRIES THE RANKING WEIGHT. The scalar this subnet exists to compute divides by the
+    achievable gap `oracle − zero` — the quality a perfect per-ask router could add over a featureless
+    one. Measured on real data across eight experiments, that gap is **+0.019 on GSM8K**: every pool
+    model lands at 79-97%, and the best router beat the featureless baseline by +0.002. Ranking there
+    does not merely fail to reward routing — it divides by a number smaller than the sampling noise
+    in an 8-question slice, manufacturing a leaderboard out of nothing. LiveCodeBench is the one
+    regime measured with models in the MIDDLE and disagreeing (scores 0.47-0.78, the first non-zero
+    sole-correct rate, gap **+0.083**), which is above the validator's `min_headroom_gap` floor where
+    math sits far below it. See `koth/lcb.py` for the honest caveat: this makes the competition
+    measurable, it does not promise anyone can win it.
+
+    GSM8K stays as a weight-0 FLOOR rather than being dropped: `eligible` requires `acc >= f_min` on
+    every benchmark regardless of weight, so it remains a cheap sanity gate that catches a broken
+    agent — and unlike code it grades with no container, so it costs the validator nothing.
+
+    Loads real MMLU + GSM8K + LiveCodeBench, splitting each into disjoint pool/held-out.
+    (SWE/GPQA are heavier seams — GPQA gated, SWE needs the Docker patch loop.)
 
     `n_load` MUST be >> the validator's `n_per_bench`, or the per-epoch "slice" is the whole pool
     and the epoch nonce selects nothing. It was 16 (-> 8 pool items, drawn 8-at-a-time), which made
@@ -188,13 +209,13 @@ def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
     Upper bound: GSM8K's test split is ~1319 rows, so `n_load` cannot go far above 1000 without
     changing the split or the dataset."""
     from ..eval import math_tasks
-    from . import mmlu
+    from . import lcb, mmlu
     mt = mmlu.load_mmlu(n_load, seed=seed)
     g = [BenchTask(t.task_id, t.prompt, t.gold) for t in math_tasks.load_gsm8k(n_load, seed=seed)]
     half = lambda xs: (xs[: len(xs) // 2], xs[len(xs) // 2:])  # noqa: E731
     mp, mh = half(mt)
     gp, gh = half(g)
-    # WEIGHTS: the RANKING scalar is 100% free-form, MMLU is a floor-only sanity gate (weight 0).
+    # WEIGHTS: the RANKING scalar is 100% CODE; MMLU and math are floor-only sanity gates (weight 0).
     #
     # Multiple choice cannot be defended against memorization by any proof-inspection rule: every
     # option is in the prompt by construction, so `extract_choice(prompt)` already yields the gold
@@ -205,13 +226,18 @@ def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
     # checks `acc >= f_min` on EVERY benchmark regardless of weight), so a broken agent is still
     # caught while memorizing it earns exactly nothing.
     #
-    # `math` is free-form numeric: the answer is not in the prompt, so first-appearance grounding
-    # catches both naive memorization and prompt-laundering. SWE is the intended second ranked
-    # benchmark and is deliberately NOT wired here yet — `grade_patch` is a stand-in that scores any
-    # well-formed diff 1.0, so ranking on it today would be trivially gameable. It needs
-    # `eval.swe_tasks.SWEGrader` (Docker + the SWE-bench Pro harness) first.
+    # `math` was the ranked benchmark until the achievable gap was measured on it: +0.019, which is
+    # smaller than the sampling noise the router scalar would divide it by. It is retained at weight
+    # 0 for the same reason as MMLU — `eligible` gates on EVERY benchmark's accuracy regardless of
+    # weight, so it stays a cheap broken-agent detector that needs no container to grade.
+    #
+    # SWE remains the intended second RANKED benchmark and is deliberately still not wired —
+    # `grade_patch` is a stand-in that scores any well-formed diff 1.0, so ranking on it today would
+    # be trivially gameable. It needs `eval.swe_tasks.SWEGrader` (Docker + the SWE-bench Pro
+    # harness) first, and one-shot SWE measured degenerate at the FLOOR (0/120) regardless.
     return [RealBenchmark("mmlu", 0.0, mp, mh, grade_choice),
-            RealBenchmark("math", 1.0, gp, gh, math_tasks.grade)]
+            RealBenchmark("math", 0.0, gp, gh, math_tasks.grade),
+            lcb.make_lcb(seed=seed, weight=1.0)]
 
 
 # --- FRESH benchmarks (WS4): tasks generated per-epoch from the seed, so there is nothing

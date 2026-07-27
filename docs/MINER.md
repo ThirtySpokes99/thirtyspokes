@@ -17,16 +17,26 @@ to the pool — it returns the model's response text and is metered for cost.
 ```python
 # my_router.py  — a cost-aware cascade: cheap first, escalate hard prompts
 import json
+PARAMS = {"max_tokens": 16384, "reasoning": {"effort": "low"}}   # see the note below
 def build_agent(weights):
     cfg = json.loads(weights.decode())            # your routing config / trained params
     cheap, strong = cfg["cheap"], cfg["strong"]
     def agent(prompt, call_model):
-        ans = call_model(cheap, [{"role": "user", "content": prompt}], {"max_tokens": 256})
+        ans = call_model(cheap, [{"role": "user", "content": prompt}], PARAMS)
         if len(prompt) > 400 or "prove" in prompt.lower():      # your routing logic
-            ans = call_model(strong, [{"role": "user", "content": prompt}], {"max_tokens": 512})
+            ans = call_model(strong, [{"role": "user", "content": prompt}], PARAMS)
         return ans
     return agent
 ```
+
+> **Mind `max_tokens` and `reasoning`.** The ranked benchmark is code, so an answer is a whole
+> program — a small cap truncates it mid-function and it grades as *wrong*, which is
+> indistinguishable from your router having picked a bad model. And `max_tokens` counts **thinking**
+> tokens: give a reasoning model an unbounded budget and it spends the lot deliberating and returns
+> nothing (measured at 8k *and* 32k). The owner's pool reference measures every model at
+> `max_tokens 16384, reasoning effort low`, so those settings put you on the same footing as the
+> frontier you are scored against. Going lower means competing against models that were given more
+> room than you gave yours. Allowed params: `max_tokens`, `temperature`, `top_p`, `stop`, `reasoning`.
 
 Your bundle = `source.py` + `weights.bin` (opaque bytes — a trained model, a config, whatever) and it
 is **public** on your HuggingFace repo. The competitive surface is open: a trained routing model,
@@ -65,21 +75,59 @@ under an audited runtime, so any cheat is visible in your source or caught by th
   cascading, ensembling, and verifying are all fine.
 - **You pay your own inference** (your OpenRouter key). Cost is metered from the real bill.
 
+## What you're scored on
+
+**The ranked benchmark is LiveCodeBench** (`code`). MMLU and GSM8K are also run, at **weight 0** —
+they are eligibility floors, not ranking signal: you must clear `f_min` on them, but being brilliant
+at them earns you nothing. Each epoch you get 8 code problems drawn unpredictably from a 56-problem
+public pool, **stratified by difficulty** (3 easy / 3 medium / 2 hard), plus 8 from each floor.
+
+Math used to carry the ranking weight and no longer does, for a reason worth understanding before you
+optimise: on GSM8K every pool model scores 79-97%, so a *perfect* router beats a coin-flip over the
+pool by about **+0.019** — less than the noise in an 8-question slice. There was nothing there to win.
+On LiveCodeBench that number is **+0.083**. See [`DESIGN.md`](DESIGN.md) §5e.
+
 ## How you're scored
 
-**Quality first, then cost.** You are ranked by
+**You are not scored on how accurate you are. You are scored on how well you ROUTED.**
+
+Each epoch the owner publishes a *pool reference*: what every pinned model scored, and cost, on the
+exact asks you were given. Your score is where you landed between two baselines **evaluated at the
+price you actually paid**:
 
 ```
-S = Q_lcb − λ · (your_cost / B)      Q_lcb = Σ_benchmark w · lcb(accuracy),   λ = 0.02
+headroom = (Q_lcb − zero(your_cost)) / (oracle(your_cost) − zero(your_cost))
 ```
 
-`Q_lcb` is the weighted per-benchmark accuracy at its bootstrap **lower confidence bound** (so a lucky
-run can't win). The cost term is deliberately **small — it can never beat a real accuracy gain**; it
-only separates miners who are otherwise **equal**. That matters because accuracy *saturates*: once
-you're at the ceiling, **being cheaper is how you keep climbing.**
+- **`zero(c)`** — what a *featureless* policy gets at price `c`, by randomly picking pool models.
+  **This is the bar.** Score 0.0 and you have demonstrated nothing, however high your accuracy.
+- **`oracle(c)`** — the best a perfect per-ask router could do at that price. Score 1.0 and you
+  matched it.
+- **Below 0.0** means you did worse than picking at random.
 
-To take the **crown** you must be not-worse than the king on every benchmark, and then either be
-**confidently better on ≥1 benchmark**, *or* **match its quality at ≥10% lower cost**. Emissions split
+The consequence to internalise: **matching quality at a fraction of the price scores well, not
+badly.** Calling the strongest model on everything puts you *on* the zero frontier — maximum accuracy,
+zero headroom, score ≈ 0. The gain comes from knowing *which* asks need the expensive model.
+
+`Q_lcb` is your accuracy at its **Wilson lower confidence bound**, pooled across every epoch you have
+run the same artifact — so a lucky slice cannot buy a crown, and a good agent's score climbs as
+evidence accumulates. Re-publishing a changed artifact **resets that evidence**: dethroning costs real
+attested epochs. No separate cost penalty is subtracted — cost is already inside both baselines.
+
+If the owner publishes no reference, or the traffic that epoch turns out too saturated to measure
+routing on, scoring falls back to absolute quality-minus-a-small-cost-term and the feed says so
+(`diagnostics.pool_reference.routable = false`).
+
+**What is measured but never paid for.** Your escalation behaviour, latency, token counts and per-ask
+regret are all extracted from your attested trace and published in the standings feed. None of them
+is a reward term — every one becomes farmable the moment it pays. Read them to debug your agent, not
+to game the scalar.
+
+To take the **crown** you must beat the king's pooled score by an **epsilon incumbency margin** that
+decays as its artifact ages — so noise cannot flip the crown, but a genuinely better agent always
+gets there. Because the score is pooled Wilson-bounded evidence, that means out-performing it *over
+attested epochs*, not winning one lucky slice; and because re-publishing resets your own evidence,
+every artifact change is a real bet. Emissions split
 **equally** across the king + a chain of up to 4 recent ex-kings (5 slots, ≈20% each when all five are
 paid — a dethroned king that keeps competing goes on earning while it decays out of the chain, so
 there's no cliff to camp against), with an epsilon incumbency margin protecting the king +
@@ -92,21 +140,38 @@ forgiven (real CVM boots are flaky), and while you are the king, being absent co
 pay but not the crown — you keep the title, and challengers still have to clear your epsilon margin,
 until your grace runs out.
 
-You are **eligible** only if ALL hold, else you earn nothing that epoch: `total_cost ≤ B` (the owner's
-per-slice budget — a hard ceiling); accuracy ≥ `f_min` on **every** benchmark; ≥1 pool call on every
-scored task.
+You are **eligible** only if ALL hold, else you earn nothing that epoch: accumulated **cost per task**
+≤ the owner's ceiling; accuracy ≥ `f_min` on **every** benchmark, floors included; ≥1 pool call on
+every scored task.
 
-**So: hit the quality bar on every benchmark, then get relentlessly cheaper.** (Full detail:
-[`DESIGN.md`](DESIGN.md) §5.)
+**So: clear the floors, then beat the frontier.** Being accurate is table stakes — the score is what
+you added *over what your money could have bought anyway*. (Full detail: [`DESIGN.md`](DESIGN.md)
+§5.0 for the scalar, §5e for the suite.)
 
 ## Test locally before you spend a cent on-chain
 
-The dev kit runs the exact validator scoring on your artifact:
+The dev kit runs the validator's own scoring code on your artifact. It has two modes, and the
+difference matters:
+
 ```bash
+# 1. FREE smoke test — synthetic benchmarks + a mock pool, no key, no Docker, no cost.
+#    Proves your agent loads, calls the pool and returns answers. It CANNOT tell you whether you
+#    can route: the mock pool's difficulty is invented, so its headroom is meaningless.
 uv run orchestra-koth-dev --source my_router.py --weights my_weights.bin
-# -> per-benchmark acc/lcb, total_cost, Q_lcb, eligible, n_pool_calls  (byte-identical to the validator)
+
+# 2. REAL — the live suite (LiveCodeBench + MMLU/GSM8K floors) over real pool models.
+#    This is what the validator scores. Needs OPENROUTER_API_KEY (you pay) and Docker.
+uv run orchestra-koth-dev --source my_router.py --weights my_weights.bin \
+  --real --pool "model-a,model-b,model-c"
 ```
-Iterate here until your `Q_lcb` is high and `eligible: true` under the budget.
+Both print per-benchmark acc/lcb, total_cost, `Q_lcb`, `eligible`, `n_pool_calls` from the same code
+path the validator runs. Iterate on (1) until nothing is broken, then on (2) until `eligible: true`
+under the budget with a `Q_lcb` you would bet a CVM boot on.
+
+Note what neither mode gives you: your **headroom**. That needs the owner's pool reference for a live
+epoch — so a strong `Q_lcb` here says you are accurate, not that you out-routed the frontier. Compare
+your cost against calling each pool model on everything: if you are not both cheaper *and* comparably
+accurate, your headroom will be near zero on-chain.
 
 ## Submit + run
 

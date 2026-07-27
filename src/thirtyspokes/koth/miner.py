@@ -24,13 +24,23 @@ from .runtime import Artifact, KOTHRuntime
 
 # A real baseline agent: single-shot call to one model, return its answer verbatim.
 # `weights` is JSON `{"model": "<id>"}`; the source is what the runtime hashes + runs.
+#
+# THE GENERATION PARAMS MATTER, AND THEY MATCH THE POOL REFERENCE ON PURPOSE. The ranked benchmark is
+# code, where an answer is a whole program: the old 512-token cap truncated solutions mid-function
+# and graded them as incapability. And `max_tokens` counts THINKING tokens, so an unbounded reasoning
+# model spends the entire budget deliberating and returns nothing — measured at 8k and again at 32k.
+# `koth/reference.py` measures every pool model at these same settings, so a miner that keeps them is
+# compared against a frontier built under identical conditions. A miner is free to change them (that
+# is part of the competition), but lowering them below what the reference used means competing
+# against models that were given more room than you gave yours.
 REFERENCE_SRC = (
     "import json\n"
     "def build_agent(weights):\n"
     "    cfg = json.loads(weights.decode())\n"
     "    model = cfg.get('model', 'mid')\n"
     "    def agent(prompt, call_model):\n"
-    "        return call_model(model, [{'role': 'user', 'content': prompt}], {'max_tokens': 512})\n"
+    "        return call_model(model, [{'role': 'user', 'content': prompt}],\n"
+    "                          {'max_tokens': 16384, 'reasoning': {'effort': 'low'}})\n"
     "    return agent\n"
 )
 

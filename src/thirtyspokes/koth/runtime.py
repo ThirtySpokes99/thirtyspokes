@@ -38,7 +38,11 @@ KOTH_RUNTIME_VERSION = "orchestra-koth-runtime-1"
 # Bumped to 3: the RANKING weights moved to 100% free-form (mmlu 0.5->0.0, math 0.5->1.0). MCQ is
 # undefendable against memorization by proof-inspection, so it is a floor-only gate now. This
 # changes every miner's score, so the accumulated evidence must reset with it.
-SUITE_VERSION = "koth-suite-3"
+# Bumped to 4: the RANKING weight moved from GSM8K to LiveCodeBench (math 1.0 -> 0.0 floor, code
+# 0.0 -> 1.0). Math's measured achievable gap is +0.019 — below the noise the router scalar divides
+# it by — so ranking there scored sampling noise; LCB's is +0.083. This changes both what miners run
+# and what "good" means, so the accumulated evidence must reset with it. See benchmarks.real_suite.
+SUITE_VERSION = "koth-suite-4"
 
 
 def runtime_measurement() -> str:

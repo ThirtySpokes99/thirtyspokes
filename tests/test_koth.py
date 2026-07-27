@@ -2370,3 +2370,88 @@ def test_trajectory_stats_sees_the_intelligence_layer(env):
     assert s["escalations_that_changed_the_answer"] == 1    # the escalation RECOVERED the answer
     assert s["escalation_yield"] == 1.0
     assert s["calls_per_ask"] == 2.0
+
+
+# --- the per-epoch POOL REFERENCE (what makes router_headroom actually run) ----------------------
+# `router_headroom` needs every (ask, model) cell for the epoch's slice, and a validator runs NO
+# inference — so the OWNER measures the pool and publishes it, hash-committed like the governance
+# record. Without this the router scalar silently falls back to the old absolute one.
+
+def _rec(epoch=7, nonce="n7", n=2):
+    from thirtyspokes.koth.runtime import SUITE_VERSION
+    return {"v": 1, "epoch": epoch, "nonce": nonce, "suite_version": SUITE_VERSION,
+            "n_per_bench": n, "models": ["cheap", "pricey"], "task_ids": ["t1", "t2"],
+            "scores": [[1.0, 1.0], [0.0, 1.0]], "costs": [[0.001, 0.1], [0.001, 0.1]]}
+
+
+def test_reference_commit_fits_a_plain_commitment():
+    """73 bytes, so it goes on-chain immediately — no reveal delay, unlike the artifact commit."""
+    from thirtyspokes.koth import reference as R
+    d = R.digest(_rec())
+    cs = R.commit_string(d)
+    assert len(cs) == 73 and R.parse_commit(cs) == d
+    assert R.parse_commit("koth1|something-else") is None
+
+
+def test_reference_is_content_addressed_and_tamper_evident():
+    from thirtyspokes.koth import reference as R
+    rec = _rec(); d = R.digest(rec)
+    assert R.verify(R.canonical(rec), d)["epoch"] == 7
+    with pytest.raises(ValueError, match="hash mismatch"):
+        R.verify(R.canonical(_rec(epoch=8)), d)     # a different epoch's record must not pass
+
+
+def test_reference_must_describe_THIS_slice_not_just_hash_correctly():
+    """The load-bearing check. A hash only proves the owner committed the body — not that it is
+    about this epoch. A record from an EASIER epoch lowers the Zero frontier and flatters every
+    miner, so epoch/nonce/suite/n_per_bench are all checked."""
+    from thirtyspokes.koth import reference as R
+    rec = _rec(epoch=7, nonce="n7")
+    assert R.matches(rec, epoch=7, nonce="n7", n_per_bench=2)
+    assert not R.matches(rec, epoch=8, nonce="n7", n_per_bench=2)      # replayed from another epoch
+    assert not R.matches(rec, epoch=7, nonce="other", n_per_bench=2)   # different slice
+    assert not R.matches(rec, epoch=7, nonce="n7", n_per_bench=8)      # different slice size
+    assert not R.matches({**rec, "suite_version": "stale"}, epoch=7, nonce="n7", n_per_bench=2)
+
+
+def test_chain_reader_returns_none_rather_than_stalling_the_subnet(monkeypatch):
+    """A reference outage is an OWNER problem. Scoring must degrade to the legacy scalar, not halt."""
+    from thirtyspokes.koth import reference as R
+
+    class Chain:
+        def revealed_commitments(self):
+            raise RuntimeError("chain unavailable")
+
+    assert R.chain_reader(Chain(), n_per_bench=2)(7, "n7") is None
+
+
+def test_chain_reader_finds_verifies_and_matches(monkeypatch):
+    from types import SimpleNamespace
+
+    from thirtyspokes.koth import reference as R
+    rec = _rec(); d = R.digest(rec)
+    monkeypatch.setattr(R, "fetch", lambda dg, **kw: rec if dg == d else None)
+
+    class Chain:
+        def revealed_commitments(self):
+            return [SimpleNamespace(hotkey="owner", data="koth1|not-a-reference", block=1),
+                    SimpleNamespace(hotkey="owner", data=R.commit_string(d), block=2)]
+
+    got = R.chain_reader(Chain(), n_per_bench=2, owner_hotkey="owner")(7, "n7")
+    assert got == (rec["scores"], rec["costs"])
+    # a commitment from a DIFFERENT hotkey must be ignored — only the owner sets the reference
+    assert R.chain_reader(Chain(), n_per_bench=2, owner_hotkey="someone-else")(7, "n7") is None
+
+
+def test_reference_drives_the_router_scalar_end_to_end(env):
+    """The whole point: with a published reference the reign scalar becomes frontier-relative."""
+    from thirtyspokes.koth import reference as R
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.koth.verify import BenchStat, ProofVerdict
+    from thirtyspokes.reign import KingChain
+    rec = _rec()
+    # an oracle router: cheap on the ask cheap can solve, pricey on the other -> full quality, low cost
+    vd = ProofVerdict(True, "ok", {"math": BenchStat(2, 1.0, 0.7, 0.101)}, 0.101, 0.7, 1.0)
+    v = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                      pool_reference=lambda e, n: (rec["scores"], rec["costs"]))
+    assert v._reign_scalar(vd, epoch=7, nonce="n7") == pytest.approx(1.0, abs=1e-6)

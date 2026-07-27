@@ -292,6 +292,12 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
                    help="F7 anti-grind: require each proof committed on-chain within N blocks of the "
                         "epoch open (miners commit automatically). Off by default; calibrate N to one "
                         "benchmark run's wall-clock before enabling.")
+    p.add_argument("--no-pool-reference", action="store_true",
+                   help="ignore the owner's per-epoch pool reference and score on absolute accuracy "
+                        "(Q_lcb - lambda*cost) instead of frontier-relative routing headroom")
+    p.add_argument("--min-headroom-gap", type=float, default=0.05,
+                   help="refuse to score frontier-relatively when the pool reference shows less "
+                        "achievable headroom than this (saturated traffic -> the ratio is noise)")
     p.add_argument("--grace-blocks", type=int, default=0,
                    help="F2: score an epoch only N blocks after it opens, so submissions settle and "
                         "decoupled validators agree on presence. Keep N < 100 (epoch length).")
@@ -335,10 +341,20 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
         probe_bank = SecretProbeBank.from_file(args.probe_bank)
         if args.audit_mode != "probe":
             print("[koth-validator] --probe-bank given -> audit_mode=probe (re-executes miner agents)")
+    # THE ROUTER SCALAR'S INPUT. Without a pool reference the validator can only score how accurate
+    # a miner was; with one it can score how well it ROUTED — against what was achievable at the
+    # price it paid. The owner publishes it per epoch (`orchestra-koth-reference`); a missing or
+    # stale one degrades to the absolute scalar rather than stalling the subnet.
+    pool_reference = None
+    if not args.no_pool_reference:
+        from .reference import chain_reader
+        pool_reference = chain_reader(chain, n_per_bench=args.n_per_bench)
     val = KOTHValidator({runtime_measurement()}, platform.public_hex, chain, KingChain(),
                         real_suite(), store, backend, n_per_bench=args.n_per_bench,
                         enforce=not args.insecure, probe_bank=probe_bank, audit_mode=audit_mode,
-                        commit_window=args.commit_window, grace_blocks=args.grace_blocks)
+                        commit_window=args.commit_window, grace_blocks=args.grace_blocks,
+                        pool_reference=pool_reference,
+                        min_headroom_gap=args.min_headroom_gap)
     ok, why = val.governance_ready()
     if not ok:
         raise SystemExit(

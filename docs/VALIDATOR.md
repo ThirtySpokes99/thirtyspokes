@@ -25,8 +25,9 @@ committed miner:
    response, else `ungrounded`). Proof-inspection only — no miner code runs.
 5. **Behavioral dedup** — near-identical attested-answer vectors keep the earliest commit (`copy_of:…`).
 6. **Score + reign** — the cost-budgeted `Q_lcb`, the Pareto dethrone guard vs the persisted king,
-   commit-block seniority → `KingChain` → `set_weights` (equal split across the king + registered
-   ex-kings; burns to uid 0 only if nobody in the chain is still registered).
+   commit-block seniority → `KingChain` → `set_weights` (equal split across the seats that are
+   registered **and submitted this epoch**; a seat absent `absent_grace`=3 consecutive epochs is
+   evicted, and an epoch with no live miner burns to uid 0 — see [`DESIGN.md`](DESIGN.md) §5a).
 
 Scoring detail and the evidence-accumulation / anti-grind refinements are in [`DESIGN.md`](DESIGN.md) §5–5b.
 
@@ -102,15 +103,33 @@ atomic score/save/weight step, then exits within Compose's 30-second stop grace 
 | `--probe-bank` | — | the owner's secret held-out bank matching the on-chain `probe_commit`. **Implies `--audit-mode probe`** |
 | `--commit-window` | off | **F7 anti-grind:** require each proof committed on-chain within N blocks of the epoch open. Miners must opt in with `--commit-proofs`, so **announce this before enabling it** or you will DQ everyone. Calibrate N to one benchmark run's wall-clock first |
 | `--grace-blocks` | `0` | **F2:** score an epoch only N blocks after it opens, so submissions settle and validators agree. Keep N < 100 (epoch length); set it above the store's upload latency |
+| `--no-pool-reference` | off | score absolute accuracy instead of frontier-relative routing headroom. On by default because the router scalar is the point of the subnet — use this only to reproduce a pre-reference score |
+| `--min-headroom-gap` | `0.05` | refuse to score frontier-relatively when the owner's reference shows less achievable headroom than this. Below it the ratio's denominator is under the sampling noise, so the ranking would be noise ([`DESIGN.md`](DESIGN.md) §5.0) |
 | `--n-per-bench` / `--poll` | `8` / `12` | tasks per benchmark per epoch / seconds between chain polls |
 
 The `--commit-window` (F7) and `--grace-blocks` (F2) paths are landed but **off by default**, pending a
 calibration of `W` and `G`; enable them together once measured. Mechanism in [`DESIGN.md`](DESIGN.md) §5b.
 
+**You do not fetch the pool reference yourself** — the daemon reads it each epoch from the owner's
+bucket, resolving the owner from `SubnetOwnerHotkey` on-chain and rejecting anything that key did not
+sign. Every failure path (no reference published, unreachable bucket, bad signature, a record for
+another slice) falls back to the absolute scalar rather than stalling: a reference outage is the
+owner's problem and must never cost a miner its epoch. Watch `diagnostics.pool_reference` in
+`standings.json` — `routable: false` means this epoch's traffic was too saturated to score routing on.
+
 ## What you need
 
-A **Bittensor wallet** with stake + a vpermit, registered on the subnet, plus TAO; and a **HuggingFace**
-account. **No LLM API key, no GPU, and no confidential VM** — validation is verify-only, and the default
-grounding mode does zero inference (a plain CPU VM is enough). An **OpenRouter key is needed only** if you
-opt into `--audit-mode probe`, which re-executes miner agents and bills you for their inference. Install the `tee` extra for full DCAP
-quote verification; off-TDX boxes verify captured quotes fine.
+A **Bittensor wallet** with stake + a vpermit, registered on the subnet, plus TAO; a **HuggingFace**
+account; and **Docker**. **No LLM API key, no GPU, and no confidential VM** — validation is verify-only,
+and the default grounding mode does zero inference (a plain CPU VM is enough). An **OpenRouter key is
+needed only** if you opt into `--audit-mode probe`, which re-executes miner agents and bills you for
+their inference. Install the `tee` extra for full DCAP quote verification; off-TDX boxes verify captured
+quotes fine.
+
+**Why Docker.** The ranked benchmark is LiveCodeBench ([`DESIGN.md`](DESIGN.md) §5e), so grading an
+answer means *executing* a program, not parsing one. Each submission runs in a throwaway
+`python:3.11-slim` container with `--network none` and a 1 GB memory cap — the code is untrusted model
+output, so it gets no egress and cannot outlive its container. Budget ~8 short-lived containers per
+miner per epoch. If Docker is unavailable the validator reports `grading_unavailable` and **excludes**
+those miners from the epoch rather than scoring them 0 — your broken infrastructure must never be
+charged to a miner — so a Docker outage costs the subnet an epoch, not a miner its rank.

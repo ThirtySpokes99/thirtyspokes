@@ -8,7 +8,7 @@ Cheap and re-execution-free. `verify_proof`:
   2. re-derives the SAME nonce-seeded task slice the runtime ran, so it knows the
      public gold for every task without re-running the agent;
   3. grades the attested answers (missing/substituted tasks count as wrong) and
-     returns per-benchmark accuracy + a bootstrap lower confidence bound and the
+     returns per-benchmark accuracy + a Wilson lower confidence bound and the
      reign scalar `Q_lcb = Σ_b w_b·lcb_b`. Cost is NOT folded into the score — it is
      a budget ceiling applied separately by `eligible`.
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from math import sqrt
+from statistics import NormalDist
 
 import numpy as np
 
@@ -33,6 +34,7 @@ from ..gateway import signing
 from ..gateway.grader import extract_number
 from ..tee.attestation import verify_quote
 from .benchmarks import Benchmark, bench_seed, extract_choice, grade_choice, grade_patch
+from .evidence import wilson_lcb
 from .proof import Proof
 from .store import hash_source
 
@@ -41,7 +43,18 @@ from .store import hash_source
 class BenchStat:
     n: int
     acc: float          # point accuracy over the assigned slice
-    lcb: float          # bootstrap lower confidence bound (noise can't dethrone)
+    lcb: float          # Wilson lower confidence bound (noise can't dethrone)
+    cost_usd: float
+
+
+@dataclass(frozen=True)
+class TaskStat:
+    """One graded ask. The per-benchmark aggregate cannot answer "which ask did this router get
+    wrong, and what did it pay for it", which is what per-ask regret and the frontier's cost axis
+    both need — so the grading loop keeps its working detail instead of discarding it."""
+    benchmark: str
+    task_id: str
+    correct: float
     cost_usd: float
 
 
@@ -54,15 +67,27 @@ class ProofVerdict:
     score: float = 0.0          # Q_lcb = Σ w·lcb, the bounded [0,1] reign scalar
     total_score: float = 0.0    # Σ w·acc (point) — display + per-benchmark floor
     eligible: bool = True        # passes cost budget + floors + pool-call gate
+    per_task: tuple[TaskStat, ...] = ()   # per-ask detail, in the validator's re-derived slice order
 
 
 def _bootstrap_lcb(correct: list[float], alpha: float, boot: int, seed: int) -> float:
-    x = np.asarray(correct, dtype=float)
-    if x.size == 0:
+    """Lower confidence bound on the slice accuracy. Wilson, NOT the resampling bootstrap.
+
+    The bootstrap is DEGENERATE on the all-same slices that matter most here: resampling 8 identical
+    values yields 8 identical means, so a perfect 8/8 slice reported `lcb = 1.000` — zero claimed
+    uncertainty from eight questions. That defeated the entire premise of scoring on the lower bound
+    (`dethrone_guard` then cleared `lcb_c > acc_king + margin` against ANY king below 0.97), making
+    "resubmit every epoch until a slice comes up perfect" a free lottery ticket for the crown.
+    Wilson is exact on the same counts and correctly prices small samples: 8/8 -> 0.747, and it is
+    already what the accumulate path uses (`evidence.wilson_lcb`), so the two modes now agree.
+
+    `boot` is retained for call compatibility and unused; `seed` likewise (Wilson is deterministic,
+    which is a bonus — two validators no longer depend on drawing the same resamples).
+    """
+    if not correct:
         return 0.0
-    rng = np.random.default_rng(seed)
-    means = x[rng.integers(0, x.size, size=(boot, x.size))].mean(axis=1)
-    return float(np.quantile(means, alpha))
+    z = NormalDist().inv_cdf(1.0 - alpha)        # one-sided, matching the accumulate path
+    return wilson_lcb(float(np.sum(correct)), float(len(correct)), z)
 
 
 def verify_proof(
@@ -111,6 +136,14 @@ def verify_proof(
             return bad("rtmr_gate_unset")                 # need boot RTMR1/2 + runtime RTMR3
         if tcb_accept is None:
             return bad("tcb_policy_unset")                # enforce ⇒ full DCAP (TCB/CRL/QE)
+        if not proof.confined:
+            # The agent ran with network egress. The measured-image gates above prove WHICH image
+            # booted, not what it did inside — and an unconfined agent can reach an off-allow-list
+            # model using a key embedded in its own weights, voiding the pool pinning, the metered
+            # cost and the budget ceiling while still satisfying `no_pool_call` with one token call.
+            # `run_agent_confined` degrades silently when the namespace probe fails, so this is
+            # gated on the ATTESTED fact rather than on the miner's configuration.
+            return bad("unconfined_agent")
     if is_tdx:                                            # WS7: real Intel-TDX hardware quote
         # `tcb_accept` set -> full DCAP (TCB status/CRL/QE-identity via dcap-qvl, H1);
         # else the offline crypto-chain-only path (cert chain to Intel root + binding).
@@ -149,6 +182,7 @@ def verify_proof(
     # re-derive the assigned slice + gold, and index the attested answers
     submitted = {(r.benchmark, r.task_id): r for r in proof.results}
     per_bench: dict[str, BenchStat] = {}
+    per_task: list[TaskStat] = []
     q_lcb = 0.0          # Σ w·lcb  (bounded reign scalar)
     total_score = 0.0    # Σ w·acc  (point)
     seen: set[tuple[str, str]] = set()
@@ -161,9 +195,10 @@ def verify_proof(
             seen.add(key)
             r = submitted.get(key)
             ans = r.answer if r is not None else ""    # missing task -> graded wrong
-            if r is not None:
-                cost += float(r.cost_usd)
+            task_cost = float(r.cost_usd) if r is not None else 0.0
+            cost += task_cost
             correct.append(bench.grade(ans, t.gold))
+            per_task.append(TaskStat(bench.name, t.task_id, correct[-1], task_cost))
         lcb = _bootstrap_lcb(correct, alpha, boot,
                              seed=int(signing.sha256_hex(f"{proof.nonce}|{bench.name}")[:8], 16))
         acc = float(np.mean(correct)) if correct else 0.0
@@ -174,7 +209,7 @@ def verify_proof(
     if any(k not in seen for k in submitted):
         return bad("unexpected_task")
 
-    return ProofVerdict(True, "ok", per_bench, c, q_lcb, total_score)
+    return ProofVerdict(True, "ok", per_bench, c, q_lcb, total_score, per_task=tuple(per_task))
 
 
 def dethrone_guard(
@@ -267,35 +302,98 @@ def answer_token(text, kind: str):
     if kind == "number":
         v = extract_number(text)
         return None if v is None else format(v, ".6g")
+    if kind == "code":
+        # THE PARSER MUST MATCH THE GRADER'S, and for code that parser is `extract_code`. Comparing
+        # raw text here instead disqualified every honest agent: a model answers a code ask with
+        # prose plus a ```python fence, so an agent that strips the fence — exactly what the grader
+        # does before running the program — produces an answer that matches no response verbatim.
+        # All 8 code answers then read `ungrounded`, blowing past `max_ungrounded` (0.15) and DQ'ing
+        # the miner for behaving normally. Extracting both sides makes the fenced response and the
+        # cleaned answer the same token, while a memorized program that never came from the pool
+        # still matches nothing.
+        from .lcb import extract_code
+        s = " ".join(extract_code(text).split())
+        return s or None
     s = " ".join(str(text).split())                  # patch/text: whitespace-normalized
     return s or None
 
 
+# Answer kinds where the answer is NOT structurally present in the prompt, so "who produced it
+# first" is a meaningful question. MULTIPLE CHOICE IS EXCLUDED ON PURPOSE: every option is in the
+# prompt by construction, so `extract_choice(prompt)` already returns the gold and a provenance rule
+# would flag every honest agent. That is not a tuning problem — it means no prompt/response rule can
+# ever defend an MCQ benchmark against memorization, which is why the scored suite ranks on
+# free-form answers (see `benchmarks.real_suite`).
+#
+# CODE IS ALSO EXCLUDED, and this one is a judgement call worth stating. Ordering would catch the
+# laundering vector (put a memorized program in your own prompt, let the model echo it back), but
+# `extract_code` pulls the fenced block out of a PROMPT just as readily as out of a response — so
+# every self-refining agent ("here is my draft, find the bug") would be flagged `laundered` for the
+# iterative orchestration this subnet exists to reward. Plain grounding still applies: the program
+# must appear in a pool RESPONSE, so an agent that answers from its own weights without consulting
+# the pool is still caught. The residual is a memorizer who launders through a self-authored prompt.
+_PROVENANCE_KINDS = frozenset({"number", "patch"})
+
+
+def _grounded_one(answer, calls: list[dict], kind: str) -> tuple[bool, str]:
+    """Provenance of ONE scored answer, walking that task's calls in order.
+
+    Grounded  — the token first appears in a RESPONSE: the pool produced it.
+    Laundered — the token first appears in a PROMPT: the agent already had it and used the pool as
+                an echo chamber, which is exactly how a memorizer defeats plain grounding.
+    Ungrounded— it never appears at all: the agent answered without the pool.
+    """
+    tok = answer_token(answer, kind)
+    check_prompts = kind in _PROVENANCE_KINDS
+    for e in calls:                                   # trace is in call order
+        if check_prompts and answer_token(e.get("prompt", ""), kind) == tok:
+            return False, "laundered"
+        # an unparseable answer relaying an equally-unparseable response is still grounded
+        if answer_token(str(e.get("response", "")), kind) == tok:
+            return True, "ok"
+    return False, "ungrounded"
+
+
 def grounding_check(proof: Proof, trace: list[dict], suite: list[Benchmark], *,
                     max_ungrounded: float = 0.15) -> tuple[bool, str]:
-    """Each scored answer must match a pool response logged for its task. Reads only the proof
-    + the hash-attested trace (no re-execution). DQs `ungrounded` when the ungrounded fraction
-    exceeds `max_ungrounded` (slack for synthesis orchestration + parser noise). KNOWN residual:
-    prompt-injection laundering (the agent tells the model the answer and the model echoes it)
-    passes — the null-pool re-execution probe is the counterfactual upgrade path."""
+    """Each scored answer must DERIVE FROM the pool — not merely appear next to it.
+
+    Reads only the proof + the hash-attested trace: no re-execution, no secret bank, no private
+    data, deterministic across validators. DQs when the unexplained fraction exceeds
+    `max_ungrounded` (slack for synthesis orchestration and parser noise); the reported reason is
+    whichever failure dominates.
+
+    Plain "answer ∈ some response" was defeatable by laundering — put the memorized answer in your
+    own prompt and the model echoes it back, so the answer is 'grounded' in a response the agent
+    itself authored. Ordering closes that: information the agent already had surfaces on the prompt
+    side first, information the pool supplied surfaces on the response side first. Verified against
+    honest verify-loops and cheap→strong escalation, which both keep passing because their answer
+    still originates in a response.
+
+    Residual: a few-shot prompt whose trailing number happens to equal the task's answer reads as
+    laundered. `extract_number` takes the LAST number, which is normally part of the question rather
+    than an example's answer, and `max_ungrounded` absorbs the occasional collision.
+    """
     kind = {b.name: _bench_kind(b) for b in suite}
-    resp_by_task: dict[str, list[str]] = {}
+    calls_by_task: dict[str, list[dict]] = {}
     for e in trace:
-        resp_by_task.setdefault(e.get("task_id"), []).append(str(e.get("response", "")))
-    total = ungrounded = 0
+        calls_by_task.setdefault(e.get("task_id"), []).append(e)
+    total = laundered = ungrounded = 0
     for r in proof.results:
         total += 1
-        k = kind.get(r.benchmark, "number")
-        at = answer_token(r.answer, k)
-        # grounded iff the answer's token matches SOME logged response's token (an unparseable
-        # answer that relays an equally-unparseable response is still grounded: None in {None}).
-        toks = {answer_token(resp, k) for resp in resp_by_task.get(r.task_id, [])}
-        if at not in toks:
-            ungrounded += 1
+        ok, why = _grounded_one(r.answer, calls_by_task.get(r.task_id, []),
+                                kind.get(r.benchmark, "number"))
+        if not ok:
+            if why == "laundered":
+                laundered += 1
+            else:
+                ungrounded += 1
     if total == 0:
         return True, "ok"
-    frac = ungrounded / total
-    return (frac <= max_ungrounded, "ok" if frac <= max_ungrounded else "ungrounded")
+    frac = (laundered + ungrounded) / total
+    if frac <= max_ungrounded:
+        return True, "ok"
+    return False, "laundered" if laundered >= ungrounded else "ungrounded"
 
 
 # --- optimistic anti-cheat backstops (applied by the validator on the artifact it
@@ -391,6 +489,55 @@ def scan_source(source_text: str) -> tuple[bool, str]:
     return (True, "hardcoded_answers") if _HARDCODE.search(source_text) else (False, "clean")
 
 
+def _decoys(golds: list[str], salt: str) -> list[str]:
+    """One deterministic control per gold, with the SAME digit-length — so a decoy is exactly as
+    likely to occur by chance as the real answer it stands in for. Derived from a shared salt, so
+    every validator computes the identical control set."""
+    out = []
+    for i, s in enumerate(golds):
+        n = len(s)
+        h = int(signing.sha256_hex(f"{salt}|{i}|{s}")[:8], 16)
+        d = str(h % (10 ** n)).zfill(n)
+        if d == s:                                  # never let a control BE the answer
+            d = str((h + 1) % (10 ** n)).zfill(n)
+        out.append(d)
+    return out
+
+
+def scan_weights(weights: bytes, golds: list, *, salt: str = "", min_golds: int = 4,
+                 min_hit: float = 0.5, ratio: float = 3.0) -> tuple[bool, str]:
+    """Flag an answer table hidden in the OPAQUE weights blob.
+
+    `scan_source` only ever sees `source_text`, so `weights.bin` was the obvious place to keep a
+    lookup table — public, bound, and never examined.
+
+    Naive substring search is useless: a short gold like "8" occurs in essentially any binary. So
+    the real answers are measured against DECOYS OF THE SAME DIGIT-LENGTH and flagged only when they
+    hit substantially more often than the controls. Single-digit golds then hit in both sets and
+    correctly discriminate nothing, while a table of multi-digit answers stands out sharply.
+
+    Only digit-bearing golds are usable: an MCQ letter has no same-shape decoy (and "A" matches
+    almost any text), so a choice benchmark is skipped entirely rather than measured without a
+    control — getting that wrong flagged every honest miner in the offline sim.
+
+    This raises the bar on lazy memorization; it is NOT a proof of absence, since a compressed or
+    learned encoding defeats it. `grounding_check` is the defence that targets the behaviour
+    regardless of how the answers are stored.
+    """
+    if not weights:
+        return False, "clean"
+    # only golds that are numeric enough to build a same-shape control for
+    usable = [s for s in (str(g) for g in golds) if s.isdigit()]
+    if len(usable) < min_golds:
+        return False, "clean"
+    text = weights.decode("latin-1")
+    present = lambda vals: sum(1 for v in vals if v in text) / len(vals)   # noqa: E731
+    real, ctrl = present(usable), present(_decoys(usable, salt))
+    if real >= min_hit and real >= ratio * max(ctrl, 1e-9):
+        return True, "answers_in_weights"
+    return False, "clean"
+
+
 @dataclass(frozen=True)
 class Challenge:
     challenger_hotkey: str
@@ -405,3 +552,246 @@ def adjudicate_challenge(ch: Challenge, committed_source_hash: str) -> tuple[boo
     if hash_source(ch.source_text) != committed_source_hash:
         return (False, "unbound_source")
     return scan_source(ch.source_text)
+
+
+# --- the router-agent scalar: "best answer at the lowest price, for a given ask" ---------------
+# The old scalar (Q_lcb - lambda*cost) has three defects for a ROUTING competition:
+#   1. It scores the OUTCOME, not the DECISION. "Always call the frontier model" and a router that
+#      correctly predicts which asks the cheap model handles score almost identically at lambda=0.02.
+#   2. It is ABSOLUTE, not baseline-relative. On a 95%-accurate pool every router scores ~95%, so
+#      ~98% of the number measures the POOL and ~2% measures the miner.
+#   3. It is a POINT, not a frontier. A fixed lambda bakes in one quality/price exchange rate -- the
+#      owner's -- but that tradeoff belongs to the user: a throwaway ask wants the cheapest adequate
+#      answer, a critical one wants the best available.
+#
+# `router_headroom` fixes all three: 0.0 = no better than randomising over fixed pool models AT YOUR
+# PRICE, 1.0 = matched the budget-constrained per-query oracle there. It needs a POOL REFERENCE for
+# the epoch's slice -- every (task, pool-model) score and cost -- which the OWNER publishes, since a
+# validator runs no inference and cannot know what other models would have answered.
+
+def _wmean(x, w) -> float:
+    """Row-weighted mean, or the plain mean when no weights are given.
+
+    ROW WEIGHTS EXIST BECAUSE THE TWO SIDES OF THE COMPARISON MUST BE WEIGHTED ALIKE. The miner's
+    score is `Σ_b w_b·acc_b`, but the reference matrix holds one row per TASK across every benchmark,
+    so an unweighted row mean silently re-weights the pool by how many tasks each benchmark
+    contributed. On the live suite that is not a rounding error: `mmlu` carries weight 0 (an
+    eligibility floor, never ranked — see `benchmarks.real_suite`) yet supplies half the rows, so an
+    unweighted frontier would be half-built from a benchmark the miner is not scored on. Passing
+    `w_row = w_b / n_b` makes the frontier the same weighted average as the miner's own number, and
+    drops weight-0 benchmarks out of it automatically."""
+    return float(np.average(np.asarray(x, float), weights=w)) if w is not None \
+        else float(np.mean(np.asarray(x, float)))
+
+
+def _upper_hull(points):
+    """Non-decreasing upper convex hull of (cost, quality). Every interpolated point is physically
+    realisable by randomising between the two neighbouring policies."""
+    out, best = [], -1.0
+    for c, q in sorted(points):
+        best = max(best, q)
+        out.append((c, best))
+    h = []
+    for c, q in out:
+        while len(h) >= 2 and (h[-1][1] - h[-2][1]) * (c - h[-2][0]) <= (q - h[-2][1]) * (h[-1][0] - h[-2][0]):
+            h.pop()
+        h.append((c, q))
+    return h
+
+
+def _on_hull(h, cost):
+    if not h or cost <= h[0][0]:
+        return h[0][1] if h else 0.0
+    for (c1, q1), (c2, q2) in zip(h, h[1:]):
+        if c1 <= cost <= c2:
+            t = (cost - c1) / (c2 - c1) if c2 > c1 else 0.0
+            return q1 + t * (q2 - q1)
+    return h[-1][1]
+
+
+def zero_frontier(pool_scores, pool_costs, row_weights=None):
+    """RouterBench's Zero router: what a FEATURELESS policy reaches at each price, by randomising
+    over fixed pool models. The bar a real router must clear to have demonstrated anything."""
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    return _upper_hull([(_wmean(C[:, j], row_weights), _wmean(S[:, j], row_weights))
+                        for j in range(S.shape[1])])
+
+
+def oracle_frontier(pool_scores, pool_costs, row_weights=None):
+    """The budget-constrained PER-QUERY upper bound: start from the cheapest model on each ask, then
+    buy the cheapest per-ask upgrades first. For binary scores the only upgrade worth buying on an
+    ask is to the cheapest model correct there, so this is exact rather than greedy-approximate.
+
+    The purchase ORDER is unaffected by `row_weights`: an upgrade on ask `t` buys `w_t·Δs_t` quality
+    for `w_t·Δc_t`, so the weight cancels out of the cost-effectiveness ratio and (with binary
+    scores, where every upgrade is the same 0->1 step) ordering by raw `Δc_t` stays exact."""
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    T, M = S.shape
+    base = C.argmin(axis=1)
+    cur_s, cur_c = S[np.arange(T), base].copy(), C[np.arange(T), base].copy()
+    ups = []
+    for t in range(T):
+        better = [j for j in range(M) if S[t, j] > cur_s[t]]
+        if better:
+            j = min(better, key=lambda j: C[t, j])
+            ups.append((C[t, j] - cur_c[t], t, j))
+    pts = [(_wmean(cur_c, row_weights), _wmean(cur_s, row_weights))]
+    for _dc, t, j in sorted(ups):
+        cur_c[t], cur_s[t] = C[t, j], S[t, j]
+        pts.append((_wmean(cur_c, row_weights), _wmean(cur_s, row_weights)))
+    return _upper_hull(pts)
+
+
+def achievable_gap(pool_scores, pool_costs, row_weights=None) -> float:
+    """The most quality a perfect per-ask router could add over the featureless baseline, anywhere
+    on the price range. MINER-INDEPENDENT: it is a property of the traffic and the pool, not of
+    anyone competing, so it is the honest answer to "is this suite worth routing at all".
+
+    This is the same oracle-gap statistic this project measured across eight experiments — ~0.019 on
+    the saturated math suite, ~0.083 on LiveCodeBench. Publishing it each epoch means a saturated
+    benchmark announces itself in the feed instead of being silently amplified into a ranking."""
+    zf = zero_frontier(pool_scores, pool_costs, row_weights)
+    of = oracle_frontier(pool_scores, pool_costs, row_weights)
+    costs = sorted({c for c, _ in zf} | {c for c, _ in of})
+    return max((_on_hull(of, c) - _on_hull(zf, c) for c in costs), default=0.0)
+
+
+def frontier_bounds(cost: float, pool_scores, pool_costs, row_weights=None) -> tuple[float, float]:
+    """`(zero, oracle)` quality at this price — the two ends of the achievable band.
+
+    Returned as a PAIR rather than pre-divided into a ratio because the accumulator pools them
+    across epochs before dividing (`evidence.Evidence.headroom_lcb`), and because their DIFFERENCE
+    is itself the diagnostic that says whether the traffic is worth routing at all."""
+    z = _on_hull(zero_frontier(pool_scores, pool_costs, row_weights), cost)
+    o = _on_hull(oracle_frontier(pool_scores, pool_costs, row_weights), cost)
+    return z, o
+
+
+def router_headroom(acc: float, cost: float, pool_scores, pool_costs, row_weights=None) -> float:
+    """Share of the ACHIEVABLE headroom this router captured, at its own price.
+
+      0.0  -> no better than randomising over fixed pool models at this cost
+      1.0  -> matched the budget-constrained per-query oracle at this cost
+      <0   -> worse than the featureless baseline
+
+    Unlike a quality-only measure, matching quality at a fraction of the price scores WELL rather
+    than negative -- which is the whole point of "best answer at the lowest price".
+
+    Single-slice form, kept for analysis and the `per_epoch` sim path. The DEFAULT `accumulate`
+    scoring mode pools the frontier across epochs instead (`evidence.Evidence.headroom_lcb`), so a
+    single 8-question slice cannot decide a crown.
+    """
+    z, o = frontier_bounds(cost, pool_scores, pool_costs, row_weights)
+    return float((acc - z) / (o - z)) if o - z > 1e-12 else 0.0
+
+
+def per_ask_regret(miner_scores, miner_costs, pool_scores, pool_costs):
+    """Per-ASK attribution: what did this router give up, on each individual question?
+
+      quality_regret[q] = max_m s(q,m) - s(q, chosen)      # a better model was available
+      cost_regret[q]    = cost(q, chosen) - cheapest_correct(q)
+
+    Why per-ask rather than the aggregate `router_headroom` takes: aggregates cannot separate a
+    router that made good decisions from one that got lucky overall, and they waste information.
+    Binary accuracy carries ~1 bit per ask; regret is CONTINUOUS and graded against every known
+    alternative, so a paired comparison needs materially fewer asks to resolve the same gap. That
+    matters directly at n_per_bench=8.
+
+    An ask nobody in the pool solves contributes ZERO quality regret to everyone -- routing cannot
+    fix it, so it must not drag every miner down the way an accuracy average does.
+    """
+    S, C = np.asarray(pool_scores, float), np.asarray(pool_costs, float)
+    ms, mc = np.asarray(miner_scores, float), np.asarray(miner_costs, float)
+    qual = S.max(axis=1) - ms
+    cheapest_ok = np.array([
+        min([C[t, j] for j in range(S.shape[1]) if S[t, j] >= S[t].max()], default=C[t].min())
+        for t in range(S.shape[0])])
+    return qual, mc - cheapest_ok
+
+
+def row_weights_for(row_benchmarks, bench_weights: dict[str, float]) -> list[float] | None:
+    """Per-ROW weights that make a reference-matrix mean equal the miner's `Σ_b w_b·acc_b`.
+
+    Each benchmark `b` gets total mass `w_b`, split evenly over the rows it contributed
+    (`w_b / n_b`), so a benchmark supplying more tasks does not thereby count for more — and a
+    weight-0 benchmark (the MMLU eligibility floor) contributes nothing to the frontier at all.
+    Returns None when no row carries any weight, so the caller can decline to score rather than
+    divide by zero."""
+    counts: dict[str, int] = {}
+    for b in row_benchmarks:
+        counts[b] = counts.get(b, 0) + 1
+    w = [bench_weights.get(b, 0.0) / counts[b] for b in row_benchmarks]
+    return w if sum(w) > 0 else None
+
+
+def regret_stats(per_task, ref: dict) -> dict:
+    """Per-ask ATTRIBUTION against the pool reference — what this router gave up, ask by ask.
+
+    Diagnostics, not a reward term. Regret and the frontier scalar are both measured against the
+    SAME reference, so paying for regret on top of headroom would price one decision twice; and
+    unlike headroom, regret has no scale on which "good" is defined without a second calibration.
+    Its job is to EXPLAIN a headroom number: a router that lost quality reads differently from one
+    that merely overpaid, and the aggregate scalar cannot tell them apart.
+    """
+    rows = {tid: i for i, tid in enumerate(ref.get("task_ids", []))}
+    S, C = np.asarray(ref["scores"], float), np.asarray(ref["costs"], float)
+    idx = [(rows[t.task_id], t) for t in per_task if t.task_id in rows]
+    if not idx:
+        return {}
+    order = [i for i, _ in idx]
+    qual, cost = per_ask_regret([t.correct for _, t in idx], [t.cost_usd for _, t in idx],
+                                S[order], C[order])
+    return {
+        "asks_matched": len(idx),
+        # mean quality given up per ask: 0.0 == never picked worse than the best available model
+        "quality_regret": round(float(np.mean(qual)), 4),
+        # mean overpayment per ask vs the cheapest model that was just as good
+        "cost_regret_usd": round(float(np.mean(cost)), 6),
+        # asks no pool model solves: they charge zero regret to everyone, so they are reported
+        # separately rather than silently diluting the average
+        "asks_nobody_solves": int(np.sum(S[order].max(axis=1) <= 0.0)),
+    }
+
+
+def trajectory_stats(proof, trace: list[dict]) -> dict:
+    """Diagnostics for the INTELLIGENCE LAYER — the half of "routing model + intelligence layer"
+    that the scalar cannot see.
+
+    The mechanism scores the final answer and the total cost, so it cannot tell an agent that
+    escalated BECAUSE its verifier caught an error from one that escalated blindly, nor one that
+    stopped early because it was confident from one that got lucky. The trace already records every
+    call and is hash-attested (`call_log_hash`), so the signal is present and simply discarded.
+
+    Reported as DIAGNOSTICS, never as reward terms: any of these becomes trivially gameable the
+    moment it pays (a miner would escalate constantly to farm `escalations`), exactly as
+    RouterEval's selection-entropy metric is maximised by a random router.
+    """
+    by_task: dict = {}
+    for e in trace:
+        by_task.setdefault(e.get("task_id"), []).append(e)
+    final = {r.task_id: r.answer for r in proof.results}
+    n_esc = n_rec = n_waste = 0
+    calls = []
+    for tid, es in by_task.items():
+        calls.append(len(es))
+        costs = [float(e.get("cost_usd", 0.0)) for e in es]
+        for i in range(1, len(es)):                       # escalation = a pricier call after a cheaper
+            if costs[i] > costs[i - 1] > 0:
+                n_esc += 1
+                # did the escalation actually change the answer that was finally submitted?
+                if str(es[i].get("response", "")).strip() == str(final.get(tid, "")).strip() \
+                        and str(es[i - 1].get("response", "")).strip() != str(final.get(tid, "")).strip():
+                    n_rec += 1
+        # a call whose response never became the answer and was not followed by an escalation
+        for e in es[:-1]:
+            if str(e.get("response", "")).strip() != str(final.get(tid, "")).strip():
+                n_waste += 1
+    return {
+        "calls_per_ask": round(float(np.mean(calls)), 2) if calls else 0.0,
+        "escalations": n_esc,
+        "escalations_that_changed_the_answer": n_rec,
+        "escalation_yield": round(n_rec / n_esc, 3) if n_esc else 0.0,
+        "superseded_calls": n_waste,
+        "latency_s": round(float(getattr(proof, "latency_s", 0.0)), 3),
+        "tokens_out": int(getattr(proof, "tokens_out", 0)),
+    }

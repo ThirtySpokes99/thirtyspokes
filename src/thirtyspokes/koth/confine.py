@@ -68,7 +68,9 @@ def _ns_flags() -> list[str]:
     return ns
 
 
-@functools.lru_cache(maxsize=1)
+_probe_cache: bool | None = None
+
+
 def confinement_available() -> bool:
     """True where the no-egress confinement can ACTUALLY be built — probed, not guessed.
 
@@ -80,16 +82,33 @@ def confinement_available() -> bool:
     every audit into `audit_error:SandboxError`.
 
     Where this returns False, `run_agent_confined` degrades to a plain isolated subprocess (scrubbed
-    env + rlimits); the no-egress *guarantee* holds only where it returns True.
+    env + rlimits); the no-egress *guarantee* holds only where it returns True — so callers that
+    NEED the guarantee must pass `require=True` rather than trusting this to be right.
+
+    A TIMEOUT is not an answer. It used to be swallowed by the same `except` as "unsupported" and
+    then `lru_cache`d, so one slow probe silently disabled confinement for the rest of the boot —
+    a load-sensitive trigger on a machine whose size the miner chooses. Timeouts are therefore
+    retried and never cached; only a definitive yes/no is remembered.
     """
+    global _probe_cache
+    if _probe_cache is not None:
+        return _probe_cache
     if sys.platform != "linux" or not shutil.which("unshare"):
+        _probe_cache = False
         return False
-    try:
-        return subprocess.run(["unshare", *_ns_flags(), "--", "true"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=10).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    for attempt in range(3):
+        try:
+            ok = subprocess.run(["unshare", *_ns_flags(), "--", "true"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=30).returncode == 0
+        except subprocess.TimeoutExpired:
+            continue                      # inconclusive under load — re-probe, do NOT cache
+        except (OSError, subprocess.SubprocessError):
+            _probe_cache = False          # definitive: the kernel/binary cannot do it
+            return False
+        _probe_cache = ok
+        return ok
+    return False                          # every probe timed out; stay uncached so we retry later
 
 
 def _preexec(cpu_limit: int):
@@ -126,16 +145,28 @@ def _send(f, obj: dict) -> None:
 
 
 def run_agent_confined(source_text: str, weights: bytes, tasks: list[dict], *, backend,
-                       timeout: float = 120.0, hardened: bool | None = None):
+                       timeout: float = 120.0, hardened: bool | None = None,
+                       require: bool = False):
     """Run the agent over `tasks` (`[{task_id, benchmark?, prompt}]`) in a confined child.
-    Model calls are metered + executed parent-side; returns `(results, trace)`:
-      results = [{task_id, benchmark, answer, cost_usd}]   (cost attributed from the trace)
-      trace   = [{task_id, model, prompt, response, cost_usd}]
-    Raises SandboxError on crash/timeout → callers fail closed."""
+    Model calls are metered + executed parent-side; returns `(results, trace, hardened)`:
+      results  = [{task_id, benchmark, answer, cost_usd}]   (cost attributed from the trace)
+      trace    = [{task_id, model, prompt, response, cost_usd}]
+      hardened = whether the no-egress namespaces were ACTUALLY in force
+    Raises SandboxError on crash/timeout → callers fail closed.
+
+    `require=True` refuses to run at all rather than degrade — production (the measured enclave)
+    sets it, because an unconfined agent has network egress and can reach an off-allow-list model
+    with a key of its own, which silently voids the pinning, the metering and the cost budget.
+    The returned `hardened` flag is what the caller stamps into the attested proof, so the
+    guarantee is observable to a validator instead of being taken on trust."""
     from ..tee.runtime import MeteringProxy
 
     if hardened is None:
         hardened = confinement_available()
+    if require and not hardened:
+        raise SandboxError(
+            "no-egress confinement unavailable and require=True: refusing to run the agent "
+            "unconfined (it would get network egress, voiding pool pinning and cost metering)")
     proxy = MeteringProxy(backend)
     trace: list[dict] = []
     results: list[dict] = []
@@ -157,9 +188,12 @@ def run_agent_confined(source_text: str, weights: bytes, tasks: list[dict], *, b
             if msg["type"] == "call":
                 c0 = proxy.total_cost_usd
                 resp = proxy.call_model(msg["model"], msg["messages"], msg.get("params"))
+                tin, tout = getattr(proxy, "last_tokens", (0, 0))
                 trace.append({"task_id": msg.get("task_id"), "model": msg["model"],
                               "prompt": str(msg["messages"][-1]["content"]),
-                              "response": str(resp), "cost_usd": proxy.total_cost_usd - c0})
+                              "response": str(resp), "cost_usd": proxy.total_cost_usd - c0,
+                              "tokens_in": tin, "tokens_out": tout,
+                              "latency_s": getattr(proxy, "last_latency_s", 0.0)})
                 _send(proc.stdin, {"type": "resp", "response": resp})
             elif msg["type"] == "result":
                 results.append(msg["result"])
@@ -196,4 +230,4 @@ def run_agent_confined(source_text: str, weights: bytes, tasks: list[dict], *, b
         by_task[e["task_id"]] = by_task.get(e["task_id"], 0.0) + e["cost_usd"]
     for r in results:
         r["cost_usd"] = by_task.get(r["task_id"], 0.0)
-    return results, trace
+    return results, trace, hardened

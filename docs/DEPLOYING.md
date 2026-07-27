@@ -54,8 +54,10 @@ the prerequisite: until MRTD + RTMR1/2/3 are published, an enforcing validator h
 **2. Register on-chain.**
 ```bash
 uv pip install -e ".[chain,eval,tee]"
-export OPENROUTER_API_KEY=...            # MINER only (it runs the benchmark and pays for it).
-                                         # A validator needs NO LLM key in the default grounding mode.
+export OPENROUTER_API_KEY=...            # MINER (runs the benchmark) and OWNER (builds the pool
+                                         # reference). A validator needs NO LLM key in the default
+                                         # grounding mode — but it DOES need Docker, since the ranked
+                                         # benchmark is graded by executing code (DESIGN.md §5e).
 huggingface-cli login
 btcli wallet new_coldkey && btcli wallet new_hotkey        # one wallet per role
 btcli subnet register --netuid 99 --wallet.name miner     --subtensor.network finney
@@ -67,7 +69,36 @@ btcli subnet register --netuid 99 --wallet.name validator --subtensor.network fi
 `orchestra-koth-owner` — see [§Build, pin, publish](#build-pin-publish). Validators read this **per
 epoch**, so rotating the image or recovering TCB takes effect without a restart.
 
-**4. Run the validator and the external locked-image miner operator.** Both default to
+**4. Publish the per-epoch pool reference.** This is what turns validators' scalar from "how accurate
+was this agent" into "how well did it *route*" — see [`DESIGN.md`](DESIGN.md) §5.0/§5c. Validators run
+no inference, so only the owner can measure what the other pool models would have answered.
+```bash
+# once per epoch, next to the validator (a cron / systemd timer is the intended shape)
+set -a && . ./.env && set +a            # OPENROUTER_API_KEY — the OWNER pays for this, not miners
+orchestra-koth-reference --netuid 99 --wallet owner \
+  --pool "$THE_PINNED_POOL" --n-per-bench 8 \     # MUST match the validators' --n-per-bench
+  --deadline-s 900 --call-timeout 180
+```
+
+**Keep `--deadline-s` inside your epoch.** A reference that outruns its epoch describes a slice nobody
+is scored on any more, so it is dead on arrival — and provider calls can hang well past their own
+timeout (observed during this build-out: one request sat with the connection ESTABLISHED and no
+response, holding the job for 35+ minutes on 3.5 seconds of CPU). Cells outstanding at the deadline
+are treated as failed and their rows drop, so a hang costs coverage rather than the epoch. Progress
+is printed as cells land, so a wedged run is visible in the cron log rather than looking like a slow
+one.
+Cost is `n_per_bench × |pool|` calls per epoch — 8 × 6 = 48, well under a dollar. The record is signed
+with the owner hotkey and served from the owner's bucket (it cannot go on-chain: the owner's single
+commitment slot already holds the governance record, and overwriting it would blank the measured-image
+gate for the whole subnet). **Read the `achievable gap` it prints.** Below the validators'
+`--min-headroom-gap` (0.05) the traffic is saturated — a perfect router could add less than the
+sampling noise — and every validator will decline to score routing on it and publish
+`routable: false`. That is a signal about the *benchmark suite*, not about the miners; see
+`koth/lcb.py` for the alternative and what adopting it costs.
+
+Skipping this step is safe: epochs without a reference simply score on absolute accuracy.
+
+**5. Run the validator and the external locked-image miner operator.** Both default to
 `--network finney`.
 ```bash
 orchestra-koth-validator --netuid 99 --wallet validator                 # verify-only; no GPU, no CVM
@@ -141,12 +172,23 @@ NVMe driver in the initramfs. The kernel pin is load-bearing beyond determinism:
 expose — on those, RTMR3 silently stays zero.
 
 > **Always re-run the two-build check after touching the image contents.** Anything that lands in the
-> rootfs lands in the verity roothash → RTMR1. Baking the benchmark cache in (necessary, above) initially
-> *broke* reproducibility: the dataset bytes were identical, but `datasets` also wrote `.lock` files whose
-> **filename embeds the absolute cache path** and a `xet/logs/…<timestamp>_<pid>.log`. Two builds in
-> different directories therefore produced different RTMR1s — i.e. every miner who rebuilt the recipe
-> would have been rejected `unapproved_runtime`. The recipe now deletes both. Reproducibility is a
-> property of the *whole* rootfs, so verify it, don't assume it.
+> rootfs lands in the verity roothash → RTMR1. This has now bitten twice, both times silently:
+>
+> 1. **The baked benchmark cache.** The dataset bytes were identical, but `datasets` also wrote `.lock`
+>    files whose **filename embeds the absolute cache path**, and a `xet/logs/…<timestamp>_<pid>.log`.
+>    The recipe now deletes both.
+> 2. **The staged venv.** When venv staging moved from the fixed `/opt/koth/venv` to `$OUT/.venv-stage`
+>    (so a build could not clobber a host runtime), `python -m venv` baked that absolute path into
+>    `pyvenv.cfg` **and into the shebang of all ~30 console scripts**. Measured: two builds →
+>    roothash `533c80d7…` vs `2d41ca85…`. It also meant every `/opt/koth/venv/bin/orchestra-*` in the
+>    image pointed at an interpreter that does not exist there — invisible, because the runner calls
+>    `venv/bin/python <script>` directly and `bin/python` is a copied *binary*, not a script. The
+>    recipe now rewrites the staging path to `/opt/koth/venv` in the image copy and **fails the build**
+>    if any reference survives.
+>
+> Both bugs produce a perfectly valid-looking image whose only symptom is that miners who rebuilt the
+> recipe get rejected `unapproved_runtime`. Reproducibility is a property of the *whole* rootfs, so
+> verify it, don't assume it — `sha256sum` the UKI from two builds in **different directories**.
 
 Obtain the measurements either by **predicting** RTMR1 offline from the build artifacts, or by
 **capturing** them from one controlled boot (`koth/rtmr.read_measurements()` / `scripts/koth_gcp_measure_probe.sh`).

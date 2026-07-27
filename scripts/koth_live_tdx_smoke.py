@@ -2,7 +2,7 @@
 """The whole real path in one run (Stage-2), INSIDE the confidential VM.
 
 Real model backend (OpenRouter, real metered `usage.cost`), real benchmarks (MMLU +
-GSM8K with real gold), attested by the REAL Intel-TDX hardware root (not the mock
+the real live suite with real gold), attested by the REAL Intel-TDX hardware root (not the mock
 vendor key), then independently verified with `verify_proof` — DCAP chain to the
 Intel SGX Root CA + report_data binding + MRTD gate + answer grading + Q_lcb scoring.
 
@@ -39,7 +39,8 @@ def main() -> None:
     backend = PinnedBackend(
         OpenRouterBackend(cfg.api_key, cfg.base_url, timeout=120.0, max_retries=2,
                           price_fn=config.price_for), {MODEL})
-    print("loading real MMLU + GSM8K + producing a hardware-attested proof (real calls)...", flush=True)
+    # grading the code benchmark needs Docker on this box (docs/VALIDATOR.md)
+    print("loading the live suite + producing a hardware-attested proof (real calls)...", flush=True)
     suite = real_suite(n_load=8, seed=1)
     art = reference_artifact(MODEL)
 

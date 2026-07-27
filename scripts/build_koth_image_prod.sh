@@ -88,15 +88,59 @@ rm -f "$BUILDROOT"/etc/nvme/hostid "$BUILDROOT"/etc/nvme/hostnqn \
 EOF
 chmod +x "$OUT/mkosi.finalize"
 
-# self-contained venv (host==image x86_64/py3.12); copied via extra tree. Stage it under OUT so a
-# build never deletes or mutates a host runtime at /opt/koth.
-VENV_STAGE="$OUT/.venv-stage"
+# self-contained venv (host==image x86_64/py3.12); copied via extra tree.
+#
+# THE STAGING PATH MUST BE CONSTANT ACROSS BUILDS, and it must not be a host runtime. It was
+# `$OUT/.venv-stage`, which satisfied the second requirement and broke the first: `python -m venv`
+# and pip bake their own absolute location into three separate places, and each one leaked the build
+# directory into the rootfs -> the verity roothash -> RTMR1. Rewriting them afterwards is not enough,
+# because pip hashes the console scripts INTO `RECORD` at install time, before any rewrite can run —
+# so the recorded sha256 of `bin/f2py` et al still differed per build directory (measured: 24 RECORD
+# files differing, roothash 54f37385 vs 00bfa86c, after the shebang and bytecode fixes had already
+# landed). A fixed scratch path outside /opt/koth satisfies both requirements at once.
+VENV_STAGE="${VENV_STAGE:-/var/tmp/koth-venv-stage}"
 rm -rf "$VENV_STAGE"
 python3 -m venv --copies "$VENV_STAGE"
 # openai: the pool client (OpenRouterBackend). datasets: the real MMLU/GSM8K loaders.
 "$VENV_STAGE/bin/pip" install -q --no-cache-dir "$WHEEL" 'cryptography>=42' 'dcap-qvl>=0.5' numpy \
   openai datasets
 cp -a "$VENV_STAGE" "$OUT/mkosi.extra/opt/koth/venv"
+
+# REWRITE THE STAGING PATH OUT OF THE IMAGE COPY. `python -m venv` bakes its own absolute location
+# into pyvenv.cfg and into the shebang of every console script, and staging moved from the fixed
+# /opt/koth/venv to $OUT/.venv-stage — so the build directory leaked into the rootfs. That broke two
+# things at once:
+#   * REPRODUCIBILITY. The path is part of the rootfs -> the verity roothash -> RTMR1. Two builds in
+#     different directories produced different RTMR1s (measured: 533c80d7… vs 2d41ca85…), so a miner
+#     who rebuilt this recipe anywhere but the owner's exact directory was rejected
+#     `unapproved_runtime`. That is the whole point of the recipe being reproducible.
+#   * THE ENTRY POINTS. Every /opt/koth/venv/bin/orchestra-* in the image began
+#     `#!/root/koth-build-prod/.venv-stage/bin/python3` — an interpreter that does not exist inside
+#     the image. Only the direct `venv/bin/python <script>` invocations worked (bin/python is a
+#     copied BINARY, not a script), which is why this survived unnoticed.
+# The copy is what ships, so rewrite it to its real in-image location and leave $VENV_STAGE working
+# (the HF cache below is populated with it).
+IMG_VENV="$OUT/mkosi.extra/opt/koth/venv"
+grep -rlZ --binary-files=without-match "$VENV_STAGE" "$IMG_VENV" 2>/dev/null \
+  | xargs -0 -r sed -i "s|$VENV_STAGE|/opt/koth/venv|g"
+
+# ...and the same path is baked into every .pyc, which the text rewrite above cannot touch. Python
+# stores the compile-time source path in each code object (`co_filename`), so ~10k bytecode files
+# each carried the build directory. The HEADERS were already fine — pip emits hash-based pycs under
+# SOURCE_DATE_EPOCH — but the BODIES differed, and that alone changed the roothash (measured:
+# 1ff8ad2d vs 91f2eff1 after the text fix). Recompiling with `-d /opt/koth/venv` sets `co_filename`
+# to the path the code will actually live at: constant across builds, and correct in tracebacks.
+find "$IMG_VENV" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+"$VENV_STAGE/bin/python" -m compileall -q -f --invalidation-mode checked-hash \
+  -d /opt/koth/venv "$IMG_VENV" >/dev/null 2>&1 || true
+
+# Fail the build rather than ship a non-reproducible image: any surviving reference means the
+# rewrite missed a file, and the failure mode is silent (a valid-looking image with a wrong RTMR1).
+# Checked over TEXT AND BINARY — the bytecode leak above is exactly what a text-only check misses.
+if grep -rl "$VENV_STAGE" "$IMG_VENV" >/dev/null 2>&1; then
+  echo "FATAL: build path still embedded in the image venv -> RTMR1 would not be reproducible"
+  grep -rl "$VENV_STAGE" "$IMG_VENV" | head; exit 1
+fi
 
 # BAKE THE BENCHMARK DATA INTO THE IMAGE. Loading the suite from the Hub at boot made the run
 # network-dependent and non-deterministic (it failed on hardware), and left the questions OUTSIDE the

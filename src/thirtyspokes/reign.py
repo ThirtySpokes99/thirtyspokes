@@ -131,13 +131,20 @@ class Reign:
         self,
         candidates: list[Submission],
         deregistered: set[str] | None = None,
+        live: set[str] | None = None,
     ) -> EpochResult:
-        """Advance one epoch: re-rank all candidates, apply eps hysteresis, pay."""
+        """Advance one epoch: re-rank all candidates, apply eps hysteresis, pay.
+
+        `live` (the miners that produced a VALID proof this epoch) gates payout exactly as it does
+        in `KingChain` — a slot held by an absent miner burns rather than pays. `None` treats every
+        candidate as live, which is the offline-sim shape and leaves existing callers unchanged.
+        """
         ids = [c.miner_id for c in candidates]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate miner_id in candidates (one submission per miner)")
         self._epoch += 1
         dereg = deregistered or set()
+        live_ids = set(live) if live is not None else {c.miner_id for c in candidates}
         prev_champion = self.members[0].sub.miner_id if self.members else ""
 
         # register first-seen epoch per artifact; prune artifacts no longer offered
@@ -182,7 +189,8 @@ class Reign:
         burn = 0.0
         for i in range(self.n_slots):
             w = self.split[i]
-            if i < len(self.members) and self.members[i].sub.hotkey not in dereg:
+            if (i < len(self.members) and self.members[i].sub.hotkey not in dereg
+                    and self.members[i].sub.miner_id in live_ids):
                 mid = self.members[i].sub.miner_id
                 weights[mid] = weights.get(mid, 0.0) + w
                 slots.append(mid)
@@ -213,15 +221,32 @@ class KingChain:
     held the crown and are still registered (nobody registered -> burn). Drop-in for `Reign`: same
     `members` / `burn_uid` / `update` / `snapshot` / `restore` surface, so the validator is unchanged.
 
-    Why a chain rather than winner-take-all: a dethroned king keeps earning while it decays out of
-    the chain, which is the anti-hoarding pension tail — a miner beaten by 0.001 does not drop to
-    zero, so there is no cliff to camp against. Why equal-share rather than a graded split: the
-    reward for climbing is *entering the chain at all*, and the only door into it is taking the
-    crown, so the gradient lives at the coronation rather than in the slot weights.
+    Why a chain rather than winner-take-all: a dethroned king that KEEPS COMPETING goes on earning
+    while it decays out of the chain, which is the anti-hoarding pension tail — a miner beaten by
+    0.001 does not drop to zero, so there is no cliff to camp against. Why equal-share rather than a
+    graded split: the reward for climbing is *entering the chain at all*, and the only door into it
+    is taking the crown, so the gradient lives at the coronation rather than in the slot weights.
+
+    LIVENESS (the pension is earned per epoch, never vested). A seat pays only while its holder is
+    still submitting valid proofs. Without this the mechanism paid for *membership* rather than
+    *work*, and three exploits followed, all reproduced end-to-end against this class:
+      * a miner that took the crown once and then went dark drew its full share forever (measured:
+        one epoch of mining with the CHEAPEST pool model captured 54% of emissions over 12 epochs,
+        out-earning the honest miner that worked every epoch);
+      * because the king earns exactly what an idle ex-king earns, a cartel could rotate the crown
+        through 5 self-owned hotkeys and then stop entirely, capping an arbitrarily better honest
+        miner at 1/5 of the pot;
+      * withholding a single epoch used to hand the crown to ANY submitter, unguarded — a 21-epoch
+        champion lost its crown to a 0.01-scoring agent by missing one upload.
+    So: `live` (the miners that produced a valid proof THIS epoch) gates every payout; a seat missing
+    `absent_grace` consecutive epochs is evicted; and an absent king keeps its title (unpaid) and
+    goes on setting the eps bar until its grace runs out, so absence can never be a cheap handoff.
+    A king that loses the crown by going dark does NOT get a pension seat — it is delinquent by
+    construction.
 
     What carries over from `Reign` unchanged, because the adversarial review depends on it:
-      * eps hysteresis — an OUTSIDE challenger must beat the king's raw score by eps(artifact age),
-        so noise cannot flip the crown, and a re-commit re-enters unprotected with a fresh clock;
+      * eps hysteresis — an OUTSIDE challenger must beat the king's raw score by eps, so noise
+        cannot flip the crown;
       * earliest-commit seniority — exact ties go to the earlier commit block.
     Copy-mining is still killed upstream (`behavioral_duplicates` DQs a copy as `copy_of:<orig>`
     before it ever reaches here), so a copy cannot take the crown and cannot enter the chain.
@@ -234,16 +259,26 @@ class KingChain:
         eps_floor: float = 0.002,
         tau: float = 8.0,
         burn_uid: str = "uid0",
+        absent_grace: int = 3,
     ):
+        if absent_grace < 1:
+            raise ValueError("absent_grace must be >= 1")
         self.chain_size = chain_size
         self.eps0 = eps0
         self.eps_floor = eps_floor
         self.tau = tau
         self.burn_uid = burn_uid
+        # consecutive epochs a seat may miss before it is evicted / the crown vacates. >1 because a
+        # real miner's confidential-VM boot is flaky (~30% of cold boots failed on testnet 526), so a
+        # single missed upload must not cost a working miner its seat.
+        self.absent_grace = absent_grace
         self.king: Member | None = None
         self.chain: list[Submission] = []              # ex-kings, most recent first
         self._first_seen: dict[ArtifactKey, int] = {}
         self._epoch = 0
+        self._misses: dict[str, int] = {}              # miner_id -> consecutive epochs absent
+        self._king_since = 0                           # epoch the CURRENT king's miner took the crown
+        self._last_weights: dict[str, float] = {}      # last payout, for the standings feed
 
     # `members` exists so a KingChain duck-types as a Reign for the validator: members[0] is the king.
     @property
@@ -258,6 +293,17 @@ class KingChain:
     def _artifact_age(self, sub: Submission) -> int:
         return self._epoch - self._first_seen.get(sub.artifact, self._epoch)
 
+    def _king_age(self) -> int:
+        """Epochs the CURRENT miner has held the crown — the eps clock.
+
+        Keyed to the REIGN, not the artifact. Artifact-keyed age silently waived a king's earned
+        protection the moment it re-committed: a 15-epoch champion that improved its agent lost the
+        crown to a challenger it still out-scored, because the new artifact key made the incumbent
+        lookup miss. Punishing the exact behavior the subnet wants is backwards. Reign-keyed age
+        also can't be refreshed by re-committing every epoch, so it opens no squatting vector.
+        """
+        return max(0, self._epoch - self._king_since)
+
     def snapshot(self) -> dict:
         def enc(s: Submission) -> dict:
             return {"miner_id": s.miner_id, "hotkey": s.hotkey,
@@ -267,6 +313,11 @@ class KingChain:
             "king": ({**enc(self.king.sub), "age": self.king.age} if self.king else None),
             "chain": [enc(s) for s in self.chain],
             "first_seen": [[list(k), v] for k, v in self._first_seen.items()],
+            # liveness state must survive a restart, else every restart forgives every absence and
+            # the pension exploit reopens for `absent_grace` epochs at a time.
+            "misses": dict(self._misses),
+            "king_since": self._king_since,
+            "last_weights": dict(self._last_weights),
         }
 
     def restore(self, snap: dict) -> None:
@@ -278,53 +329,97 @@ class KingChain:
         self.chain = [Submission(e["miner_id"], e["hotkey"], int(e["commit_block"]),
                                  float(e["score"])) for e in snap.get("chain", [])]
         self._first_seen = {(str(k[0]), int(k[1])): int(v) for k, v in snap.get("first_seen", [])}
+        self._misses = {str(m): int(n) for m, n in snap.get("misses", {}).items()}
+        self._king_since = int(snap.get("king_since", self._epoch))
+        self._last_weights = {str(m): float(w) for m, w in snap.get("last_weights", {}).items()}
 
     def update(
         self,
         candidates: list[Submission],
         deregistered: set[str] | None = None,
+        live: set[str] | None = None,
     ) -> EpochResult:
+        """Advance one epoch. `live` = the miners that produced a VALID proof this epoch; only they
+        can be paid or crowned. It is passed explicitly rather than inferred from `candidates`
+        because under `scoring_mode="accumulate"` a miner that missed the epoch is still scored
+        (miss=0) and so still appears as a candidate — inferring liveness there would pay absentees.
+        `live=None` (offline sims, the graduated-`Reign` call shape) treats every candidate as live.
+        """
         ids = [c.miner_id for c in candidates]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate miner_id in candidates (one submission per miner)")
         self._epoch += 1
         dereg = deregistered or set()
         prev_king_id = self.king.sub.miner_id if self.king else ""
+        live_ids = set(live) if live is not None else {c.miner_id for c in candidates}
 
         offered = {c.artifact for c in candidates}
         for c in candidates:
             self._first_seen.setdefault(c.artifact, self._epoch)
         self._first_seen = {k: v for k, v in self._first_seen.items() if k in offered}
 
-        # --- coronation: the top challenger takes the crown only by clearing the king's eps ---
-        ranked = sorted(candidates, key=lambda s: (-s.score, s.commit_block, s.miner_id))
-        incumbent = next((c for c in candidates
-                          if self.king and c.artifact == self.king.sub.artifact), None)
-        if incumbent is None:
-            new_king_sub = ranked[0] if ranked else None      # crown is vacant: best candidate takes it
+        # --- liveness bookkeeping: a seat's miss counter resets only by actually submitting ---
+        seated = ([self.king.sub.miner_id] if self.king else []) + [s.miner_id for s in self.chain]
+        for mid in seated:
+            self._misses[mid] = 0 if mid in live_ids else self._misses.get(mid, 0) + 1
+        self._misses = {m: n for m, n in self._misses.items() if m in seated}   # bounded
+        # evict delinquent ex-kings BEFORE the coronation, so a freed slot is usable this epoch
+        self.chain = [s for s in self.chain if self._misses.get(s.miner_id, 0) < self.absent_grace]
+        king_absent = self.king is not None and self.king.sub.miner_id not in live_ids
+        king_delinquent = king_absent and self._misses.get(
+            self.king.sub.miner_id, 0) >= self.absent_grace
+
+        # --- coronation: only a LIVE miner can be crowned, and only by clearing the king's eps ---
+        ranked = sorted((c for c in candidates if c.miner_id in live_ids),
+                        key=lambda s: (-s.score, s.commit_block, s.miner_id))
+        top = ranked[0] if ranked else None
+        # the incumbent's OWN submission this epoch (matched by miner_id, not artifact — see
+        # `_king_age`: a re-commit must not forfeit the crown it already holds)
+        incumbent = next((c for c in ranked
+                          if self.king and c.miner_id == self.king.sub.miner_id), None)
+
+        def _clears(challenger: Submission, held: Submission) -> bool:
+            return (challenger.score > held.score + self.eps(self._king_age()) + 1e-12
+                    or (challenger.score == held.score
+                        and challenger.commit_block < held.commit_block))
+
+        if self.king is None:
+            new_king_sub = top                              # genuinely vacant: best live miner takes it
+        elif incumbent is not None:
+            new_king_sub = (top if top is not None and top.miner_id != incumbent.miner_id
+                            and _clears(top, incumbent) else incumbent)
+        elif not king_delinquent:
+            # ABSENT but inside grace: the king keeps the title (it is NOT paid below) and still sets
+            # the bar with its last score, so withholding an epoch cannot hand the crown to a worse
+            # agent. This is the fix for the one-epoch-handoff takeover.
+            new_king_sub = (top if top is not None and _clears(top, self.king.sub)
+                            else self.king.sub)
         else:
-            top = ranked[0]
-            margin = self.eps(self._artifact_age(incumbent))
-            beats = top.score > incumbent.score + margin + 1e-12
-            ties = top.score == incumbent.score and top.commit_block < incumbent.commit_block
-            new_king_sub = top if (top.artifact != incumbent.artifact and (beats or ties)) else incumbent
+            new_king_sub = top                              # grace exhausted: the crown truly vacates
 
         if new_king_sub is not None:
             if prev_king_id and new_king_sub.miner_id != prev_king_id and self.king is not None:
-                past = self.king.sub                          # dethroned -> front of the chain
-                self.chain = [s for s in self.chain if s.miner_id != past.miner_id]
-                self.chain.insert(0, past)
-                self.chain = self.chain[: self.chain_size - 1]
+                # a king dethroned WHILE COMPETING earns the pension seat; one that lost the crown by
+                # going dark does not — it is delinquent by construction.
+                if not king_delinquent:
+                    past = self.king.sub                      # dethroned -> front of the chain
+                    self.chain = [s for s in self.chain if s.miner_id != past.miner_id]
+                    self.chain.insert(0, past)
+                    self.chain = self.chain[: self.chain_size - 1]
+                self._king_since = self._epoch                # new reign -> fresh eps clock
             # the sitting king can never also be an ex-king entry
             self.chain = [s for s in self.chain if s.miner_id != new_king_sub.miner_id]
-            self.king = Member(new_king_sub, self._artifact_age(new_king_sub))
+            self.king = Member(new_king_sub, self._king_age())
+        elif king_delinquent:
+            self.king = None                                  # dead king, no live successor
 
-        # --- payout: EQUAL share across the king + registered ex-kings; nobody -> burn ---
+        # --- payout: EQUAL share across the king + ex-kings that are BOTH registered AND live ---
         paid: list[str] = []
-        if self.king and self.king.sub.hotkey not in dereg:
+        if (self.king and self.king.sub.hotkey not in dereg
+                and self.king.sub.miner_id in live_ids):
             paid.append(self.king.sub.miner_id)
         for s in self.chain:
-            if s.hotkey not in dereg and s.miner_id not in paid:
+            if s.hotkey not in dereg and s.miner_id in live_ids and s.miner_id not in paid:
                 paid.append(s.miner_id)
 
         weights: dict[str, float] = {}
@@ -336,6 +431,7 @@ class KingChain:
         else:
             burn = 1.0
             weights[self.burn_uid] = 1.0
+        self._last_weights = dict(weights)
 
         king_id = self.king.sub.miner_id if self.king else ""
         slots = ([king_id] if king_id else []) + [s.miner_id for s in self.chain]

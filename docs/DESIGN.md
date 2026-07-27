@@ -51,7 +51,7 @@ artifact produced a given score, without re-running it.
 
 ```
 BenchmarkResult:                      # one graded item
-  benchmark   str                     # "math" | "mmlu" | "gpqa" | "swe"
+  benchmark   str                     # live suite: "code" (ranked) | "math" | "mmlu" (floors)
   task_id     str                     # validator re-derives the gold from the nonce
   answer      str                     # graded validator-side against the PUBLIC gold
   cost_usd    float                   # metered by the runtime — un-forgeable
@@ -107,13 +107,65 @@ comparable), for each committed miner:
    DQ the rest.
 7. apply the **Pareto dethrone guard** (clamp on *any* failure, strictly below the king)
    against the persisted king baseline, feed the cost-aware scalar + commit-block
-   seniority to `KingChain` → `set_weights` (burn to uid 0 only if nobody in the chain is
-   still registered — a partially-filled or deregistered chain just repays its remaining
-   registered members a bigger equal share).
+   seniority + the epoch's **live** set to `KingChain` → `set_weights`. Only seats whose holder
+   submitted a valid proof this epoch are paid, split equally; if no seat is live the epoch burns
+   to uid 0 (§5a).
 
 ## 5. The scoring formula + parameters
 
-The reign scalar is **quality first, cost as the tiebreak**:
+### 5.0 The router scalar — what the number is supposed to mean
+
+The product goal is *"for a given ask, deliver the best answer at the lowest price."* Absolute
+accuracy cannot express that, for three reasons:
+
+1. it scores the **outcome, not the decision** — "always call the frontier model" and a router that
+   correctly predicts which asks the cheap model handles score almost identically;
+2. it is **absolute, not baseline-relative** — on a 95%-accurate pool every router scores ~95%, so
+   ~98% of the number measures the *pool* and ~2% measures the *miner*;
+3. it is a **point, not a frontier** — one owner-chosen λ bakes in one quality/price exchange rate,
+   but that tradeoff belongs to the user.
+
+So when the owner publishes a **pool reference** for the epoch (every `ask × model` cell — §5c), the
+scalar becomes frontier-relative **headroom**:
+
+```
+headroom = (Q_lcb − zero(cost)) / (oracle(cost) − zero(cost))
+```
+
+`zero(c)` is what a *featureless* policy reaches at price `c` by randomising over fixed pool models;
+`oracle(c)` is the budget-constrained per-ask upper bound. **0.0** means "no better than a coin flip
+over the pool at your price", **1.0** means "matched the per-ask oracle there", negative means worse
+than featureless. Matching quality at a fraction of the price scores *well*, which is the point.
+
+Three properties are load-bearing:
+
+- **The numerator keeps the Wilson bound.** It is the same `Q_lcb` the absolute scalar uses, so
+  frontier-relativity is not bought by giving up small-sample protection: a lucky 8/8 slice still
+  reads 0.747, not 1.0. The denominator is measured by the *owner*, so it is a known constant and
+  dividing by it preserves the bound.
+- **Numerator and denominator pool separately across epochs**, weighted by slice size and decayed on
+  the same EWMA as the counts (`koth/evidence.py`). A near-saturated epoch then contributes little to
+  *both* sums rather than one wild ratio — which a mean-of-per-epoch-ratios would not.
+- **Rows are weighted like the score.** The miner's number is `Σ_b w_b·acc_b`, so the reference rows
+  carry `w_b / n_b`. Otherwise a weight-0 eligibility benchmark (MMLU) would build half the baseline
+  a math router is judged against.
+
+**The degeneracy gate.** Headroom divides by `oracle − zero` — the quality routing could *possibly*
+add on this traffic. Measured on this project's own data that gap is **~0.019 on the live math
+suite** and **~0.083 on LiveCodeBench**. Below `min_headroom_gap` (default **0.05**) the denominator
+is smaller than the sampling noise in the numerator, so the validator **refuses to score
+frontier-relatively**, falls back to the absolute scalar, and publishes `routable: false` in the
+feed. A saturated benchmark announces itself instead of being amplified into a leaderboard. This is
+why `koth/lcb.py` exists — see its module docstring for what adopting it costs.
+
+No cost tiebreak is subtracted from headroom: both baselines are already evaluated at the miner's own
+price, so matching quality more cheaply raises headroom by construction, and charging for cost again
+would price the same decision twice.
+
+### 5.1 The absolute scalar (no reference published)
+
+Without a reference — or on traffic the gate rejects — the reign scalar is **quality first, cost as
+the tiebreak**:
 
 ```
 S = Q_lcb − λ · min(1, cost / B)        Q_lcb = Σ_b w_b · lcb_b,   λ = cost_tiebreak (0.02)
@@ -147,28 +199,68 @@ trading a regression — `reign.py` is untouched; the guard lives in the validat
 
 | Param | Default | Source |
 |---|---|---|
-| benchmark weights `w_b` (math/mmlu/gpqa/swe) | 0.30 / 0.22 / 0.23 / 0.25 | owner |
+| benchmark weights `w_b`, live suite (code/math/mmlu) | **1.0 / 0.0 / 0.0** — see §5e | owner |
 | `margin` (confident dominance) | 0.03 | Affine 0.03 |
 | `tol` (not-worse band) | 0.02 | Affine not-worse 0.02 |
 | `min_tasks` (per-benchmark sample gate) | 5 | Affine thin-eval guard |
 | `cost_tol` | 0.10 | this design |
 | `cost_margin` (cheaper-at-parity dethrone) | 0.10 | this design — the anti-ossification axis |
 | `cost_tiebreak` λ (cost term in the reign scalar) | 0.02 | small enough to never outrank a real accuracy gain |
-| `lcb` bootstrap α / resamples | 0.05 / 1000 | Teutonic bootstrap-LCB (α 0.001, B 10000 in prod) |
-| king-chain size / eps schedule | 5 slots (king + 4 ex-kings), equal share 20% each when full · eps0 0.02 → floor 0.002, τ 8 | `reign.py` `KingChain` (SN9→IOTA anti-hoarding pension tail) |
+| `lcb` α (one-sided **Wilson**, not a resampling bootstrap) | 0.05 | `evidence.wilson_lcb`; see the small-sample note below |
+| `scoring_mode` | **`accumulate`** (default) · `per_epoch` (sim only) | §5b |
+| `min_headroom_gap` (degeneracy gate) | 0.05 | §5.0 — measured: math ~0.019, LCB ~0.083 |
+| reference coverage floor (`MIN_REF_COVERAGE`) | 0.5 of pooled evidence | `koth/evidence.py` |
+| king-chain size / eps schedule | 5 slots (king + 4 ex-kings), equal share 20% each when all five are paid · eps0 0.02 → floor 0.002, τ 8 | `reign.py` `KingChain` (SN9→IOTA anti-hoarding pension tail) |
+| `absent_grace` (consecutive missed epochs before a seat is evicted) | 3 | tolerates the ~30% flaky-CVM-boot rate measured on testnet 526 |
 | memorization test `z_crit` | 2.33 (one-sided ~99%, two-proportion) | `memorization_collapsed_relative` |
 | `min_cohort` (miners needed to calibrate probe difficulty) | 3 | this design |
 | `max_probe_drop` (owner: "no honest probe is harder than this") | 0.25 | this design |
 | copy-dedup agreement | 0.95 answer-vector agreement | `behavioral_duplicates` |
 
-## 5b. Scoring over time — evidence accumulation + anti-grind (opt-in)
+### 5a. Emissions pay for work, not for a seat (liveness)
+
+**A seat pays only while its holder is still submitting valid proofs.** `KingChain` receives the set
+of miners that produced a valid proof this epoch (`live`) and pays only those; a seat missing
+`absent_grace` consecutive epochs is evicted; an absent king keeps its title (**unpaid**) and goes on
+setting the eps bar until its grace runs out; a king that loses the crown by going dark gets **no**
+pension seat. An epoch with no live miner **burns to uid 0** rather than leaving the previous weights
+standing on-chain.
+
+This closes an emission-capture class found by auditing the mining side, where payout consulted only
+seat *membership* + registration and never *work*. Measured against the pre-fix mechanism:
+
+- a miner that took the vacant crown with the **cheapest** pool model, then went permanently dark,
+  captured **54% of emissions over 12 epochs** — out-earning the honest miner that worked every one
+  of them (it now earns 8% for 1 of 12 epochs, i.e. exactly its share of the work);
+- because the king earned exactly what an idle ex-king earned, a cartel could rotate the crown
+  through 5 self-owned hotkeys and then stop entirely, holding **100%** of emissions and capping an
+  arbitrarily better honest miner at 1/5 of the pot;
+- withholding a **single** epoch handed the crown to any submitter, unguarded (`incumbent is None`
+  ⇒ `ranked[0]` wins): a 21-epoch champion lost to a 0.01-scoring agent by missing one upload;
+- a network where every miner stopped submitting kept paying its last slate in full, forever,
+  because `set_weights` was skipped when there was nothing to score.
+
+Note the interaction with §5b: under `accumulate` a miner that missed the epoch is still *scored*
+(miss=0) and therefore still a *candidate*, so liveness is passed explicitly rather than inferred
+from the candidate list — inferring it there would re-open the pension.
+
+> **Small-sample honesty.** The reign scalar's LCB is a one-sided **Wilson** bound, not a resampling
+> bootstrap. The bootstrap is degenerate on the all-same slices that matter most: resampling 8
+> identical values yields 8 identical means, so a perfect 8/8 slice reported `lcb = 1.000` — zero
+> claimed uncertainty from eight questions. That cleared `dethrone_guard` against any king below
+> 0.97, making "resubmit every epoch until a slice comes up perfect" a free lottery ticket for the
+> crown. Wilson prices the sample correctly (8/8 → 0.747, 32/32 → 0.922), is deterministic (two
+> validators no longer depend on drawing the same resamples), and is already what §5b pools on — so
+> the two modes now agree.
+
+## 5b. Scoring over time — evidence accumulation + anti-grind
 
 A single epoch samples only ~32 tasks (8 per benchmark), which is noisy: per-epoch scoring lets a
 lucky slice dethrone and makes two decoupled validators — drawing independent slices — disagree.
-Three refinements (all landed, off by default, enabled per validator) make the ranking stable and
-consensus-friendly; the simulation that motivated them is `scripts/scoring_v2_sim.py`.
+**Evidence accumulation is therefore the default**; the two anti-grind windows below remain opt-in
+per validator. The simulation that motivated them is `scripts/scoring_v2_sim.py`.
 
-- **Evidence accumulation** (`scoring_mode="accumulate"`, `koth/evidence.py`). Each epoch's *verified*
+- **Evidence accumulation** (`scoring_mode="accumulate"`, **the default**, `koth/evidence.py`). Each epoch's *verified*
   per-benchmark result for a **fixed artifact** is pooled into one decayed binomial, keyed by
   `(hotkey, source_hash, weights_hash, suite_version)`; the reign scalar is the **Wilson lower bound**
   on the pooled counts. An EWMA (`half_life_epochs`, default 200) gives liveness — stop submitting and
@@ -206,6 +298,87 @@ consensus-friendly; the simulation that motivated them is `scripts/scoring_v2_si
   holds only the scored epoch's commit) and `G` above the store's upload latency.
 
 Enable `commit_window` + `grace_blocks` together once `W` and `G` have been measured for the live suite.
+
+## 5c. The pool reference — who measures the frontier, and how it is trusted
+
+A validator runs **no inference**, so it cannot know what the *other* pool models would have answered
+on this epoch's asks. The **owner** measures that once per epoch and publishes it
+(`orchestra-koth-reference`): every `(ask, model)` score and cost for the slice, re-derived with the
+same `bench_seed(nonce, epoch, name)` the miners' runtimes used. Cost to the owner is
+`n_per_bench × |pool|` calls — 8 × 6 = 48, well under a dollar. Rows with any failed cell are
+dropped: a partial row makes the pool look both cheaper and weaker than it is.
+
+**It is signed, not hash-committed on-chain.** The chain gives each hotkey exactly one commitment
+slot (`CommitmentOf[(netuid, hotkey)]`) and `set_commitment` overwrites it — the same hard constraint
+§5b documents for miners. The owner's slot already carries the approved-measurement record, so
+writing a reference digest there each epoch would **erase the subnet's governance**: every validator
+would read `mrtd_gate_unset` and refuse to score at all. So the record is signed with the owner
+hotkey and served from the owner's bucket at a path both sides derive from `(epoch, nonce)`.
+Integrity is still rooted on-chain — validators resolve the owner from `SubnetOwnerHotkey` and reject
+anything that key did not sign — and it costs no per-epoch extrinsic.
+
+A signature only proves *who wrote it*, not *what it is about*. A reference replayed from an easier
+epoch lowers the zero frontier and flatters everyone; a harder one damns everyone. So `matches()`
+checks `epoch`, `nonce`, `suite_version` and `n_per_bench`, and the nonce is chain-derived and
+unpredictable, so a flattering slice cannot be pre-selected either.
+
+**Every failure degrades, none stalls.** No reference, an unreachable bucket, a bad signature, a
+mismatched slice, or too little coverage of the pooled evidence all fall back to the absolute
+scalar. A reference outage is an owner problem and must never cost a miner its epoch.
+
+## 5d. What is measured but deliberately never rewarded
+
+The trace records every pool call and is hash-attested (`call_log_hash`); latency and token counts
+are inside `report_data` and therefore inside the quote, as un-forgeable as cost. From these the
+validator reports, per miner: `calls_per_ask`, `escalations`,
+`escalations_that_changed_the_answer`, `escalation_yield`, `superseded_calls`, `latency_s`,
+`tokens_out`, and per-ask **regret** (`quality_regret`, `cost_regret_usd`, `asks_nobody_solves`).
+
+**None of these is a reward term, on purpose.** Each becomes trivially gameable the moment it pays —
+a miner would escalate constantly to farm `escalations` — which is the same trap RouterEval's
+selection-entropy metric falls into, where a random router scores best. Regret additionally shares
+the reference with the headroom scalar, so paying for both would price one decision twice.
+
+But "not scored" is not a reason to discard them. They are published in `standings.json` under
+`diagnostics`, alongside `pool_reference.routable` — the first thing to read, because it says whether
+this epoch's traffic had enough achievable headroom for the scalar to mean anything at all.
+
+## 5e. The scored suite — why the ranking weight sits on code
+
+`SUITE_VERSION = koth-suite-4`. **LiveCodeBench carries the whole ranking weight**; MMLU and GSM8K
+are weight-0 eligibility floors (`eligible` gates on every benchmark's accuracy regardless of
+weight, so they still catch a broken agent — and both grade without a container, so they are free).
+
+The reason is §5.0's denominator. Ranking on a benchmark whose achievable gap is below
+`min_headroom_gap` means the router scalar divides by less than the sampling noise in an 8-question
+slice:
+
+| traffic | achievable gap | verdict |
+|---|---|---|
+| GSM8K / MATH-500 L5 | **+0.019** | saturated at the ceiling — every model 79-97%; best router beat the featureless baseline by +0.002 |
+| SWE-bench Pro, one-shot | — | degenerate at the floor: **0/120** solved (gold patches score 1.0, so the harness is sound — the *format* is wrong) |
+| LiveCodeBench | **+0.083** | the only non-degenerate regime found: scores span 0.47-0.78, 13.9% unsolvable by anyone, first non-zero sole-correct rate |
+
+**This makes the competition measurable; it does not promise anyone can win it.** On that same run
+the learned router still lost to the featureless baseline (−0.019 vs Zero), and on the clean
+easy+medium tiers the gap falls to +0.042 with the router tying Zero exactly. The degeneracy gate is
+what keeps that honest: the subnet now measures and publishes the achievable gap every epoch rather
+than assuming one.
+
+Two operational consequences:
+
+- **Validators and the owner need Docker.** Grading a code answer means *executing* untrusted model
+  output, so each submission runs in a throwaway `--network none`, memory-capped container. Miners
+  do not need it — they only generate answers. Grading stays deterministic across validators (same
+  program, same cases, same verdict), with one residual: a solution sitting right at the per-case
+  timeout can grade differently on differently-loaded machines. Typical solutions finish in well
+  under a second against a 10s cap, and the accumulator's Wilson bound absorbs the occasional
+  single-task disagreement.
+- **The public pool is smaller** — 112 problems (56 scored / 56 held-out) against math's 1000. The
+  epoch nonce still picks an unpredictable, difficulty-stratified 8, and `grounding_check` is
+  unaffected (a stored program that never touches the pool is still DQ'd as ungrounded). But
+  `scan_weights` is **inert** here: it needs digit-shaped golds to build same-shape decoys, and a
+  code gold is a list of test cases. See §6.
 
 ## 6. Static public benchmarks are safe — binding + optimistic audit
 

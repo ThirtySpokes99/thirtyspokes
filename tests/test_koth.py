@@ -58,7 +58,9 @@ def _verify(env, proof, artifact, hotkey, **over):
 def test_valid_proof_verifies_and_scores(env):
     a = _art(_ROUTER_SRC, env.allk)
     v = _verify(env, _proof(env, a, "hk"), a, "hk")
-    assert v.valid and v.score > 0.9
+    # A perfect slice must NOT certify Q_lcb = 1.0: eight questions cannot rule out a worse true
+    # accuracy, and claiming they can is what made a lucky slice able to dethrone anyone.
+    assert v.valid and 0.7 < v.score < 1.0
     assert all(bs.acc == 1.0 for bs in v.per_bench.values())
 
 
@@ -206,6 +208,93 @@ def test_proof_json_roundtrip_preserves_binding(env):
     assert _verify(env, back, a, "hk").valid                 # downloaded proof still verifies
 
 
+def test_freeloader_that_stops_mining_earns_nothing_end_to_end(env):
+    """END-TO-END emission-capture regression, through the real validator (verify_proof -> grounding
+    -> dedup -> eligibility -> KingChain -> set_weights).
+
+    Measured before the fix: a miner running the CHEAPEST pool model took the vacant crown in one
+    epoch, went permanently dark, and still captured 54% of emissions over 12 epochs — out-earning
+    the honest miner that worked every single epoch. The validator recorded `no_proof` for it every
+    epoch and paid it anyway, because payout read seat membership rather than work.
+    """
+    import json
+    import tempfile
+
+    from thirtyspokes.gateway.signing import Signer
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS, current_epoch
+    from thirtyspokes.koth.miner import KOTHMinerNeuron
+    from thirtyspokes.koth.neuron import store_get_proof
+    from thirtyspokes.koth.pool import MockPool
+    from thirtyspokes.koth.runtime import runtime_measurement
+    from thirtyspokes.koth.store import LocalBundleStore
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    from thirtyspokes.subnet.chain import LocalFileChain
+
+    root = tempfile.mkdtemp()
+    chain = LocalFileChain(f"{root}/chain"); store = LocalBundleStore(f"{root}/store")
+    chain.register("burn")
+    relay = ("import json\ndef build_agent(w):\n m=json.loads(w.decode())['model']\n"
+             " def agent(p,cm):\n  return cm(m,[{'role':'user','content':p}],{'max_tokens':16})\n return agent\n")
+    art = lambda m: Artifact(relay, json.dumps({"model": m}).encode(), m)  # noqa: E731
+    val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain, KingChain(),
+                        env.suite, store, MockPool(), n_per_bench=8, budget_per_task=1.0, f_min=0.0)
+    mk = lambda m, r: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
+                                      chain, store, art(m), r)
+    freeloader, honest = mk("cheap", "f/repo"), mk("strong", "h/repo")
+    for m in (freeloader, honest):
+        m.publish()
+    gp = store_get_proof(store)
+
+    earned = {freeloader.hotkey: 0.0, honest.hotkey: 0.0}
+    for i in range(12):
+        chain.advance(EPOCH_BLOCKS)
+        e = current_epoch(chain)
+        for m in ([freeloader] if i == 0 else [honest]):     # freeloader mines ONCE, then goes dark
+            m.run_once(e)
+        rep = val.run_epoch(gp)
+        uid_hk = chain.hotkeys()
+        for uid, w in rep.weights_by_uid.items():
+            hk = uid_hk.get(uid, "")
+            if hk in earned:
+                earned[hk] += w
+
+    assert earned[freeloader.hotkey] <= 1.0, "one mined epoch must not pay out for eleven idle ones"
+    assert earned[honest.hotkey] > earned[freeloader.hotkey] * 5, \
+        "the miner doing the work must dominate the one that quit"
+    assert val.reign.king.sub.hotkey == honest.hotkey
+
+
+def test_epoch_with_no_submissions_burns_instead_of_freezing_weights(env):
+    """If nobody submits, the validator must still settle the epoch and BURN.
+
+    It used to skip `set_weights` entirely when there was nothing to score, leaving the previous
+    slate standing on-chain — so a network where every miner stopped kept paying its last five
+    miners in full, forever, for producing nothing."""
+    import tempfile
+
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    from thirtyspokes.koth.neuron import store_get_proof
+    from thirtyspokes.koth.pool import MockPool
+    from thirtyspokes.koth.runtime import runtime_measurement
+    from thirtyspokes.koth.store import LocalBundleStore
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    from thirtyspokes.subnet.chain import LocalFileChain
+
+    root = tempfile.mkdtemp()
+    chain = LocalFileChain(f"{root}/chain"); store = LocalBundleStore(f"{root}/store")
+    chain.register("burn")
+    val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain, KingChain(),
+                        env.suite, store, MockPool(), n_per_bench=8)
+    chain.advance(EPOCH_BLOCKS)
+    rep = val.run_epoch(store_get_proof(store))              # no miners committed at all
+    assert rep.weights_by_uid == {0: 1.0}, "an empty epoch must burn to uid 0"
+    # it must actually reach the chain — the bug was that set_weights was skipped entirely
+    assert val._last_submitted_weights == {0: 1.0}
+    assert chain._load()["weights"] == {"0": 1.0}
+
+
 def test_decoupled_neuron_flow_scores_via_store():
     """Miner uploads proof to its repo; validator downloads from the chain+store and
     scores it — the two never call each other."""
@@ -296,7 +385,49 @@ def test_copy_dedup_on_scored_answers():
     assert losers == {"copy": "orig"}                    # earliest commit kept; identical vector DQ'd
 
 
-# --- docs/DESIGN.md §5b: evidence accumulation (opt-in scoring_mode="accumulate") ------------------------
+# --- small-sample honesty: the LCB must actually price 8-question uncertainty --------------------
+def test_lcb_never_certifies_a_perfect_small_slice():
+    """A perfect slice must not report lcb = 1.0.
+
+    The resampling bootstrap was degenerate on all-same slices — resampling 8 identical values gives
+    8 identical means, so 8/8 returned lcb = 1.000, i.e. *zero* claimed uncertainty from eight
+    questions. That cleared `dethrone_guard`'s `lcb_c > acc_king + margin` against any king below
+    0.97, making "resubmit until a slice comes up perfect" a free lottery ticket for the crown.
+    """
+    from thirtyspokes.koth.verify import _bootstrap_lcb
+    perfect8 = _bootstrap_lcb([1.0] * 8, 0.05, 1000, 7)
+    assert 0.7 < perfect8 < 0.8, "8/8 must be bounded well below 1.0"
+    # more evidence at the same accuracy must bind tighter — that is the whole incentive to keep mining
+    assert _bootstrap_lcb([1.0] * 32, 0.05, 1000, 7) > perfect8
+    # monotone in accuracy, and an empty/zero slice floors at 0
+    seq = [_bootstrap_lcb([1.0] * k + [0.0] * (8 - k), 0.05, 1000, 7) for k in range(9)]
+    assert seq == sorted(seq) and seq[0] == 0.0
+    # deterministic: two validators must agree without drawing the same resamples
+    assert _bootstrap_lcb([1.0] * 5 + [0.0] * 3, 0.05, 1000, 1) == \
+           _bootstrap_lcb([1.0] * 5 + [0.0] * 3, 0.05, 1000, 999)
+
+
+def test_lucky_perfect_slice_cannot_dethrone_a_better_king():
+    """End of the variance-grinding lottery: a genuinely worse agent that draws a perfect 8-question
+    slice must NOT clear the guard against a king with higher true accuracy."""
+    from thirtyspokes.koth.verify import BenchStat, ProofVerdict, _bootstrap_lcb, dethrone_guard
+    lucky_lcb = _bootstrap_lcb([1.0] * 8, 0.05, 1000, 7)            # the REAL bound, not a stub
+    lucky = ProofVerdict(True, "ok", {"math": BenchStat(8, 1.0, lucky_lcb, 0.01)}, 0.01, lucky_lcb, 1.0)
+    king = ProofVerdict(True, "ok", {"math": BenchStat(8, 0.95, 0.80, 0.01)}, 0.01, 0.95, 0.95)
+    ok, why = dethrone_guard(lucky, king)
+    assert not ok and why == "no_confident_gain"
+
+
+def test_scoring_mode_defaults_to_accumulate(env):
+    """Per-epoch scoring makes the crown a per-epoch lottery and charges nothing for a hidden epoch.
+    Accumulation is the default so ranking is stable and decoupled validators agree."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    val = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None)
+    assert val.scoring_mode == "accumulate"
+
+
+# --- docs/DESIGN.md §5b: evidence accumulation (scoring_mode="accumulate", the DEFAULT) -----------
 def test_accumulate_mode_crowns_and_pools(env):
     """Accumulate mode pools per-artifact evidence over epochs, crowns the stronger miner, and the
     accumulator holds MORE than one epoch's tasks (the whole point — 32 q/epoch ranks stably)."""
@@ -385,7 +516,7 @@ def test_commit_window_binds_proof_to_one_run(env):
     W = 5
     val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain,
                         Reign(eps0=0.0, eps_floor=0.0), env.suite, store, MockPool(), n_per_bench=8,
-                        budget=999.0, f_min=0.0, commit_window=W)
+                        budget=999.0, f_min=0.0, commit_window=W, scoring_mode="per_epoch")
     mk = lambda repo, cp: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
                                           chain, store, art(), repo, commit_proofs=cp)
     honest, nocommit, swap, late = mk("h/r", True), mk("n/r", False), mk("s/r", False), mk("l/r", True)
@@ -484,7 +615,7 @@ def test_fresh_suite_disjoint_and_solvable(env):
         assert s and p and not (s & p)                              # disjoint
     r = evaluate(reference_artifact("strong"), pool_backend=MockPool(), suite=suite,
                  n_per_bench=8, nonce="f1")
-    assert r["valid"] and r["Q_lcb"] > 0.8                          # solver still grades fresh tasks
+    assert r["valid"] and r["Q_lcb"] > 0.7          # solver still grades fresh tasks (8/8 -> LCB .747)
 
 
 def test_devkit_matches_validator(env):
@@ -625,7 +756,7 @@ def test_confine_meters_parent_side():
     authoritative trace + per-task cost. Works with or without netns (portable path)."""
     from thirtyspokes.koth.confine import run_agent_confined
     from thirtyspokes.koth.pool import MockPool
-    results, trace = run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool())
+    results, trace, _hardened = run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool())
     assert results[0]["answer"] == "4"
     assert len(trace) == 1 and trace[0]["cost_usd"] > 0
     assert results[0]["cost_usd"] == trace[0]["cost_usd"]     # cost attributed from the trace
@@ -644,7 +775,7 @@ def test_confine_blocks_network_egress():
            "        except Exception as e:\n"
            "            return 'BLOCKED:'+type(e).__name__\n"
            "    return agent\n")
-    results, _ = run_agent_confined(src, b"{}", _TASK, backend=MockPool())
+    results, _tr, _hardened = run_agent_confined(src, b"{}", _TASK, backend=MockPool())
     assert results[0]["answer"].startswith("BLOCKED")
 
 
@@ -671,7 +802,7 @@ def test_confined_run_retries_a_transient_spawn_crash(monkeypatch):
     from thirtyspokes.koth.pool import MockPool, PinnedBackend
 
     calls = {"n": 0}
-    real_rows = ([{"benchmark": "b", "task_id": "t1", "answer": "ok", "cost_usd": 0.0}], [])
+    real_rows = ([{"benchmark": "b", "task_id": "t1", "answer": "ok", "cost_usd": 0.0}], [], True)
 
     def flaky(*a, **kw):
         calls["n"] += 1
@@ -683,8 +814,8 @@ def test_confined_run_retries_a_transient_spawn_crash(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda s: None)     # no real backoff delay in tests
 
     rt = KOTHRuntime(PinnedBackend(MockPool(), MockPool().allowed), Platform(), confine=True)
-    results, trace = rt._run_confined(reference_artifact("strong"), _TASK)
-    assert calls["n"] == 3 and results[0].answer == "ok"
+    results, trace, hardened = rt._run_confined(reference_artifact("strong"), _TASK)
+    assert calls["n"] == 3 and results[0].answer == "ok" and hardened is True
 
 
 def test_confined_run_gives_up_after_repeated_crashes(monkeypatch):
@@ -732,7 +863,9 @@ def test_simulation_every_defense_fires():
     assert dq.get("fake-quote") == "bad_platform_quote"
     assert dq.get("replayer") == "epoch_nonce_mismatch"
     assert dq.get("hardcoder") == "hardcoded_answers"
-    assert dq.get("memorizer") == "memorization"
+    # the memorizer keeps its answer table in weights.bin. `scan_weights` now catches it BEFORE the
+    # probe audit runs — a cheaper, earlier catch — so accept either memorization defense firing.
+    assert dq.get("memorizer") in {"answers_in_weights", "memorization", "ungrounded", "laundered"}
     assert dq.get("substituter") == "artifact_binding_mismatch"     # binding enforced
     assert dq.get("copier", "").startswith("copy_of:")              # behavioral dedup
     em = out["emissions"]
@@ -1891,3 +2024,873 @@ def test_governance_record_is_content_addressed_and_tamper_evident():
     # and the digest is stable regardless of key order / whitespace
     assert governance.digest({"pool_allow_list": ["openai/gpt-4o"], "rtmr": {"1": "6d" * 48},
                               "version": 1}) == d
+
+
+# --- CRITICAL-1: the enclave's pool connection must not be steerable by the miner ----------------
+# The measured runtime takes its pool credential from a blob the MINER supplies (GCE metadata
+# `koth-secrets`). It used to be splatted wholesale into os.environ, and the HTTP client reads its
+# TLS trust store and proxy routing FROM the environment. Two extra metadata lines therefore let a
+# miner MITM its own pool: fabricate answers (inject memorised gold), fabricate `usage.cost` and
+# token counts (cost is read out of the response body), spend nothing — and still emit a fully
+# valid attested proof, because the enclave faithfully reports what it was told.
+
+def test_secrets_blob_is_allowlisted():
+    """Only the pool credential may cross from the miner-supplied blob into the environment."""
+    import tempfile
+
+    from thirtyspokes.eval import config
+    blob = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+    blob.write(
+        "OPENROUTER_API_KEY=sk-or-real\n"
+        "SSL_CERT_FILE=/run/koth/agent/weights.bin\n"      # CA smuggled in as 'weights'
+        "HTTPS_PROXY=http://127.0.0.1:8080\n"
+        "export REQUESTS_CA_BUNDLE=/tmp/evil.pem\n"
+        "OPENAI_BASE_URL=http://127.0.0.1:9/v1\n"
+        "# a comment\n")
+    blob.close()
+    env: dict = {}
+    accepted, rejected = config.load_secrets_env(blob.name, env=env)
+    assert accepted == ["OPENROUTER_API_KEY"]
+    assert env == {"OPENROUTER_API_KEY": "sk-or-real"}, "nothing else may reach the environment"
+    assert set(rejected) == {"SSL_CERT_FILE", "HTTPS_PROXY", "REQUESTS_CA_BUNDLE", "OPENAI_BASE_URL"}
+
+
+def test_scrub_network_env_clears_every_tls_and_proxy_override():
+    from thirtyspokes.eval import config
+    env = {k: "x" for k in config.UNSAFE_NET_ENV} | {"OPENROUTER_API_KEY": "keep", "PATH": "keep"}
+    dropped = config.scrub_network_env(env)
+    assert set(dropped) == set(config.UNSAFE_NET_ENV)
+    assert env == {"OPENROUTER_API_KEY": "keep", "PATH": "keep"}
+
+
+def test_pool_client_ignores_env_tls_and_proxy_overrides(monkeypatch, tmp_path):
+    """The backstop: even with the attack env set, the client must keep the real trust anchor.
+
+    This is the PoC that proved the hole, inverted into a regression test — it fails loudly if
+    anyone reconstructs the client without `trust_env=False`.
+    """
+    import certifi
+    from thirtyspokes.gateway.gateway import OpenRouterBackend
+
+    evil_ca = tmp_path / "evil_ca.pem"          # a CA the miner controls
+    evil_ca.write_text(open(certifi.where()).read().split("-----END CERTIFICATE-----")[0]
+                       + "-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("SSL_CERT_FILE", str(evil_ca))
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:8080")
+
+    be = OpenRouterBackend("sk-test")
+    client = be._client._client
+    assert client.trust_env is False, "env-derived TLS/proxy must be off"
+    assert not [m for m in client._mounts.values() if m is not None], "no proxy may be mounted"
+    n_roots = len(client._transport._pool._ssl_context.get_ca_certs())
+    assert n_roots > 20, f"trust store was replaced by the miner's CA (only {n_roots} roots)"
+
+
+# --- CRITICAL-3: the no-egress guarantee must fail CLOSED and be ATTESTED -----------------------
+# `run_agent_confined` silently degraded to a plain subprocess when the namespace probe failed
+# (which it did on ANY exception, including its own probe timeout, then lru_cached that for the
+# boot). An unconfined agent has network egress: it can call an off-allow-list model with a key
+# embedded in its own weights.bin, voiding PinnedBackend + the MeteringProxy + the budget ceiling,
+# while one token call through call_model satisfies `no_pool_call`. Nothing recorded the downgrade,
+# so a fully-enforcing validator could not tell the two runs apart.
+
+def test_confinement_probe_does_not_cache_a_timeout(monkeypatch):
+    """A slow probe is inconclusive, not a 'no'. Caching it disabled confinement for the whole
+    boot — a load-sensitive trigger on a machine whose size the miner chooses."""
+    import subprocess as sp
+
+    from thirtyspokes.koth import confine
+    monkeypatch.setattr(confine, "_probe_cache", None)
+    monkeypatch.setattr(confine.shutil, "which", lambda _: "/usr/bin/unshare")
+    monkeypatch.setattr(confine.sys, "platform", "linux")
+    calls = {"n": 0}
+
+    def always_timeout(*a, **kw):
+        calls["n"] += 1
+        raise sp.TimeoutExpired(cmd="unshare", timeout=30)
+
+    monkeypatch.setattr(confine.subprocess, "run", always_timeout)
+    assert confine.confinement_available() is False
+    assert calls["n"] == 3, "a timeout must be retried, not taken as a verdict"
+    assert confine._probe_cache is None, "an inconclusive probe must NOT be cached"
+
+
+def test_require_confinement_refuses_to_run_unconfined():
+    """Production fails closed instead of silently handing the agent a network."""
+    from thirtyspokes.koth.confine import SandboxError, run_agent_confined
+    from thirtyspokes.koth.pool import MockPool
+    with pytest.raises(SandboxError, match="refusing to run the agent unconfined"):
+        run_agent_confined(_CALLS_POOL, b"{}", _TASK, backend=MockPool(),
+                           hardened=False, require=True)
+
+
+def test_proof_attests_the_confinement_mode(env):
+    """The proof records what ACTUALLY happened, and the quote covers it."""
+    import dataclasses
+
+    from thirtyspokes.koth.proof import Proof
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")                     # in-process runtime -> not confined
+    assert p.confined is False
+    assert "confined" in p._payload(), "must be inside report_data, i.e. covered by the quote"
+    # flipping the flag breaks the binding — a miner cannot claim confinement it did not have
+    forged = dataclasses.replace(p, confined=True)
+    assert forged.report_data() != p.quote.report_data
+    assert Proof.from_json(p.to_json()).confined is False
+
+
+def test_absent_confined_field_reads_as_false():
+    """An older proof that never asserted confinement must not be read as having had it."""
+    import json
+
+    from thirtyspokes.koth.proof import Proof
+    p = Proof(epoch=1, nonce="n", hotkey="hk", source_hash="sh", weights_hash="wh",
+              model_id="m", results=(), total_cost_usd=0.0, n_calls=0,
+              call_log_hash="x", measurement="m", confined=True)
+    d = json.loads(p.to_json()); d.pop("confined")
+    assert Proof.from_json(json.dumps(d)).confined is False
+
+
+def test_enforcing_validator_rejects_an_unconfined_proof(env):
+    """The gate that makes this enforceable regardless of how the miner configured its runtime:
+    the measured-image gates prove WHICH image booted, not what it did inside."""
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert p.confined is False
+    v = _verify(env, p, a, "hk", enforce=True, approved_mrtd={"m"},
+                approved_rtmr={1: "a", 2: "b", 3: "c"}, tcb_accept=frozenset({"UpToDate"}))
+    assert not v.valid and v.reason in {"unconfined_agent", "mock_quote_rejected"}
+
+
+# --- CRITICAL-2: memorization of the PUBLIC benchmark ------------------------------------------
+# The scored pool is 500 public items/benchmark with public gold. The beacon makes the SLICE
+# unpredictable but not the POOL, so a miner memorises all 500 -- a few hundred KB in weights.bin,
+# which `scan_source` never looked at. Plain grounding ("answer appears in some response") was
+# defeated by laundering: put the memorised answer in your own prompt and the model echoes it.
+
+def _tr(*pairs):
+    return [{"task_id": "t", "prompt": p, "response": r} for p, r in pairs]
+
+
+def test_first_appearance_grounding_catches_laundering():
+    """The provenance question: did the answer surface on the RESPONSE side before it ever
+    surfaced on the PROMPT side? Information the agent already had shows up in a prompt first."""
+    from thirtyspokes.koth.verify import _grounded_one
+    # free-form: the answer (11) is NOT in the prompt by construction
+    assert _grounded_one("11", _tr(("Compute 3+4*2.", "11")), "number") == (True, "ok")
+    assert _grounded_one("11", _tr(("hi", "hello")), "number") == (False, "ungrounded")
+    assert _grounded_one("11", _tr(("Repeat exactly: 11", "11")), "number") == (False, "laundered")
+
+
+def test_first_appearance_does_not_flag_honest_orchestration():
+    """Verify-loops and cheap->strong escalation must keep passing: their answer still ORIGINATES
+    in a response, it is merely quoted back afterwards."""
+    from thirtyspokes.koth.verify import _grounded_one
+    verify_loop = _tr(("Compute 3+4*2.", "11"), ("Is 11 correct?", "11"))
+    escalation = _tr(("Compute 3+4*2.", "10"), ("Compute 3+4*2.", "11"))
+    assert _grounded_one("11", verify_loop, "number") == (True, "ok")
+    assert _grounded_one("11", escalation, "number") == (True, "ok")
+
+
+def test_multiple_choice_is_exempt_from_the_provenance_rule():
+    """MCQ is undefendable here BY CONSTRUCTION -- every option is in the prompt, so the rule would
+    flag every honest agent. It must fall back to plain grounding rather than DQ everyone. This is
+    why the ranking weights are 100% free-form (`real_suite`)."""
+    from thirtyspokes.koth.verify import _grounded_one, answer_token
+    mcq = _tr(("Q: 2+2? A) 3 B) 4", "B"))
+    assert answer_token(mcq[0]["prompt"], "choice") == "B", "the gold is in the prompt already"
+    assert _grounded_one("B", mcq, "choice") == (True, "ok"), "must not flag an honest MCQ agent"
+
+
+def test_ranking_weights_are_entirely_free_form():
+    """No ranked benchmark may use an answer format whose provenance cannot be checked."""
+    from thirtyspokes.koth.verify import _PROVENANCE_KINDS, _bench_kind
+    from thirtyspokes.koth.benchmarks import default_suite
+    for b in default_suite():
+        if b.weight > 0:
+            assert _bench_kind(b) in _PROVENANCE_KINDS, f"{b.name} is ranked but undefendable"
+
+
+def test_scan_weights_finds_an_answer_table_but_not_random_weights():
+    """weights.bin was the obvious hiding place and was never examined. Decoys of the same
+    digit-length are the control, so short numeric golds matching by chance don't false-positive."""
+    import json
+    import numpy as np
+    from thirtyspokes.koth.verify import scan_weights
+    golds = [18, 7, 4213, 96, 51, 8, 1240, 33]
+    table = json.dumps({f"q{i}": g for i, g in enumerate(golds)}).encode()
+    assert scan_weights(table, golds, salt="n1") == (True, "answers_in_weights")
+    # a real float32 weight blob must NOT trip it, however numerically dense
+    rng = np.random.default_rng(0)
+    real = rng.standard_normal(200_000).astype("float32").tobytes()
+    assert scan_weights(real, golds, salt="n1")[0] is False
+    assert scan_weights(b"", golds, salt="n1")[0] is False
+
+
+# --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------
+# The old scalar (Q_lcb - lambda*cost) scores the OUTCOME, is ABSOLUTE rather than baseline-relative
+# (on a 95%-accurate pool ~98% of it measures the POOL), and fixes ONE quality/price exchange rate.
+# `router_headroom` scores the DECISION against what was achievable AT THAT PRICE.
+
+def _ref():
+    """3 asks x 2 models. cheap solves only ask0; pricey solves all."""
+    import numpy as np
+    return np.array([[1., 1.], [0., 1.], [0., 1.]]), np.array([[0.001, 0.10]] * 3)
+
+
+def test_router_headroom_is_zero_on_the_featureless_frontier():
+    """Both 'always cheapest' and 'always priciest' are ON the Zero frontier -- neither demonstrated
+    any routing skill, so both must score 0 regardless of their very different accuracy."""
+    from thirtyspokes.koth.verify import router_headroom
+    S, C = _ref()
+    assert abs(router_headroom(1 / 3, 0.001, S, C)) < 1e-9      # always cheap
+    assert abs(router_headroom(1.0, 0.10, S, C)) < 1e-9         # always pricey
+
+
+def test_router_headroom_rewards_matching_quality_at_lower_price():
+    """The property the OLD quality-only measure got backwards: an oracle router that reaches full
+    quality by paying the cheap model where it suffices scores 1.0, not negative."""
+    from thirtyspokes.koth.verify import router_headroom
+    S, C = _ref()
+    oracle_cost = (0.001 + 0.10 + 0.10) / 3        # cheap on ask0, pricey on the other two
+    assert router_headroom(1.0, oracle_cost, S, C) == pytest.approx(1.0, abs=1e-6)
+    assert router_headroom(0.0, 0.05, S, C) < 0     # worse than the baseline -> negative
+
+
+def test_router_headroom_ignores_asks_nobody_can_solve():
+    """A query no pool model answers must not drag every miner down -- routing cannot fix it."""
+    from thirtyspokes.koth.verify import oracle_frontier, zero_frontier
+    import numpy as np
+    S = np.array([[1., 1.], [0., 0.]]); C = np.array([[0.001, 0.10]] * 2)
+    # both frontiers cap at 0.5: the unsolvable ask is simply unreachable for anyone
+    assert max(q for _, q in zero_frontier(S, C)) == pytest.approx(0.5)
+    assert max(q for _, q in oracle_frontier(S, C)) == pytest.approx(0.5)
+
+
+def _refrec(epoch=7, nonce="n7", n=3, bench="math", scores=None, costs=None):
+    """The owner's published record for a 3-ask x 2-model slice: cheap solves only ask0."""
+    from thirtyspokes.koth.runtime import SUITE_VERSION
+    return {"v": 1, "epoch": epoch, "nonce": nonce, "suite_version": SUITE_VERSION,
+            "n_per_bench": n, "models": ["cheap", "pricey"],
+            "task_ids": ["t0", "t1", "t2"], "benchmarks": [bench] * 3,
+            "scores": scores or [[1., 1.], [0., 1.], [0., 1.]],
+            "costs": costs or [[0.001, 0.10]] * 3}
+
+
+def _rvd(correct, costs, *, bench="math", lcb=0.7):
+    """A ProofVerdict carrying the per-ask detail the frontier and regret both need."""
+    from thirtyspokes.koth.verify import BenchStat, ProofVerdict, TaskStat
+    n = len(correct)
+    acc = sum(correct) / n
+    return ProofVerdict(True, "ok", {bench: BenchStat(n, acc, lcb, sum(costs))},
+                        sum(costs), lcb, acc,
+                        per_task=tuple(TaskStat(bench, f"t{i}", c, k)
+                                       for i, (c, k) in enumerate(zip(correct, costs))))
+
+
+def test_validator_uses_the_router_scalar_when_a_pool_reference_exists(env):
+    """With a reference the reign scalar becomes frontier-relative headroom; without one it falls
+    back to the legacy Q_lcb - lambda*cost, so existing deployments are unchanged."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    # an oracle router: cheap where cheap suffices, pricey elsewhere -> full quality, low price
+    vd = _rvd([1., 1., 1.], [0.001, 0.10, 0.10])
+
+    plain = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None)
+    legacy = plain._reign_scalar(vd, epoch=7, nonce="n7")
+    assert legacy == pytest.approx(vd.score - 0.02 * min(1.0, 0.201 / 0.5))
+
+    routed = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                           pool_reference=lambda e, n: _refrec())
+    assert routed._reign_scalar(vd, epoch=7, nonce="n7") == pytest.approx(1.0, abs=1e-6)
+
+
+def test_pool_reference_outage_falls_back_instead_of_breaking_scoring():
+    """A reference fetch that raises must never take the subnet down."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.koth.benchmarks import default_suite
+    from thirtyspokes.reign import KingChain
+
+    def boom(epoch, nonce):
+        raise RuntimeError("reference unavailable")
+
+    v = KOTHValidator({"m"}, "pub", None, KingChain(), default_suite(), None, None,
+                      pool_reference=boom)
+    assert v._router_scalar(_rvd([1.], [0.01]), 1, "n") is None
+
+
+def test_frontier_ignores_benchmarks_the_miner_is_not_ranked_on(env):
+    """The miner's score is `Σ_b w_b·acc_b`, so the frontier must be weighted the same way. MMLU
+    carries weight 0 (an eligibility floor) yet contributes rows to the reference — unweighted, half
+    the baseline a math router is judged against would come from a benchmark it is not scored on."""
+    from thirtyspokes.koth.verify import row_weights_for, zero_frontier
+    import numpy as np
+    S = np.array([[1., 1.], [0., 1.], [0., 1.], [0., 0.]])   # last row: an mmlu ask nobody solves
+    C = np.array([[0.001, 0.10]] * 4)
+    w = row_weights_for(["math", "math", "math", "mmlu"], {"math": 1.0, "mmlu": 0.0})
+    assert max(q for _, q in zero_frontier(S, C, w)) == pytest.approx(1.0)   # mmlu row excluded
+    assert max(q for _, q in zero_frontier(S, C)) == pytest.approx(0.75)     # unweighted: dragged down
+    assert row_weights_for(["mmlu"], {"mmlu": 0.0}) is None                  # nothing ranked at all
+
+
+def test_saturated_traffic_refuses_the_router_scalar(env):
+    """GAP 6a. Headroom divides by `oracle - zero`. On saturated traffic that gap is under the noise
+    in an 8-question slice, so dividing by it manufactures a ranking out of nothing. The validator
+    must decline and fall back rather than report a confident number about a non-difference."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.koth.verify import achievable_gap
+    from thirtyspokes.reign import KingChain
+    # both models solve everything: a perfect router adds exactly nothing
+    flat = _refrec(scores=[[1., 1.]] * 3)
+    assert achievable_gap(flat["scores"], flat["costs"]) == pytest.approx(0.0)
+    v = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                      pool_reference=lambda e, n: flat)
+    vd = _rvd([1., 1., 1.], [0.001, 0.10, 0.10])
+    assert v._router_scalar(vd, 7, "n7") is None                  # declined
+    assert v._reign_scalar(vd, 7, "n7") == pytest.approx(vd.score - 0.02 * (0.201 / 0.5))
+    health = v._reference_health(flat)
+    assert health["routable"] is False and health["achievable_gap"] == 0.0
+
+
+# --- workstream 1: what the scalar could not see --------------------------------------------------
+
+def test_miners_can_bound_their_own_thinking():
+    """`max_tokens` counts THINKING tokens, so without a separate bound a reasoning model spends its
+    whole budget deliberating and returns an empty answer — measured at 8k AND 32k. It grades as
+    wrong, so it reads as incapability. Miners must be able to send `reasoning`."""
+    from thirtyspokes.tee.runtime import ALLOWED_PARAMS, MeteringProxy
+    assert "reasoning" in ALLOWED_PARAMS
+
+    seen = {}
+
+    class Spy:
+        def complete(self, model, messages, params):
+            seen.update(params)
+            return "ok", 3, 4, 0.001
+
+    MeteringProxy(Spy()).call_model("m", [{"role": "user", "content": "hi"}],
+                                    {"reasoning": {"effort": "low"}, "stream": True})
+    assert seen["reasoning"] == {"effort": "low"}
+    assert "stream" not in seen, "the allowlist must still reject everything else"
+
+
+def test_latency_and_tokens_are_attested(env):
+    """Speed is half of 'best answer at the lowest price' and was measured then discarded. In the
+    payload => covered by report_data => covered by the quote."""
+    import dataclasses
+    a = _art(_ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert "latency_s" in p._payload() and "tokens_out" in p._payload()
+    assert p.tokens_out > 0, "the metering proxy measures these; they must reach the proof"
+    forged = dataclasses.replace(p, latency_s=p.latency_s + 100.0)
+    assert forged.report_data() != p.quote.report_data     # cannot be edited after attestation
+
+
+def test_empty_trace_proof_survives_serialization(env):
+    """Regression: sum([]) is int 0 but from_json coerces to 0.0, and 0 vs 0.0 hash differently in
+    the canonical payload — an agent making NO pool calls produced report_data_mismatch."""
+    from thirtyspokes.koth.proof import Proof
+    a = _art(_NOCALL_SRC if "_NOCALL_SRC" in globals() else _ROUTER_SRC, env.allk)
+    p = _proof(env, a, "hk")
+    assert Proof.from_json(p.to_json()).report_data() == p.report_data()
+
+
+def test_per_ask_regret_ignores_asks_nobody_solves():
+    """An ask no pool model answers must cost every miner ZERO quality regret — routing cannot fix
+    it, and an accuracy average would drag everyone down for it."""
+    import numpy as np
+    from thirtyspokes.koth.verify import per_ask_regret
+    S = np.array([[1., 1.], [0., 1.], [0., 0.]])
+    C = np.array([[0.001, 0.10]] * 3)
+    qual, cost = per_ask_regret([1., 0., 0.], [0.001] * 3, S, C)
+    assert list(qual) == [0.0, 1.0, 0.0]          # ask2 unsolvable -> no regret charged
+    assert cost[1] < 0                            # underspent on the ask it got wrong
+
+
+def test_trajectory_stats_sees_the_intelligence_layer(env):
+    """The scalar sees only the final answer and total cost. These diagnostics distinguish an agent
+    that escalated and RECOVERED from one that escalated blindly."""
+    from thirtyspokes.koth.proof import BenchmarkResult, Proof
+    from thirtyspokes.koth.verify import trajectory_stats
+    p = Proof(epoch=1, nonce="n", hotkey="hk", source_hash="s", weights_hash="w", model_id="m",
+              results=(BenchmarkResult("math", "t1", "42", 0.02),), total_cost_usd=0.02,
+              n_calls=2, call_log_hash="x", measurement="m")
+    trace = [{"task_id": "t1", "model": "cheap", "prompt": "q", "response": "17", "cost_usd": 0.001},
+             {"task_id": "t1", "model": "strong", "prompt": "q", "response": "42", "cost_usd": 0.019}]
+    s = trajectory_stats(p, trace)
+    assert s["escalations"] == 1
+    assert s["escalations_that_changed_the_answer"] == 1    # the escalation RECOVERED the answer
+    assert s["escalation_yield"] == 1.0
+    assert s["calls_per_ask"] == 2.0
+
+
+# --- the per-epoch POOL REFERENCE (what makes router_headroom actually run) ----------------------
+# `router_headroom` needs every (ask, model) cell for the epoch's slice, and a validator runs NO
+# inference — so the OWNER measures the pool and publishes it, hash-committed like the governance
+# record. Without this the router scalar silently falls back to the old absolute one.
+
+def _rec(epoch=7, nonce="n7", n=2):
+    from thirtyspokes.koth.runtime import SUITE_VERSION
+    return {"v": 1, "epoch": epoch, "nonce": nonce, "suite_version": SUITE_VERSION,
+            "n_per_bench": n, "models": ["cheap", "pricey"], "task_ids": ["t1", "t2"],
+            "benchmarks": ["math", "math"],
+            "scores": [[1.0, 1.0], [0.0, 1.0]], "costs": [[0.001, 0.1], [0.001, 0.1]]}
+
+
+# A fake owner key: `sign` stamps the bytes, `check` accepts only that owner's stamp.
+def _fake_signer(owner="owner"):
+    import hashlib
+    sign = lambda data: hashlib.sha256(f"{owner}|".encode() + data).hexdigest()  # noqa: E731
+    check = lambda data, sig, ss58: sig == hashlib.sha256(f"{ss58}|".encode() + data).hexdigest()  # noqa: E731
+    return sign, check
+
+
+def test_reference_cannot_use_the_owners_only_commitment_slot():
+    """WHY THIS IS SIGNED, NOT HASH-COMMITTED. The chain gives each hotkey ONE commitment slot and
+    `set_commitment` overwrites it. The owner's slot already carries the approved-measurement record,
+    so a per-epoch reference digest written there would erase the subnet's governance — every
+    validator would then read `mrtd_gate_unset` and refuse to score. The reference therefore carries
+    its own authentication and never touches the chain."""
+    from thirtyspokes.koth import governance, reference as R
+    assert not hasattr(R, "commit_string")          # no on-chain writer exists any more
+    assert governance.commit_string("0" * 64).startswith("kothgov1|")   # the slot's real occupant
+
+
+def test_reference_is_signed_and_tamper_evident():
+    """The signature is what makes the bucket untrusted transport: only the owner's key can produce
+    a record validators accept, so a bucket compromise cannot move the frontier."""
+    import json
+
+    from thirtyspokes.koth import reference as R
+    sign, check = _fake_signer()
+    raw = json.dumps(R.envelope(_rec(), sign)).encode()
+    assert R.open_envelope(raw, owner_ss58="owner", verify_sig=check)["epoch"] == 7
+    with pytest.raises(ValueError, match="not signed by the subnet owner"):
+        R.open_envelope(raw, owner_ss58="someone-else", verify_sig=check)   # not the owner's key
+    env2 = json.loads(raw)
+    env2["record"]["scores"] = [[1.0, 1.0], [1.0, 1.0]]                     # flatter every miner
+    with pytest.raises(ValueError, match="not signed by the subnet owner"):
+        R.open_envelope(json.dumps(env2).encode(), owner_ss58="owner", verify_sig=check)
+
+
+def test_reference_only_measures_the_benchmarks_that_are_ranked():
+    """The owner pays per cell, every epoch. A weight-0 eligibility floor carries row weight 0 in
+    both frontiers, so measuring the pool on it buys nothing — on the live suite (1 ranked + 2
+    floors) skipping them is a 3x saving."""
+    from types import SimpleNamespace
+
+    from thirtyspokes.koth import reference as R
+    from thirtyspokes.koth.benchmarks import BenchTask
+
+    def bench(name, weight):
+        return SimpleNamespace(
+            name=name, weight=weight,
+            sample=lambda n, seed, _n=name: [BenchTask(f"{_n}-{i}", f"q{i}", "1") for i in range(n)],
+            grade=lambda a, g: 1.0)
+
+    class Backend:
+        calls = 0
+
+        def complete(self, model, messages, params):
+            Backend.calls += 1
+            return "1", 1, 1, 0.001
+
+    rec = R.build([bench("mmlu", 0.0), bench("math", 0.0), bench("code", 1.0)],
+                  epoch=1, nonce="n", n_per_bench=4, models=["a", "b"], backend=Backend())
+    assert set(rec["benchmarks"]) == {"code"}          # floors not measured
+    assert Backend.calls == 4 * 2                      # 4 ranked asks x 2 models, not 12 x 2
+
+
+def test_reference_build_is_bounded_by_a_deadline():
+    """A per-epoch job that can hang forever silently stops publishing. Observed live: one provider
+    request sat ESTABLISHED with no response and held the build for 35+ minutes on 3.5s of CPU.
+    Cells outstanding at the deadline must count as failed — costing coverage, not the epoch."""
+    import threading
+
+    from thirtyspokes.koth import reference as R
+    from thirtyspokes.koth.benchmarks import BenchTask
+
+    bench = SimpleNamespace(
+        name="code", weight=1.0,
+        sample=lambda n, seed: [BenchTask(f"t{i}", f"q{i}", "1") for i in range(n)],
+        grade=lambda a, g: 1.0)
+    release = threading.Event()
+
+    class Hanging:
+        def complete(self, model, messages, params):
+            if model == "slow":
+                release.wait()               # never set: the hang under test
+            return "1", 1, 1, 0.001
+
+    seen = []
+    rec = R.build([bench], epoch=1, nonce="n", n_per_bench=2, models=["fast", "slow"],
+                  backend=Hanging(), deadline_s=0.5, progress=lambda d, t: seen.append(d))
+    release.set()                            # let the stuck worker unwind
+    # every row needed a `slow` cell, so all rows drop — the build RETURNS instead of hanging
+    assert rec["scores"] == [] and rec["task_ids"] == []
+    assert seen, "progress must be reported so a cron log distinguishes working from wedged"
+
+
+def test_reference_path_is_derivable_by_both_sides():
+    """No on-chain pointer means the validator must be able to ADDRESS the record itself. The path
+    comes from `(epoch, nonce)`, and the nonce is chain-derived, so it is unique per epoch and
+    cannot be guessed ahead of the beacon."""
+    from thirtyspokes.koth import reference as R
+    assert R.record_path(7, "n7") == "reference/7-n7.json"
+    assert R.record_path(7, "n7") != R.record_path(8, "n7")
+
+
+def test_reference_must_describe_THIS_slice_not_just_hash_correctly():
+    """The load-bearing check. A hash only proves the owner committed the body — not that it is
+    about this epoch. A record from an EASIER epoch lowers the Zero frontier and flatters every
+    miner, so epoch/nonce/suite/n_per_bench are all checked."""
+    from thirtyspokes.koth import reference as R
+    rec = _rec(epoch=7, nonce="n7")
+    assert R.matches(rec, epoch=7, nonce="n7", n_per_bench=2)
+    assert not R.matches(rec, epoch=8, nonce="n7", n_per_bench=2)      # replayed from another epoch
+    assert not R.matches(rec, epoch=7, nonce="other", n_per_bench=2)   # different slice
+    assert not R.matches(rec, epoch=7, nonce="n7", n_per_bench=8)      # different slice size
+    assert not R.matches({**rec, "suite_version": "stale"}, epoch=7, nonce="n7", n_per_bench=2)
+
+
+def test_chain_reader_returns_none_rather_than_stalling_the_subnet(monkeypatch):
+    """A reference outage is an OWNER problem. Scoring must degrade to the legacy scalar, not halt."""
+    from thirtyspokes.koth import reference as R
+
+    class Chain:
+        def owner_hotkey(self):
+            raise RuntimeError("chain unavailable")
+
+    assert R.chain_reader(Chain(), n_per_bench=2)(7, "n7") is None
+
+
+def test_chain_reader_resolves_the_owner_from_chain_then_verifies(monkeypatch):
+    """The owner is read from the CHAIN, never from local config: a validator that has to be TOLD
+    who the owner is can be pointed at an attacker's key and fed an attacker's frontier."""
+    from thirtyspokes.koth import reference as R
+    _sign, check = _fake_signer()
+    rec = _rec()
+    monkeypatch.setattr(R, "fetch", lambda e, n, **kw: rec if kw["owner_ss58"] == "owner"
+                        else (_ for _ in ()).throw(ValueError("not signed by the subnet owner")))
+
+    class Chain:
+        def owner_hotkey(self):
+            return "owner"
+
+    got = R.chain_reader(Chain(), n_per_bench=2, verify_sig=check)(7, "n7")
+    assert got["task_ids"] == ["t1", "t2"]      # the whole record, not just the two matrices
+    # a record signed by anyone else is rejected -> None -> legacy scalar
+    class Impostor(Chain):
+        def owner_hotkey(self):
+            return "someone-else"
+    assert R.chain_reader(Impostor(), n_per_bench=2, verify_sig=check)(7, "n7") is None
+
+
+# --- GAPS 1+3: the router scalar on the PRODUCTION path, with its confidence bound intact --------
+# `per_epoch` is sim-only; `accumulate` is the default and the only mode a mainnet validator runs.
+# The frontier-relative scalar previously existed solely on the `per_epoch` branch, so on mainnet it
+# was dead code and every miner was still ranked by absolute accuracy.
+
+def _mini_suite(name="math"):
+    """A one-benchmark suite: `_accumulate` and `_epoch_frontier` read only name + weight."""
+    from types import SimpleNamespace
+    return [SimpleNamespace(name=name, weight=1.0)]
+
+
+def _acc_validator(ref, **kw):
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import Reign
+    return KOTHValidator({"m"}, "pub", None, Reign(), _mini_suite(), None, None, n_per_bench=3,
+                         scoring_mode="accumulate", budget_per_task=1.0, f_min=0.0,
+                         pool_reference=(lambda e, n: ref) if ref else None, **kw)
+
+
+def test_accumulate_mode_actually_uses_the_router_scalar(env):
+    """GAP 1. The DEFAULT scoring mode must score frontier-relative headroom, not absolute accuracy.
+    Both prior end-to-end tests called `_reign_scalar` directly — a `per_epoch`-only path — so this
+    never ran on the mode mainnet uses, and the scalar silently stayed the one it replaced."""
+    from thirtyspokes.koth.validator import _MinerEval
+    ref = _refrec()
+    vd = _rvd([1., 1., 1.], [0.001, 0.10, 0.10])       # oracle routing: full quality, cheap
+    ev = {"m": _MinerEval(verdict=vd, sh="s", wh="w")}
+
+    audit: dict = {}
+    routed = _acc_validator(ref)._accumulate(ev, {}, ref, audit)
+    assert "headroom" in audit and audit["headroom"]["m"] == pytest.approx(routed["m"], abs=1e-6)
+
+    legacy = _acc_validator(None)._accumulate({"m": _MinerEval(verdict=vd, sh="s", wh="w")}, {})
+    assert routed["m"] != pytest.approx(legacy["m"])   # a genuinely different number, not a no-op
+    assert 0.0 <= legacy["m"] <= 1.0                   # legacy is absolute accuracy, bounded [0,1]
+
+
+def test_accumulated_headroom_keeps_its_confidence_bound(env):
+    """GAP 3. A perfect 3-question slice routes perfectly, so the POINT headroom is 1.0 — and that is
+    exactly the lucky-slice lottery the Wilson bound exists to stop. The accumulated scalar must
+    price the sample instead: deeply negative on one slice, climbing toward 1.0 only as real attested
+    epochs pile up behind the same artifact."""
+    from thirtyspokes.koth.validator import _MinerEval
+    from thirtyspokes.koth.verify import router_headroom
+    ref = _refrec()
+    vd = _rvd([1., 1., 1.], [0.001, 0.10, 0.10])
+    assert router_headroom(1.0, 0.201 / 3, ref["scores"], ref["costs"]) == pytest.approx(1.0, abs=1e-6)
+
+    v = _acc_validator(ref)
+    ev = {"m": _MinerEval(verdict=vd, sh="s", wh="w")}
+    first = v._accumulate(ev, {}, ref)["m"]
+    assert first < 0.0                                  # 3 questions have proven nothing yet
+    for _ in range(19):
+        last = v._accumulate({"m": _MinerEval(verdict=vd, sh="s", wh="w")}, {}, ref)["m"]
+    assert first < last < 1.0                           # converges upward, never reaches certainty
+
+
+def test_headroom_engages_on_the_REAL_live_suite_shape():
+    """The live suite is 1 ranked benchmark + 2 weight-0 floors, so an epoch is 8 ranked asks out of
+    24 scored tasks. Measuring reference coverage against ALL tasks reads 0.33, trips the coverage
+    floor, and refuses to score frontier-relatively forever — the router scalar would never engage
+    in production. Coverage must be measured against the RANKED count the reference actually covers."""
+    from thirtyspokes.koth.evidence import Evidence
+    w = {"code": 1.0, "math": 0.0, "mmlu": 0.0}
+    e = Evidence()
+    for _ in range(3):                                   # three epochs of the real shape
+        e.add("code", 8, 6.0, 0.05)
+        e.add("math", 8, 8.0, 0.01)
+        e.add("mmlu", 8, 8.0, 0.01)
+        e.add_reference(8, 0.30, 0.65)                   # frontier covers the ranked asks only
+    h = e.headroom_lcb(w, min_gap=0.05)
+    assert h is not None, "router scalar must engage on the live suite"
+    assert 0.0 < h < 1.0                                 # between featureless and the oracle
+
+    # and the coverage guard must still fire when the owner genuinely stops publishing
+    for _ in range(6):
+        e.decay(0.5 ** (1 / 200))                        # the accumulator's EWMA
+        e.add("code", 8, 6.0, 0.05)                      # scored, but no reference banked
+    assert e.headroom_lcb(w, min_gap=0.05) is None
+
+
+def test_headroom_falls_back_when_the_frontier_stops_covering_the_evidence(env):
+    """If the owner stops publishing references, the pooled frontier ages out while the counts keep
+    growing. Past that point the baseline describes too little of the evidence to divide by, so the
+    scalar returns to absolute accuracy rather than quietly comparing 200 epochs of accuracy against
+    one epoch's frontier."""
+    from thirtyspokes.koth.validator import _MinerEval
+    ref = _refrec()
+    v = _acc_validator(ref)
+    vd = _rvd([1., 1., 1.], [0.001, 0.10, 0.10])
+    v._accumulate({"m": _MinerEval(verdict=vd, sh="s", wh="w")}, {}, ref)
+    for _ in range(3):                                   # epochs scored with no reference published
+        s = v._accumulate({"m": _MinerEval(verdict=vd, sh="s", wh="w")}, {}, None)["m"]
+    assert 0.0 <= s <= 1.0                               # back on the absolute scalar
+
+
+# --- GAP 6b: a ranked benchmark whose traffic is actually routable ---------------------------------
+
+def test_code_answers_are_parsed_as_programs_not_numbers():
+    """`_bench_kind` guesses the answer type from the grader's identity and falls through to
+    'number'. A program parsed as a number takes whatever integer appears last in it, so grounding
+    would compare garbage — the benchmark must DECLARE its kind."""
+    from thirtyspokes.koth import lcb
+    from thirtyspokes.koth.verify import _bench_kind, answer_token
+    b = lcb.LCBBenchmark("code", 1.0, {}, {})
+    assert _bench_kind(b) == "code"
+    src = "n = int(input())\nprint(n * 2)\n"
+    assert answer_token(src, "code") == " ".join(src.split())     # whole program, normalized
+    assert answer_token(src, "number") == "2"                     # what the wrong kind would compare
+
+
+def _code_bench(n=6):
+    """An LCB-shaped benchmark with grading stubbed — Docker is not a CI dependency, but every
+    other part of the path (sampling, answer kind, proof, grading seam, grounding) is real."""
+    from thirtyspokes.koth.benchmarks import BenchTask
+    from thirtyspokes.koth.lcb import TIERS, LCBBenchmark
+    mk = lambda p, t: [BenchTask(f"{p}-{t}-{i}", f"[CODE] print {i}", str(i)) for i in range(n)]  # noqa: E731
+    b = LCBBenchmark("code", 1.0, {t: mk("c", t) for t in TIERS}, {t: mk("h", t) for t in TIERS})
+    b.grade = lambda answer, gold: 1.0 if answer.strip() == f"print({gold})" else 0.0
+    return b
+
+
+class _CodeBackend:
+    """A pool model that answers a code prompt with a program."""
+    allowed = {"m"}
+
+    def complete(self, model, messages, params):
+        n = str(messages[-1]["content"]).rsplit(" ", 1)[-1]
+        return f"print({n})", 4, 4, 0.0001
+
+
+def test_code_benchmark_round_trips_through_the_validator(env):
+    """A code answer is a whole PROGRAM, not a token. It has to survive runtime -> proof ->
+    verify_proof -> grounding intact, and the stratified draw has to give the validator exactly the
+    slice the miner ran — otherwise every honest code agent is graded on tasks it never saw."""
+    import json
+
+    from thirtyspokes.koth.miner import REFERENCE_SRC
+    from thirtyspokes.koth.runtime import Artifact, KOTHRuntime, runtime_measurement
+    from thirtyspokes.koth.verify import grounding_check, verify_proof
+    bench = _code_bench()
+    art = Artifact(REFERENCE_SRC, json.dumps({"model": "m"}).encode(), "m")
+    proof, trace = KOTHRuntime(_CodeBackend(), env.platform).run(
+        art, hotkey="hk", epoch=1, nonce="n1", suite=[bench], n_per_bench=3)
+
+    vd = verify_proof(proof, approved_measurements={runtime_measurement()},
+                      platform_public_hex=env.platform.public_hex, expect_epoch=1,
+                      expect_nonce="n1", expect_hotkey="hk",
+                      expect_source_hash=art.source_hash, expect_weights_hash=art.weights_hash,
+                      suite=[bench], n_per_bench=3)
+    assert vd.valid, vd.reason
+    assert vd.per_bench["code"].acc == 1.0            # validator re-derived the SAME slice
+    assert len(vd.per_task) == 3 and all(t.benchmark == "code" for t in vd.per_task)
+    assert grounding_check(proof, trace, [bench])[0]  # the program came from a pool response
+
+
+def test_grading_a_program_as_a_number_would_dq_every_honest_agent():
+    """Why the answer kind is DECLARED, not inferred. Under the fallback 'number' kind both the
+    program and the prompt reduce to whatever integer they end with — so the provenance rule sees the
+    answer 'already in the prompt' and reports LAUNDERED against an entirely honest agent."""
+    from thirtyspokes.koth.verify import _grounded_one, answer_token
+    prompt, answer = "[CODE] print 3", "print(3)"
+    assert answer_token(answer, "number") == answer_token(prompt, "number") == "3"
+    calls = [{"task_id": "t", "prompt": prompt, "response": answer}]
+    assert _grounded_one(answer, calls, "number") == (False, "laundered")   # the bug
+    assert _grounded_one(answer, calls, "code") == (True, "ok")             # declared kind: correct
+
+
+def test_an_agent_that_cleans_the_models_output_is_still_grounded():
+    """Would have DQ'd every honest code miner. Models answer a code ask with prose plus a
+    ```python fence; stripping that fence is exactly what the grader does before running the
+    program. Comparing raw text made the cleaned answer match no response, so all 8 code answers
+    read `ungrounded` — 100%, far past the 15% tolerance — and the miner was disqualified for
+    behaving normally. Grounding must use the grader's parser on BOTH sides."""
+    from thirtyspokes.koth.verify import _grounded_one, answer_token, grounding_check
+    from thirtyspokes.koth.proof import BenchmarkResult, Proof
+    response = "Sure!\n```python\nprint(input())\n```"
+    answer = "print(input())"                       # the agent stripped the fence
+    assert answer_token(response, "code") == answer_token(answer, "code")
+    calls = [{"task_id": "t", "prompt": "[CODE] solve", "response": response}]
+    assert _grounded_one(answer, calls, "code") == (True, "ok")
+
+    # a memorized program that never came from the pool still matches nothing
+    assert _grounded_one("print('memorized')", calls, "code")[0] is False
+
+    bench = _code_bench()
+    proof = Proof(1, "n1", "hk", "s", "w", "m",
+                  (BenchmarkResult("code", "t", answer, 0.001),), 0.001, 1, "h", "meas")
+    assert grounding_check(proof, calls, [bench])[0]
+
+
+def test_code_extraction_survives_fenced_and_bare_responses():
+    from thirtyspokes.koth.lcb import extract_code
+    fenced = "Here you go:\n```python\nprint(input())\n```\nHope that helps"
+    assert extract_code(fenced).strip() == "print(input())"
+    assert extract_code("print(1)").strip() == "print(1)"
+
+
+def test_broken_grading_harness_is_not_charged_to_the_miner(env, monkeypatch):
+    """A validator whose Docker is down must not score every miner 0 — that is the validator's
+    infrastructure failing, not the miner's agent. `GradingUnavailable` is distinct from a wrong
+    answer, and (unlike a missed epoch) it is NOT accumulated as miss=0."""
+    from thirtyspokes.koth import lcb
+    from thirtyspokes.koth.validator import _MISS_REASONS
+    monkeypatch.setattr(lcb.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("docker")))
+    with pytest.raises(lcb.GradingUnavailable, match="docker not available"):
+        lcb.grade_code("print(1)", [{"input": "1", "output": "1"}])
+    # an EMPTY submission is a real failure, and must still grade 0 rather than raise
+    assert lcb.run_tests("", [{"input": "1", "output": "1"}]) == 0.0
+    assert "grading_unavailable" not in _MISS_REASONS      # excluded from the epoch, not penalised
+
+
+def test_code_suite_ranks_only_the_free_form_benchmark():
+    """Same policy as the live suite: MCQ is a weight-0 eligibility floor because it cannot be
+    defended against memorization by proof-inspection. The ranked weight sits entirely on code."""
+    import types
+
+    from thirtyspokes.koth import lcb
+    fake = [types.SimpleNamespace(name="mmlu", weight=0.0),
+            types.SimpleNamespace(name="code", weight=1.0)]
+    from thirtyspokes.koth.verify import row_weights_for
+    w = row_weights_for(["mmlu", "code"], {b.name: b.weight for b in fake})
+    assert w == [0.0, 1.0]
+    assert lcb.SANDBOX_IMAGE and lcb.MAX_TESTS > 0
+
+
+# --- GAP 5: the intelligence layer is measured AND published --------------------------------------
+
+def test_standings_publishes_the_diagnostics_scoring_deliberately_ignores(env):
+    """Escalation behaviour, latency, regret and the traffic's achievable gap are all collected and
+    hash-attested, and none of them is a reward term (each is trivially farmable the moment it pays).
+    That is a reason not to SCORE them — not a reason to discard them: without publishing, the
+    orchestration half of the product is invisible to everyone, not just to the scalar."""
+    from thirtyspokes.koth.validator import EpochReport, KOTHValidator
+    from thirtyspokes.reign import KingChain
+    from thirtyspokes.subnet.chain import MockChain
+    chain = MockChain()
+    chain.register("m")
+    v = KOTHValidator(env.approved, "pub", chain, KingChain(), env.suite, None, None)
+    audit = {"trajectory": {"m": {"escalations": 4, "escalation_yield": 0.5, "latency_s": 12.5}},
+             "regret": {"m": {"quality_regret": 0.25, "cost_regret_usd": -0.01}},
+             "headroom": {"m": 0.42},
+             "pool_reference": {"achievable_gap": 0.083, "routable": True}}
+    feed = v.standings(EpochReport(3, {"m": 0.42}, {}, [], {}, audit))
+    d = feed["diagnostics"]
+    assert d["trajectory"]["m"]["escalations"] == 4 and d["regret"]["m"]["quality_regret"] == 0.25
+    assert d["headroom"]["m"] == 0.42
+    # the headline a reader needs FIRST: was this epoch's traffic routable at all?
+    assert d["pool_reference"]["routable"] is True
+    assert feed["diagnostics"]["pool_reference"]["achievable_gap"] == 0.083
+
+
+# --- GAP 4: per-ask attribution ------------------------------------------------------------------
+
+def test_restored_king_keeps_the_detail_the_router_scalar_needs(env):
+    """A restart must not change which SCALE the king is measured on. Persisting only the
+    per-benchmark aggregate would leave a restored king scorable on absolute accuracy while its
+    challengers are scored frontier-relatively — and the dethrone guard clamps one against the
+    other."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    v = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                      pool_reference=lambda e, n: _refrec())
+    v._king_id, v._king_vd = "k", _rvd([1., 1., 1.], [0.001, 0.10, 0.10])
+    before = v._reign_scalar(v._king_vd, epoch=7, nonce="n7")
+
+    v2 = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                       pool_reference=lambda e, n: _refrec())
+    v2.restore(v.snapshot())
+    assert v2._king_vd.per_task and len(v2._king_vd.per_task) == 3
+    assert v2._reign_scalar(v2._king_vd, epoch=7, nonce="n7") == pytest.approx(before)
+
+
+def test_regret_attributes_the_score_to_individual_asks():
+    """The scalar is one number; regret says where it was earned. Quality regret is what a better
+    available model would have got; cost regret is the overpayment against the cheapest model that
+    was just as good — negative when the router UNDERspent relative to that."""
+    from thirtyspokes.koth.verify import regret_stats
+    ref = _refrec()
+    got = regret_stats(_rvd([1., 0., 1.], [0.10, 0.001, 0.001]).per_task, ref)
+    assert got["asks_matched"] == 3
+    assert got["quality_regret"] == pytest.approx(1 / 3, abs=1e-3)     # missed ask1 entirely
+    assert got["cost_regret_usd"] < 0                                  # underspent on the two it lost
+    assert got["asks_nobody_solves"] == 0
+
+
+def test_regret_charges_nothing_for_asks_the_whole_pool_fails():
+    """An ask no pool model solves is not a routing failure. It must charge zero regret to everyone,
+    rather than dragging every miner down the way an accuracy average does."""
+    from thirtyspokes.koth.verify import regret_stats
+    ref = _refrec(scores=[[1., 1.], [0., 0.], [0., 0.]])
+    got = regret_stats(_rvd([1., 0., 0.], [0.001, 0.001, 0.001]).per_task, ref)
+    assert got["quality_regret"] == pytest.approx(0.0)
+    assert got["asks_nobody_solves"] == 2
+
+
+def test_reference_drives_the_router_scalar_end_to_end(env):
+    """The whole point: with a published reference the reign scalar becomes frontier-relative."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    from thirtyspokes.reign import KingChain
+    # an oracle router: cheap on the ask cheap can solve, pricey on the other -> full quality, low cost
+    vd = _rvd([1., 1.], [0.001, 0.1])
+    rec = {**_rec(), "task_ids": ["t0", "t1"]}
+    v = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
+                      pool_reference=lambda e, n: rec)
+    assert v._reign_scalar(vd, epoch=7, nonce="n7") == pytest.approx(1.0, abs=1e-6)

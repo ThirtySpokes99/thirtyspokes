@@ -412,16 +412,31 @@ def test_kingchain_copy_cannot_steal_the_crown_by_seniority():
     assert "copy" not in r.weights, "a copy that never held the crown earns nothing"
 
 
-def test_kingchain_recommit_re_enters_unprotected():
-    """A re-commit is a NEW artifact: it loses incumbency protection and seniority (arch 6f)."""
+def test_kingchain_recommit_keeps_the_crown_but_not_a_fresh_eps_clock():
+    """Re-committing (i.e. IMPROVING your agent) must not cost you the crown, and must not buy you
+    a refreshed eps shield either.
+
+    The eps clock is keyed to the REIGN (`_king_since`), not the artifact. Artifact-keyed age made
+    the incumbent lookup miss on a re-commit, so a 15-epoch champion that shipped an improvement
+    silently forfeited its earned protection and lost the crown to a challenger it still out-scored
+    — punishing exactly the behaviour the subnet exists to reward. Reign-keyed age fixes that while
+    still closing the arch-6f gaming vector, because re-committing no longer resets the clock.
+    """
     from thirtyspokes.reign import KingChain, Submission
     kc = KingChain(eps0=0.02)
     old = Submission("a", "a", 10, 0.90)
     for _ in range(12):
         kc.update([old])                                     # a is a long-lived incumbent (eps decays)
-    fresh = Submission("a", "a", 500, 0.90)                  # same miner, NEW artifact
-    r = kc.update([fresh, Submission("b", "b", 20, 0.915)])  # b beats the fresh artifact's raw score
-    assert r.slots[0] == "b", "a re-commit must not inherit the old artifact's eps protection"
+    aged_eps = kc.eps(kc._king_age())
+    fresh = Submission("a", "a", 500, 0.90)                  # same miner, NEW (improved) artifact
+    # (a) a challenger INSIDE the margin still cannot take the crown from a re-committing king
+    r = kc.update([fresh, Submission("b", "b", 20, 0.90 + aged_eps / 2)])
+    assert r.slots[0] == "a", "shipping an improvement must not forfeit earned incumbency"
+    # (b) but the re-commit bought no fresh shield: the margin is still the AGED one, not eps0
+    assert kc.eps(kc._king_age()) < kc.eps0 / 2, "a re-commit must not refresh eps protection"
+    # (c) and a challenger that genuinely clears the aged margin still wins
+    r = kc.update([fresh, Submission("b", "b", 20, 0.99)])
+    assert r.slots[0] == "b", "a genuinely better challenger must still be able to dethrone"
 
 
 def test_kingchain_snapshot_restore_roundtrip():
@@ -434,3 +449,123 @@ def test_kingchain_snapshot_restore_roundtrip():
     assert kc2.king.sub.miner_id == "b"
     assert [s.miner_id for s in kc2.chain] == ["a"]
     assert kc2.update([_sub("a", 0.5), _sub("b", 0.7)]).weights == {"b": 0.5, "a": 0.5}
+
+
+# --- LIVENESS: emissions pay for WORK, never for a vested seat -----------------------------------
+# Regression tests for the emission-capture exploits found by auditing the mining side. Before these,
+# `KingChain` consulted only seat MEMBERSHIP + registration at payout, never whether the holder had
+# actually submitted, so a miner could be crowned once and then draw its share forever.
+
+def test_kingchain_idle_ex_king_earns_nothing():
+    """THE headline exploit: take the crown once, go dark, collect forever.
+
+    Measured before the fix: an ex-king that never submitted again drew 50% of emissions across 50
+    idle epochs — the same rate as the miner that actually worked and paid for inference every one
+    of them."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain()
+    kc.update([_sub("idle", 0.50)])                          # idle takes the vacant crown
+    kc.update([_sub("idle", 0.50), _sub("worker", 0.99)])    # worker dethrones it -> idle -> chain
+    assert "idle" in {s.miner_id for s in kc.chain}
+    earned = sum(kc.update([_sub("worker", 0.99)]).weights.get("idle", 0.0) for _ in range(50))
+    assert earned == 0.0, "an ex-king that stops submitting must earn nothing"
+
+
+def test_kingchain_evicts_a_seat_after_the_absence_grace():
+    """A missed epoch is forgiven (real CVM boots are flaky); sustained absence is not."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain(absent_grace=3)
+    kc.update([_sub("a", 0.50)])
+    kc.update([_sub("a", 0.50), _sub("b", 0.99)])            # b king, a in chain
+    for i in range(1, 3):                                    # a misses 1..2 -> still seated
+        kc.update([_sub("b", 0.99)])
+        assert "a" in {s.miner_id for s in kc.chain}, f"evicted too early at miss {i}"
+    kc.update([_sub("b", 0.99)])                             # third consecutive miss -> evicted
+    assert "a" not in {s.miner_id for s in kc.chain}
+    # and coming back does not restore the seat — you must retake the crown
+    r = kc.update([_sub("a", 0.50), _sub("b", 0.99)])
+    assert "a" not in r.weights
+
+
+def test_kingchain_absent_king_keeps_the_crown_and_the_eps_bar():
+    """Withholding one epoch used to hand the crown to ANY submitter, unguarded: a 21-epoch
+    champion lost to a 0.01-scoring agent by missing a single upload. An absent king now retains
+    the title (unpaid) and goes on setting the eps bar until its grace runs out."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain(absent_grace=3)
+    for _ in range(21):
+        kc.update([_sub("champ", 0.90)])
+    r = kc.update([_sub("usurper", 0.01)])                   # champ withholds ONE epoch
+    assert r.slots[0] == "champ" and not r.coronation, "absence must not be a cheap handoff"
+    assert r.weights.get("champ", 0.0) == 0.0, "...but an absent king is not paid either"
+    assert r.weights == {"usurper": 1.0} or r.burn == 1.0
+    # a genuinely better challenger can still take an absent king's crown immediately
+    r = kc.update([_sub("better", 0.99)])
+    assert r.slots[0] == "better" and r.coronation
+
+
+def test_kingchain_delinquent_king_vacates_and_gets_no_pension():
+    """Once the grace is exhausted the crown truly vacates — and a king that lost it by going dark
+    does NOT get a pension seat, or 'abdicate then collect' would just be the exploit again."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain(absent_grace=2)
+    kc.update([_sub("dead", 0.90)])
+    kc.update([_sub("live", 0.10)])                          # miss 1: dead retains (live is worse)
+    assert kc.king.sub.miner_id == "dead"
+    r = kc.update([_sub("live", 0.10)])                      # miss 2: grace exhausted -> vacates
+    assert r.slots[0] == "live" and kc.king.sub.miner_id == "live"
+    assert "dead" not in {s.miner_id for s in kc.chain}, "a delinquent king must not be pensioned"
+    assert "dead" not in r.weights
+
+
+def test_kingchain_sybil_crown_rotation_captures_nothing():
+    """A cartel used to rotate the crown through 5 self-owned hotkeys and then stop entirely,
+    holding 100% of emissions and capping any honest miner at 1/5 of the pot."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain(absent_grace=3)
+    sybils = [f"S{i}" for i in range(5)]
+    for i, s in enumerate(sybils):                            # each takes a turn submitting alone
+        kc.update([_sub(s, 0.30, block=i + 1)])
+    r = kc.update([_sub("S4", 0.30, block=5)])                # cartel now mostly idle
+    assert sum(w for m, w in r.weights.items() if m in sybils) <= 1.0
+    idle = [m for m in sybils if m != "S4"]
+    assert all(r.weights.get(m, 0.0) == 0.0 for m in idle), "idle sybils must earn nothing"
+    r = kc.update([_sub("honest", 0.99, block=99)])           # an honest miner arrives
+    assert r.weights.get("honest") == 1.0, "a better honest miner must not be capped by idle seats"
+
+
+def test_kingchain_burns_when_no_miner_is_live():
+    """An epoch nobody submits must BURN, not silently keep paying the last slate."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain()
+    kc.update([_sub("a", 0.9)])
+    kc.update([_sub("a", 0.9), _sub("b", 0.95)])
+    r = kc.update([])                                         # nobody submits
+    assert r.burn == 1.0 and r.weights == {"uid0": 1.0}
+
+
+def test_kingchain_live_set_overrides_candidacy():
+    """Under `scoring_mode="accumulate"` a miner that MISSED the epoch is still scored (miss=0) and
+    so is still a candidate. Paying on candidacy would reopen the pension, so liveness is passed
+    explicitly and must win over mere presence in `candidates`."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain()
+    kc.update([_sub("a", 0.90)])
+    kc.update([_sub("a", 0.90), _sub("b", 0.99)])             # b king, a in chain
+    r = kc.update([_sub("a", 0.90), _sub("b", 0.99)], live={"b"})   # a is a candidate but ABSENT
+    assert r.weights == {"b": 1.0}, "a scored-but-absent candidate must not be paid"
+
+
+def test_kingchain_liveness_state_survives_a_restart():
+    """Miss counters must persist, else every validator restart forgives every absence and the
+    pension reopens for `absent_grace` epochs at a time."""
+    from thirtyspokes.reign import KingChain
+    kc = KingChain(absent_grace=2)
+    kc.update([_sub("a", 0.50)])
+    kc.update([_sub("a", 0.50), _sub("b", 0.99)])
+    kc.update([_sub("b", 0.99)])                              # a: miss 1
+    kc2 = KingChain(absent_grace=2)
+    kc2.restore(kc.snapshot())
+    assert kc2._misses.get("a") == 1
+    kc2.update([_sub("b", 0.99)])                             # miss 2 -> evicted, not forgiven
+    assert "a" not in {s.miner_id for s in kc2.chain}

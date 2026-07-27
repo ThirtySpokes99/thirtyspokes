@@ -62,4 +62,5 @@ def _mc_pool(prefix: str, lo: int, hi: int, count: int, seed: int):
 def make_gpqa() -> PooledBenchmark:
     pool, a1 = _mc_pool("pool", 2, 15, 40, seed=505)
     held, a2 = _mc_pool("held", 16, 30, 40, seed=606)   # disjoint operand range
-    return PooledBenchmark("gpqa", 0.23, pool, held, grade_choice, {**a1, **a2})
+    # weight 0 — floor only; multiple choice is undefendable by proof-inspection (see mmlu.py)
+    return PooledBenchmark("gpqa", 0.0, pool, held, grade_choice, {**a1, **a2})

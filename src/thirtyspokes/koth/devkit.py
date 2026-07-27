@@ -51,6 +51,12 @@ def main() -> None:
     p.add_argument("--model", default="strong", help="reference router's pool model")
     p.add_argument("--n-per-bench", type=int, default=8)
     p.add_argument("--budget", type=float, default=0.5)
+    p.add_argument("--real", action="store_true",
+                   help="score against the LIVE suite (LiveCodeBench ranked + MMLU/GSM8K floors) "
+                        "over real pool models instead of the offline synthetic stand-in. Needs "
+                        "OPENROUTER_API_KEY (you pay for the calls) and Docker (code is graded by "
+                        "running it). This is what the validator actually scores.")
+    p.add_argument("--pool", help="--real: comma-separated pool models (default: --model only)")
     args = p.parse_args()
 
     if args.source:
@@ -58,7 +64,27 @@ def main() -> None:
         art = Artifact(open(args.source).read(), weights, "dev")
     else:
         art = reference_artifact(args.model)
-    r = evaluate(art, pool_backend=MockPool(), suite=default_suite(),
+
+    if args.real:
+        # The offline default uses a SYNTHETIC suite and a mock pool: it proves your agent loads,
+        # calls the pool and returns answers. It cannot tell you whether you can actually route,
+        # because the mock pool's difficulty is made up. This path is the real thing.
+        from ..eval import config
+        from ..gateway.gateway import OpenRouterBackend
+        from .benchmarks import real_suite
+        from .pool import PinnedBackend
+        cfg = config.LiveConfig()
+        cfg.require_key()
+        models = ([m.strip() for m in args.pool.split(",") if m.strip()] if args.pool
+                  else [args.model])
+        backend = PinnedBackend(
+            OpenRouterBackend(cfg.api_key, cfg.base_url, timeout=300.0, max_retries=2,
+                              price_fn=config.price_for), set(models))
+        suite, pool = real_suite(), backend
+    else:
+        suite, pool = default_suite(), MockPool()
+
+    r = evaluate(art, pool_backend=pool, suite=suite,
                  n_per_bench=args.n_per_bench, budget=args.budget)
     print(json.dumps(r, indent=2))
 

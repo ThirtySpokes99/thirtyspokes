@@ -55,4 +55,8 @@ def _mc_pool(prefix: str, lo: int, hi: int, count: int, seed: int):
 def make_mmlu() -> PooledBenchmark:
     pool, a1 = _mc_pool("pool", 2, 15, 40, seed=303)
     held, a2 = _mc_pool("held", 16, 30, 40, seed=404)   # disjoint operand range
-    return PooledBenchmark("mmlu", 0.22, pool, held, grade_choice, {**a1, **a2})
+    # weight 0: multiple choice cannot be defended against memorization by proof-inspection (the
+    # answer is in the prompt by construction), so it is an ELIGIBILITY FLOOR, never ranked.
+    # `eligible` still requires acc >= f_min here, so a broken agent is caught; memorizing it
+    # earns nothing. Same policy as the live suite — see benchmarks.real_suite.
+    return PooledBenchmark("mmlu", 0.0, pool, held, grade_choice, {**a1, **a2})

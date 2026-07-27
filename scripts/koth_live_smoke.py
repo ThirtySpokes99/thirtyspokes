@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Stage-0b live smoke: the decoupled KOTH subnet with REAL components.
 
-Real model backend (OpenRouter), real benchmarks (MMLU + GSM8K with real gold), the
+Real model backend (OpenRouter), the real live suite (LiveCodeBench ranked + MMLU/GSM8K
+floors, real gold), the
 reference single-shot agent. One miner publishes + produces an attested proof by
 actually calling a model; the validator independently downloads it, grades the
 answers against real gold, runs the fresh-probe audit (real calls), and scores.
@@ -43,7 +44,9 @@ def main():
     chain = LocalFileChain(f"{root}/chain"); store = LocalBundleStore(f"{root}/store")
     chain.register("burn")
     platform = Platform()
-    print(f"loading real MMLU + GSM8K...", flush=True)
+    # n_load sizes the MMLU/GSM8K floors only; the code benchmark always loads its full
+    # 112-problem pool. Grading code answers needs Docker (see docs/VALIDATOR.md).
+    print("loading the live suite (LiveCodeBench + MMLU/GSM8K floors)...", flush=True)
     suite = real_suite(n_load=12, seed=1)
 
     val = KOTHValidator({runtime_measurement()}, platform.public_hex, chain, KingChain(),

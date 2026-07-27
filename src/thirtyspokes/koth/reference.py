@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 
 from .benchmarks import Benchmark, bench_seed
 
@@ -345,6 +347,17 @@ def main() -> None:
         return
     path = publish(rec, wallet_signer(chain.wallet))
     print(f"  published {path} (signed by {chain.wallet.hotkey.ss58_address})")
+
+    # THE DEADLINE BOUNDS THE WAIT; THIS BOUNDS THE PROCESS. A worker thread stuck inside a provider
+    # call cannot be cancelled, and `ThreadPoolExecutor`'s threads are non-daemon — Python's atexit
+    # handler JOINS them, so the interpreter refuses to exit long after the work is finished.
+    # Observed on the first live publish: the record uploaded successfully, then the process sat
+    # 20+ minutes on 4.5 seconds of CPU with no sockets open, waiting on one wedged call. Run every
+    # epoch from cron, that leaks a process per occurrence forever. The record is already published
+    # and the stuck thread holds nothing we need, so leave immediately rather than tidily.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,43 @@ have paid for it and saved nothing.
 entering the ladder at the cheapest rung scores **+0.9305** against a per-ask oracle of **+0.9319**.
 The band left for a routing model is **0.0014**. The value lives in the harness, not the miner.
 
+## The final measurement: specialisation, tested and refuted
+
+The one surviving hypothesis was that routing fails on *difficulty* (unpredictable from a prompt) but
+would work on *domain* (trivially predictable). Testing it needs a combination no earlier measurement
+had: mixed-domain traffic **and** a pool containing genuine specialists. Three-way control:
+
+| configuration | captured |
+|---|---|
+| **A** mixed-domain + specialist pool (11 models incl. code-llama) | **13.3%** |
+| **B** mixed-domain + ladder pool (5 curated, no specialists) | **15.6%** |
+| **C** single-domain + specialist pool (median of 5 domains) | **2.6%** |
+
+**Half the hypothesis was right.** Domain routing *is* learnable — mixed-domain traffic captures
+13–16% against 2.6% single-domain, because a router can read the domain off the prompt where it
+cannot read luck.
+
+**It changes nothing, because the pool has a dominator.** Per-domain accuracy over the 11-model pool:
+
+| model | code | law | commonsense | math | knowledge |
+|---|---|---|---|---|---|
+| **gpt-4-1106-preview** | **0.686** | **0.675** | **0.837** | **0.956** | **0.910** |
+| code-llama-instruct-34b | 0.518 | 0.004 | 0.228 | 0.476 | 0.007 |
+| Yi-34B-Chat | 0.386 | 0.484 | 0.730 | 0.680 | 0.796 |
+
+**Distinct per-domain winners: 1 of 5.** The nominal specialist is *worse at its own specialty* than
+the generalist (0.518 vs 0.686) and useless elsewhere — narrow and strictly worse, not orthogonal.
+Its wins are a subset of gpt-4's. Adding specialists to the pool made routing slightly **worse**
+(13.3% vs 15.6%): extra actions that are never correct are pure liability.
+
+**So the requirement, stated exactly:**
+
+> Routing needs **a model that beats the frontier model at something, cheaply** — genuinely
+> orthogonal competence, not a cheaper or narrower model.
+
+No pool measured in this project has one. Not RouterBench's 2024 models here, and not the 2026
+frontier models in the specialist-ceiling run. Two model generations, same structure.
+
 ## What this does *not* claim
 
 - **Specialisation is untested at power.** The most specialisation-bearing benchmark (`chinese_zodiac`)

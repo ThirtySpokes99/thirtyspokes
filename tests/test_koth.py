@@ -3169,3 +3169,57 @@ def test_router_copy_dedup_is_off_by_default():
     from thirtyspokes.koth.validator import KOTHValidator
     import inspect
     assert inspect.signature(KOTHValidator.__init__).parameters["dedup_max_l1"].default == 0.0
+
+
+def test_attestation_gate_imports_without_the_economics_stack():
+    """The surviving asset must stay extractable (docs/ASSET.md).
+
+    `verify_proof` used to do two unrelated jobs in one function — check the hardware claim, and
+    grade benchmarks for an economic score. The routing economics are closed
+    (docs/ROUTING_MEASUREMENTS.md); the attestation claim is not, and it is the thing worth keeping.
+    Fusing them meant you could not import the gate without dragging in frontiers, regret, Wilson
+    bounds and a benchmark suite.
+
+    This asserts the boundary rather than trusting it: a fresh interpreter importing the gate must
+    not pull in any scoring module. It fails the moment someone reaches back across the split, which
+    is exactly when the cost of re-separating it is lowest.
+    """
+    import subprocess
+    import sys
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import thirtyspokes.koth.attest, sys;"
+         "econ={'verify','validator','reign','evidence','benchmarks','reference','router','train'};"
+         "hit=sorted(m for m in sys.modules if m.startswith('thirtyspokes')"
+         " and m.rsplit('.',1)[-1] in econ);"
+         "print(','.join(hit))"],
+        capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "", f"attestation gate now imports economics: {out.stdout.strip()}"
+
+
+def test_attestation_gate_and_verify_proof_agree_on_rejection(env):
+    """The extraction must be behaviour-preserving, not merely tidy: the same tampered proof has to
+    be rejected for the same reason through both entry points."""
+    import dataclasses
+
+    from thirtyspokes.koth.attest import verify_attestation
+
+    art = _art(_ROUTER_SRC, env.allk)
+    proof = _proof(env, art, "hk")
+    kw = dict(approved_measurements=env.approved, platform_public_hex=env.platform.public_hex,
+              expect_epoch=1, expect_nonce="n1", expect_hotkey="hk",
+              expect_source_hash=art.source_hash, expect_weights_hash=art.weights_hash)
+    assert verify_attestation(proof, **kw) is None
+    assert _verify(env, proof, art, "hk").valid
+
+    # replay: an authentic proof answering a DIFFERENT challenge than the one issued
+    replay = dict(kw, expect_nonce="OTHER-nonce")
+    assert verify_attestation(proof, **replay) == "epoch_nonce_mismatch"
+    assert _verify(env, proof, art, "hk", expect_nonce="OTHER-nonce").reason == \
+        "epoch_nonce_mismatch"
+
+    # tampering: editing any field breaks report_data first, because the quote commits to all of
+    # them — the nonce check never even runs, which is the binding doing its job
+    tampered = dataclasses.replace(proof, nonce="OTHER-nonce")
+    assert verify_attestation(tampered, **kw) == "report_data_mismatch"
+    assert _verify(env, tampered, art, "hk").reason == "report_data_mismatch"

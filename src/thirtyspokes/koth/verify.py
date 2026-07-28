@@ -32,7 +32,7 @@ import numpy as np
 
 from ..gateway import signing
 from ..gateway.grader import extract_number
-from ..tee.attestation import verify_quote
+from .attest import verify_attestation
 from .benchmarks import Benchmark, bench_seed, extract_choice, grade_choice, grade_patch
 from .evidence import wilson_lcb
 from .proof import Proof
@@ -115,70 +115,22 @@ def verify_proof(
     def bad(reason: str) -> ProofVerdict:
         return ProofVerdict(False, reason)
 
-    q = proof.quote
-    if q is None:
-        return bad("bad_platform_quote")
-    is_tdx = q.platform_sig.startswith("tdx:")
-    if enforce:
-        # PRODUCTION FAIL-CLOSED (docs/DESIGN.md §8). The miner's own CVM samples AND runs the
-        # benchmark, so the score is trustworthy ONLY if the audited, measured runtime
-        # provably ran — the one thing a trustless miner cannot forge. A tampered runtime
-        # can forge every payload field (source/weights hash, cost, answers, and the
-        # self-reported `measurement` string), so the sole real anchor is the hardware
-        # quote gated on an owner-pinned measured image (MRTD + boot RTMR1/2 + runtime
-        # RTMR3) under a TCB policy. A missing gate is a config error that would silently
-        # admit a forged runtime — so it DQs here rather than skipping the check.
-        if not is_tdx:
-            return bad("mock_quote_rejected")             # mock vendor key = zero security
-        if not approved_mrtd:
-            return bad("mrtd_gate_unset")
-        if not approved_rtmr or not {1, 2, 3} <= set(approved_rtmr):
-            return bad("rtmr_gate_unset")                 # need boot RTMR1/2 + runtime RTMR3
-        if tcb_accept is None:
-            return bad("tcb_policy_unset")                # enforce ⇒ full DCAP (TCB/CRL/QE)
-        if not proof.confined:
-            # The agent ran with network egress. The measured-image gates above prove WHICH image
-            # booted, not what it did inside — and an unconfined agent can reach an off-allow-list
-            # model using a key embedded in its own weights, voiding the pool pinning, the metered
-            # cost and the budget ceiling while still satisfying `no_pool_call` with one token call.
-            # `run_agent_confined` degrades silently when the namespace probe fails, so this is
-            # gated on the ATTESTED fact rather than on the miner's configuration.
-            return bad("unconfined_agent")
-    if is_tdx:                                            # WS7: real Intel-TDX hardware quote
-        # `tcb_accept` set -> full DCAP (TCB status/CRL/QE-identity via dcap-qvl, H1);
-        # else the offline crypto-chain-only path (cert chain to Intel root + binding).
-        if tcb_accept is not None:
-            from .tdx import verify_tdx_quote_field_full
-            vq = verify_tdx_quote_field_full(
-                q, approved_mrtd=approved_mrtd, approved_rtmr=approved_rtmr,
-                tcb_accept=tcb_accept, collateral=collateral, pccs_url=pccs_url, now=now)
-        else:
-            from .tdx import verify_tdx_quote_field     # lazy: needs `cryptography` on real HW
-            vq = verify_tdx_quote_field(q, approved_mrtd=approved_mrtd)
-        if not vq.ok:
-            if vq.reason == "mrtd_not_approved" or vq.reason.startswith("rtmr"):
-                return bad("unapproved_runtime")       # hardware image not owner-approved
-            if vq.reason.startswith("tcb_"):
-                return bad(vq.reason)                  # surface the TCB status distinctly
-            return bad("bad_platform_quote")
-    elif not verify_quote(q, platform_public_hex):     # offline/dev mock vendor key
-        return bad("bad_platform_quote")
-    if q.measurement != proof.measurement:
-        return bad("measurement_mismatch")
-    if q.report_data != proof.report_data():
-        return bad("report_data_mismatch")            # payload tampered post-attestation
-    if proof.measurement not in approved_measurements:
-        return bad("unapproved_runtime")
-    if (proof.epoch, proof.nonce) != (expect_epoch, expect_nonce):
-        return bad("epoch_nonce_mismatch")            # replay / stale / best-of-N
-    if proof.hotkey != expect_hotkey:
-        return bad("hotkey_mismatch")                 # a copier resubmitting someone's proof
-    if proof.source_hash != expect_source_hash or proof.weights_hash != expect_weights_hash:
-        return bad("artifact_binding_mismatch")       # not the downloaded/committed artifact
+    # 1. IS THIS PROOF AUTHENTIC AND BOUND? Quote -> approved image -> payload -> issued challenge ->
+    #    artifact. Lives in `attest.py` because it is the half of this function that does not depend
+    #    on the routing economics, and is the capability that outlives them (docs/ASSET.md).
+    reason = verify_attestation(
+        proof, approved_measurements=approved_measurements,
+        platform_public_hex=platform_public_hex, expect_epoch=expect_epoch,
+        expect_nonce=expect_nonce, expect_hotkey=expect_hotkey,
+        expect_source_hash=expect_source_hash, expect_weights_hash=expect_weights_hash,
+        approved_mrtd=approved_mrtd, approved_rtmr=approved_rtmr, tcb_accept=tcb_accept,
+        collateral=collateral, pccs_url=pccs_url, now=now, enforce=enforce)
+    if reason:
+        return bad(reason)
     c = proof.total_cost_usd
-    if not (c == c) or c < 0:                          # NaN / negative
-        return bad("bad_cost")
 
+    # 2. WHAT DID IT SCORE? Everything below is subnet economics: re-derive the slice the runtime was
+    #    told to run, grade the attested answers against public gold, and reduce to the reign scalar.
     # re-derive the assigned slice + gold, and index the attested answers
     submitted = {(r.benchmark, r.task_id): r for r in proof.results}
     per_bench: dict[str, BenchStat] = {}

@@ -32,15 +32,17 @@ tampered variants.
 | `koth/confine.py` (233) | no-egress execution (netns) with secrets hidden, metered parent-side; **the confinement fact is itself attested**, not merely configured |
 | `koth/store.py`, `koth/imagestore.py` | content-addressed artifact + image distribution |
 | `scripts/build_koth_image_prod.sh` | **reproducible** dm-verity measured image — two builds in different directories produce a byte-identical UKI and roothash |
-| `verify_proof`'s attestation half | quote → approved measurement → payload binding → issued epoch/nonce → artifact binding |
+| `koth/attest.py` (125) | **the gate, now standalone**: quote → approved measurement → payload binding → issued epoch/nonce → artifact binding. Imports only `tee/attestation` + `proof`; a test asserts it pulls in **no** scoring module, so the boundary cannot silently rot |
 
 **Coupled to the dead thesis (~2,300 lines):** `reign.py` (emissions), `koth/validator.py` (scoring
 loop), `koth/reference.py` (pool matrix), `koth/{commit,epoch,owner,governance}.py` (chain), and the
 scoring half of `koth/verify.py` (headroom, regret, frontiers, grounding, dedup, eligibility).
 
-Note `koth/verify.py` is **mixed** — attestation verification and economics live in one 797-line
-file. Extraction would need to split it; the boundary is clean (roughly `verify_proof` and above vs
-`_wmean` and below) but it is not a file move.
+~~Note `koth/verify.py` is **mixed**~~ — **DONE.** The attestation gate was extracted to
+`koth/attest.py`; `verify_proof` now calls it and keeps only the grading half, with its two jobs
+labelled in place. Behaviour is unchanged (a test asserts both entry points reject the same proof for
+the same reason) and the separation is pinned by a test that imports the gate in a fresh interpreter
+and fails if any economics module appears. The remaining coupling in `verify.py` is scoring-only.
 
 ## Hard-won details that would be re-learned expensively
 

@@ -3048,3 +3048,77 @@ def test_router_run_produces_an_attested_decision_proof(env, monkeypatch):
                       expect_weights_hash=proof.weights_hash,
                       suite=env.suite, n_per_bench=2)
     assert vd.valid, vd.reason
+
+
+# --- Phase 2: score the DECISION from the reference, not the outcome -----------------------------
+
+def _casc_ref(n=4):
+    """3 rungs cheap->expensive. Ask 0: cheap solves+verifies. Ask 1: only the top rung solves.
+    Ask 2: cheap answer is unverifiable so the ladder must escalate. Ask 3: nobody solves."""
+    from thirtyspokes.koth.runtime import SUITE_VERSION
+    S = [[1., 1., 1.], [0., 0., 1.], [0., 1., 1.], [0., 0., 0.]][:n]
+    V = [[True, True, True], [False, False, True], [False, True, True], [True, True, True]][:n]
+    C = [[0.001, 0.01, 0.10]] * n
+    return {"v": 1, "epoch": 1, "nonce": "n", "suite_version": SUITE_VERSION, "n_per_bench": n,
+            "models": ["cheap", "mid", "top"], "task_ids": [f"t{i}" for i in range(n)],
+            "benchmarks": ["code"] * n, "scores": S, "costs": C, "verifier_ok": V}
+
+
+def test_cascade_outcomes_reconstruct_every_entry_point():
+    """The validator must know what EVERY choice would have produced, or it cannot say whether the
+    miner chose well. Semantics must match `cascade.to_cascade_cache` so offline training and live
+    scoring agree."""
+    from thirtyspokes.koth.verify import cascade_outcomes
+    correct, cost = cascade_outcomes(_casc_ref(), [0, 1, 2])
+    # ask 0: entering cheap banks immediately — correct, and only the cheap rung is paid for
+    assert correct[0, 0] == 1.0 and cost[0, 0] == pytest.approx(0.001)
+    # ask 1: cheap+mid are rejected by the verifier, so entering low escalates all the way and still
+    # lands correct — but pays for all three rungs
+    assert correct[1, 0] == 1.0 and cost[1, 0] == pytest.approx(0.111)
+    assert correct[1, 2] == 1.0 and cost[1, 2] == pytest.approx(0.10)   # entering top pays once
+    # ask 3: nobody solves it; the ladder still runs to the top and banks a wrong answer
+    assert correct[3, 0] == 0.0
+
+
+def test_decision_regret_credits_the_choice_not_the_luck():
+    """Under the fixed harness the decision IS the miner's contribution. An oracle router takes zero
+    regret; a router that always burns the top rung pays for it even though its accuracy is fine."""
+    from thirtyspokes.koth.verify import decision_regret
+    ref, order = _casc_ref(), [0, 1, 2]
+    oracle = decision_regret({"t0": 0, "t1": 2, "t2": 1, "t3": 0}, ref, order)
+    always_top = decision_regret({f"t{i}": 2 for i in range(4)}, ref, order)
+    assert oracle["decision_regret"] == pytest.approx(0.0, abs=1e-9)
+    assert oracle["decision_quality"] == pytest.approx(1.0)
+    assert always_top["decision_regret"] > oracle["decision_regret"]
+    # an ask where every entry point ties is charged to nobody
+    assert always_top["asks_no_decision"] >= 0 and always_top["asks_matched"] == 4
+
+
+def test_dedup_on_distributions_spares_honest_convergent_routers():
+    """MEASURED: independently-trained honest routers reach 0.954 argmax agreement — above the 0.95
+    copy threshold — so argmax dedup would DQ them. The realistic shape is routers that agree on
+    WHICH rung but differ in confidence; soft distributions separate that from copied weights."""
+    import numpy as np
+
+    from thirtyspokes.koth.verify import behavioral_duplicates, distribution_duplicates
+    rng = np.random.default_rng(0)
+    base = rng.dirichlet(np.ones(3), size=40)
+    sharp = base ** 3                                    # same argmax, very different confidence
+    honest = sharp / sharp.sum(axis=1, keepdims=True)
+    copy = np.clip(base + rng.normal(0, 0.002, base.shape), 1e-6, None)
+    copy /= copy.sum(axis=1, keepdims=True)              # the same weights, jittered
+    blocks = {"orig": 1, "honest": 2, "copier": 3}
+    fps = {"orig": base, "honest": honest, "copier": copy}
+
+    l1_honest = float(np.abs(honest - base).sum(axis=1).mean())
+    l1_copy = float(np.abs(copy - base).sum(axis=1).mean())
+    assert l1_honest > l1_copy * 10, "the two cases must be separable at all"
+
+    # argmax agreement cannot tell them apart — it flags the honest router as a copy
+    argmax_fp = {k: tuple(v.argmax(axis=1)) for k, v in fps.items()}
+    flagged = behavioral_duplicates(argmax_fp, blocks, agree=0.95)
+    assert "honest" in flagged, "argmax dedup should false-positive here — that is why it is replaced"
+
+    losers = distribution_duplicates(fps, blocks)
+    assert losers.get("copier") == "orig", "a weight-perturbing copier must still be caught"
+    assert "honest" not in losers, "an honestly convergent router must NOT be flagged"

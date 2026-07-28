@@ -140,9 +140,16 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
         try:
             text, _tin, _tout, cost = backend.complete(
                 model, [{"role": "user", "content": t.prompt}], dict(params))
-            return i, model, float(bench.grade(text, t.gold)), float(cost)
+            # `verifier_ok` is what makes the CASCADE scorable. The router's action is "enter the
+            # ladder at rung r", and the outcome of that action depends on whether the pinned
+            # verifier accepts each rung's answer — so without a verdict per (ask, model) a validator
+            # cannot reconstruct what any OTHER entry point would have produced, and therefore cannot
+            # say whether the router chose well. It is the same deterministic parse check the harness
+            # runs live, so the counterfactual matches what would actually have happened.
+            from .harness import verifier_ok
+            return i, model, float(bench.grade(text, t.gold)), float(cost), bool(verifier_ok(text, bench))
         except Exception:                       # noqa: BLE001 — a dead cell must not sink the epoch
-            return i, model, None, 0.0
+            return i, model, None, 0.0, False
 
     jobs = [(i, bt, m) for i, bt in enumerate(tasks) for m in models]
     started = time.monotonic()
@@ -152,8 +159,8 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
         done = 0
         try:
             for f in as_completed(futures, timeout=deadline_s):
-                i, model, score, cost = f.result()
-                cells[(i, model)] = (score, cost)
+                i, model, score, cost, vok = f.result()
+                cells[(i, model)] = (score, cost, vok)
                 done += 1
                 if progress:
                     progress(done, len(jobs))
@@ -173,7 +180,7 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
     # frontiers (a missing expensive model makes the pool look cheaper AND weaker than it is), and
     # after a deadline some cells were never recorded at all.
     keep = [i for i in range(len(tasks))
-            if all(cells.get((i, m), (None, 0.0))[0] is not None for m in models)]
+            if all(cells.get((i, m), (None, 0.0, False))[0] is not None for m in models)]
     from .runtime import SUITE_VERSION
     return {
         "v": 1,
@@ -189,6 +196,8 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
         "benchmarks": [tasks[i][0].name for i in keep],
         "scores": [[cells[(i, m)][0] for m in models] for i in keep],
         "costs": [[cells[(i, m)][1] for m in models] for i in keep],
+        # per-cell pinned-verifier verdict — required to score the cascade action space (see `one`)
+        "verifier_ok": [[cells[(i, m)][2] for m in models] for i in keep],
     }
 
 

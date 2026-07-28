@@ -753,6 +753,103 @@ def regret_stats(per_task, ref: dict) -> dict:
     }
 
 
+def cascade_outcomes(ref: dict, order: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """From the reference, derive what EVERY ladder entry point would have produced.
+
+    `(correct, cost)` of shape (asks, rungs): entering at rung r means invoking rungs r, r+1, … in
+    price order, stopping at the first the pinned verifier accepts (or at the top), banking that
+    rung's correctness and paying for everything invoked. Identical semantics to
+    `cascade.to_cascade_cache`, so what a miner trained against offline is what is scored here.
+
+    This is what makes the DECISION scorable rather than just the outcome. The miner's proof says
+    which rung it entered; this table says what every other choice would have produced on the same
+    ask, so "was that a good decision" becomes a lookup instead of a re-execution.
+    """
+    S = np.asarray(ref["scores"], float)
+    C = np.asarray(ref["costs"], float)
+    V = np.asarray(ref.get("verifier_ok") or np.ones_like(S, dtype=bool), bool)
+    Q, K = S.shape
+    correct = np.zeros((Q, len(order)), float)
+    cost = np.zeros((Q, len(order)), float)
+    for r in range(len(order)):
+        banked = np.zeros(Q, float)
+        spent = np.zeros(Q, float)
+        done = np.zeros(Q, bool)
+        rungs = order[r:]
+        for pos, m in enumerate(rungs):
+            active = ~done
+            spent[active] += C[active, m]
+            newly = active & (V[:, m] | (pos == len(rungs) - 1))
+            banked[newly] = S[newly, m]
+            done[newly] = True
+        correct[:, r], cost[:, r] = banked, spent
+    return correct, cost
+
+
+def decision_regret(chosen: dict, ref: dict, order: list[int], lam: float = 0.5) -> dict:
+    """Score the ROUTING DECISION against the reference: per ask, how much did this entry point give
+    up versus the best one available?
+
+    Under the fixed harness the decision is the miner's entire contribution, so this — not the answer
+    — is what distinguishes miners. It is also far more statistically efficient than accuracy: binary
+    correctness carries ~1 bit per ask, while regret is continuous and graded against every
+    alternative, so a paired comparison resolves the same gap with materially fewer asks. That
+    matters directly at n_per_bench=8.
+
+    Deterministic by construction: every quantity comes from the owner-signed reference and the
+    miner's attested rung, so two validators computing this cannot disagree.
+    """
+    correct, cost = cascade_outcomes(ref, order)
+    cnorm = float(np.max(cost)) or 1.0
+    obj = correct - lam * (cost / cnorm)              # the cost-aware objective, per (ask, rung)
+    rows = {tid: i for i, tid in enumerate(ref.get("task_ids") or [])}
+    picks = [(rows[t], r) for t, r in chosen.items() if t in rows and 0 <= r < obj.shape[1]]
+    if not picks:
+        return {}
+    idx = [i for i, _ in picks]
+    got = np.array([obj[i, r] for i, r in picks])
+    best = obj[idx].max(axis=1)
+    worst = obj[idx].min(axis=1)
+    span = best - worst
+    return {
+        "asks_matched": len(picks),
+        # 0.0 == chose the best available entry point on every ask
+        "decision_regret": round(float(np.mean(best - got)), 4),
+        # share of the achievable decision span captured; 1.0 = oracle routing, 0.0 = worst choice
+        "decision_quality": round(float(np.mean(np.where(span > 1e-9, (got - worst) / np.maximum(span, 1e-9), 1.0))), 4),
+        # asks where every entry point ties — no decision existed, so nobody is credited or blamed
+        "asks_no_decision": int((span <= 1e-9).sum()),
+    }
+
+
+def distribution_duplicates(fingerprints: dict[str, tuple], commit_block: dict[str, int],
+                            *, max_l1: float = 0.05) -> dict[str, str]:
+    """Copy-dedup on the head's SOFT output rather than its argmax choices.
+
+    Argmax dedup is unsafe here and that is measured, not theoretical: independently-trained HONEST
+    routers reach **0.954** action agreement, above the 0.95 copy threshold `behavioral_duplicates`
+    uses — so on a small action space that rule disqualifies honest miners for convergent evolution.
+    Two heads can genuinely agree on which rung to enter while holding quite different weights.
+
+    Mean L1 distance between distributions separates them: honest convergent routers measured ~0.235
+    mean L1, while copied weights (even perturbed) stay far below. `max_l1` sits between those, and
+    must be re-derived from `scripts/head_spread.py` whenever the encoder, head size or pool changes.
+    """
+    order_hk = sorted(fingerprints, key=lambda h: (commit_block.get(h, 0), h))
+    reps: list[tuple[str, np.ndarray]] = []
+    losers: dict[str, str] = {}
+    for hk in order_hk:
+        fp = np.asarray(fingerprints[hk], float)
+        match = next((rhk for rhk, rfp in reps
+                      if rfp.shape == fp.shape and float(np.abs(fp - rfp).sum(axis=-1).mean()) <= max_l1),
+                     None)
+        if match is None:
+            reps.append((hk, fp))
+        else:
+            losers[hk] = match
+    return losers
+
+
 def trajectory_stats(proof, trace: list[dict]) -> dict:
     """Diagnostics for the INTELLIGENCE LAYER — the half of "routing model + intelligence layer"
     that the scalar cannot see.

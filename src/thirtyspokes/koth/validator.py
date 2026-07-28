@@ -44,6 +44,7 @@ from .verify import (
     frontier_bounds,
     grounding_check,
     memorization_collapsed_relative,
+    decision_regret,
     regret_stats,
     row_weights_for,
     scan_source,
@@ -84,6 +85,10 @@ class _MinerEval:
     sh: str | None = None
     wh: str | None = None
     trajectory: dict | None = None      # intelligence-layer diagnostics (never a reward term)
+    # the proof's per-ask rows, kept because they carry the ROUTING DECISION (chosen_rung,
+    # distribution). The verdict holds graded outcomes; the decision is what the harness architecture
+    # actually pays for, so the validator needs both.
+    proof_results: tuple = ()
 
 
 class KOTHValidator:
@@ -281,6 +286,9 @@ class KOTHValidator:
             "diagnostics": {
                 "pool_reference": (rep.audit.get("pool_reference") if rep else None),
                 "headroom": (rep.audit.get("headroom") if rep else {}) or {},
+                # the fixed-harness score: how good the ROUTING CHOICE was, judged against every
+                # alternative the reference recorded. Empty on the legacy free-agent path.
+                "decision": (rep.audit.get("decision") if rep else {}) or {},
                 "regret": (rep.audit.get("regret") if rep else {}) or {},
                 "trajectory": (rep.audit.get("trajectory") if rep else {}) or {},
             },
@@ -656,7 +664,8 @@ class KOTHValidator:
             traj = trajectory_stats(proof, trace)
         except Exception:                       # noqa: BLE001 — diagnostics must never fail a miner
             traj = {}
-        return E(verdict=vd, fingerprint=fp, audit=audit, trajectory=traj)
+        return E(verdict=vd, fingerprint=fp, audit=audit, trajectory=traj,
+                 proof_results=tuple(proof.results))
 
     def _load_reference(self, epoch: int, nonce: str) -> dict | None:
         """The owner's pool reference record for this epoch, or None. NEVER raises: a reference
@@ -880,6 +889,20 @@ class KOTHValidator:
                     rs = {}
                 if rs:
                     audit_detail.setdefault("regret", {})[hk] = rs
+                # DECISION SCORE (fixed-harness path). Under the harness the routing choice is the
+                # miner's whole contribution, so this scores the CHOICE against every alternative the
+                # reference recorded — rather than the answer, which is the pool's work. Empty on the
+                # legacy free-agent path, where proofs carry no rung.
+                try:
+                    chosen = {r.task_id: r.chosen_rung for r in ev.proof_results or ()
+                              if getattr(r, "chosen_rung", -1) >= 0}
+                    if chosen and ref.get("verifier_ok"):
+                        order = list(range(len(ref.get("models") or [])))
+                        ds = decision_regret(chosen, ref, order)
+                        if ds:
+                            audit_detail.setdefault("decision", {})[hk] = ds
+                except Exception:               # noqa: BLE001 — diagnostics must never fail a miner
+                    pass
             if ev.dq:
                 dq[hk] = ev.dq
                 continue

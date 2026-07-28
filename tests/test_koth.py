@@ -3223,3 +3223,56 @@ def test_attestation_gate_and_verify_proof_agree_on_rejection(env):
     tampered = dataclasses.replace(proof, nonce="OTHER-nonce")
     assert verify_attestation(tampered, **kw) == "report_data_mismatch"
     assert _verify(env, tampered, art, "hk").reason == "report_data_mismatch"
+
+
+def test_a_proof_still_verifies_after_the_payload_gains_fields():
+    """DURABILITY OF THE ATTESTATION CLAIM — the property the whole design rests on.
+
+    `report_data` hashes the payload, and it used to hash `asdict(self)`. So every field added to
+    `Proof` silently changed the hash of every proof ever attested: a genuine proof from last year
+    fails under this year's code, and fails as `report_data_mismatch` — indistinguishable from
+    tampering. A routine upgrade would become a false accusation of forgery against an honest party,
+    which is worse than no verification at all.
+
+    Found on real data: eight recorded Intel-TDX proofs from the hardware run, all authentic, all
+    rejected, because seven fields had been added since. Those live under gitignored `data/`, so this
+    reconstructs the same situation from a hand-built pre-versioning payload.
+    """
+    import json
+
+    from thirtyspokes.gateway import signing
+    from thirtyspokes.koth.proof import Proof
+
+    # exactly the shape proofs had before payload versioning: 11 top-level keys, 4 per result
+    legacy = {
+        "epoch": 75651, "nonce": "914e293c874d2cba", "hotkey": "hk",
+        "source_hash": "aa" * 32, "weights_hash": "bb" * 32, "model_id": "router",
+        "results": [{"benchmark": "math", "task_id": "t1", "answer": "42", "cost_usd": 0.01}],
+        "total_cost_usd": 0.01, "n_calls": 1, "call_log_hash": "cc" * 32,
+        "measurement": "dd" * 32,
+    }
+    # what the runtime of that era hashed, and what its hardware quote therefore committed to
+    attested = signing.sha256_hex(legacy)
+    doc = dict(legacy, quote={"measurement": legacy["measurement"], "platform_sig": "tdx:xyz",
+                              "report_data": attested})
+
+    p = Proof.from_json(json.dumps(doc))
+    assert p.schema == 1, "a proof with no schema key must not claim the current schema"
+    assert p.report_data() == attested, "an old proof no longer verifies — upgrades break history"
+
+    # and the round trip preserves it: re-serializing must not quietly re-shape the payload
+    assert Proof.from_json(p.to_json()).report_data() == attested
+
+    # ...but replaying the OLD SHAPE must not mean replaying the OLD CONTENTS. An earlier version of
+    # this fix returned the stored payload verbatim, so `report_data` ignored what the proof actually
+    # said: editing a graded answer or zeroing the cost still matched the quote. Backward
+    # compatibility that accepts tampering is worse than the incompatibility it cures.
+    import dataclasses
+    edited = dataclasses.replace(p, results=(dataclasses.replace(p.results[0], answer="FORGED"),))
+    assert edited.report_data() != attested, "a tampered legacy proof still verifies"
+    assert dataclasses.replace(p, total_cost_usd=0.0).report_data() != attested
+
+    # a NEW proof declares its schema, so the next field addition is unambiguous rather than silent
+    fresh = Proof(1, "n", "hk", "a", "b", "router", (), 0.0, 0, "h", "m")
+    assert fresh.schema == 2
+    assert "schema" in json.loads(fresh.to_json())

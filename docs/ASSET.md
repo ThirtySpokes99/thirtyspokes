@@ -59,6 +59,28 @@ and fails if any economics module appears. The remaining coupling in `verify.py`
 - **Kernel ≥ 6.6 is load-bearing**, not just for determinism: RTMR3 extension needs the `tdx_guest`
   measurements sysfs, absent on older kernels — where RTMR3 silently stays zero.
 
+## Durability: a defect that would have voided the whole claim
+
+Verifying the recorded hardware proofs while building `scripts/verify_demo.py` found that **none of
+them verified under current code**. `report_data` hashed `asdict(proof)`, so each of the seven fields
+added since they were attested silently changed their hash. The proofs were authentic and
+self-consistent; they failed as `report_data_mismatch` — the same reason a *tampered* proof fails.
+
+That is the worst available failure mode for this capability. "Check it later without trusting the
+claimant" is the entire product, and a routine software upgrade would have turned it into a false
+accusation of forgery against an honest party.
+
+Fixed by versioning the attested payload (`PROOF_SCHEMA`, each version's field list frozen forever);
+proofs written before versioning are verified against the field set they were actually attested with.
+All eight recorded TDX proofs verify again. A first version of that fix replayed the stored payload
+verbatim, which meant `report_data` ignored the proof's contents and a *tampered* legacy proof
+verified — caught immediately by the demo's forgery section, and now pinned by a test. Both are
+regression-tested.
+
+**Generalisable lesson for anything built on this:** an attested payload is a wire format, and its
+shape is part of the signature. It must be versioned from the first line of code, not when the first
+old proof fails.
+
 ## Honest read on where this could go
 
 The obvious direction is verifiable third-party evaluation — attested benchmark results a regulator,

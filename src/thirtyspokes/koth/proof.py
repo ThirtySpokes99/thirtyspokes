@@ -18,7 +18,7 @@ breaks the quote (caught in `verify.py`).
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from ..gateway import signing
 from ..tee.attestation import Platform, Quote
@@ -42,6 +42,31 @@ class BenchmarkResult:
                                    # be honestly convergent, while near-identical distributions are
                                    # the same weights. Measured: independently-trained honest routers
                                    # reach 0.954 argmax agreement, above the old 0.95 copy threshold.
+
+
+# THE ATTESTED PAYLOAD'S SHAPE IS VERSIONED, AND EACH VERSION'S FIELD LIST IS FROZEN FOREVER.
+#
+# `report_data` is a hash of the payload, so when it was built with `asdict(self)` every field added
+# to this dataclass silently changed the hash of EVERY PROOF EVER ATTESTED. A genuine 2026 proof then
+# fails under 2027 code — and fails as `report_data_mismatch`, which is indistinguishable from
+# tampering. A routine software upgrade becomes a false accusation of forgery, and the one claim this
+# whole design rests on ("a third party can check this LATER without re-running it") stops holding.
+#
+# Found by verifying a real recorded Intel-TDX proof from the hardware run: authentic, self-consistent,
+# and rejected, because seven fields had been added since it was attested.
+#
+# To add a field: add a NEW version here. Never edit an existing one.
+PROOF_SCHEMA = 2
+
+_SCHEMA_FIELDS: dict[int, dict[str, tuple[str, ...]]] = {
+    2: {
+        "proof": ("schema", "epoch", "nonce", "hotkey", "source_hash", "weights_hash", "model_id",
+                  "results", "total_cost_usd", "n_calls", "call_log_hash", "measurement",
+                  "confined", "latency_s", "tokens_in", "tokens_out"),
+        "result": ("benchmark", "task_id", "answer", "cost_usd", "chosen_rung", "rungs_used",
+                   "distribution"),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -75,10 +100,35 @@ class Proof:
     tokens_in: int = 0
     tokens_out: int = 0
     quote: Quote | None = None
+    schema: int = PROOF_SCHEMA
+    # The payload as deserialized, for a proof written before payloads were versioned. Only its
+    # SHAPE is used (see `_payload`) — verification must reproduce the field set that was actually
+    # hashed at attestation time, or old proofs read as forged. Never re-serialized into a new proof.
+    legacy_payload: dict | None = field(default=None, compare=False, repr=False)
 
     def _payload(self) -> dict:
-        d = asdict(self)          # recurses into the BenchmarkResult tuple
-        d.pop("quote")
+        if self.legacy_payload is not None:
+            # Project the CURRENT field values onto the OLD field set. Returning the stored dict
+            # verbatim would be catastrophic and briefly was: `report_data` would then ignore the
+            # proof's actual contents, so editing a graded answer or zeroing the cost still matched
+            # the quote and a tampered proof verified. Caught by scripts/verify_demo.py, whose whole
+            # point is that a verifier which only ever accepts has demonstrated nothing.
+            old = self.legacy_payload
+            rkeys = tuple(old["results"][0]) if old.get("results") else ()
+            d = {k: getattr(self, k, old[k]) for k in old if k != "results"}
+            if "results" in old:
+                d["results"] = [{k: getattr(r, k) for k in rkeys} for r in self.results]
+            return d
+        f = _SCHEMA_FIELDS.get(self.schema)
+        if f is None:
+            # schema 1 is "whatever fields existed at the time", which is only reconstructable from
+            # the serialized bytes. Without them there is no honest payload to hash, so refuse rather
+            # than emit a plausible-looking wrong one.
+            raise ValueError(f"proof schema {self.schema} has no field list; a schema-1 proof can "
+                             f"only be verified from the JSON it was serialized as")
+        f = _SCHEMA_FIELDS[self.schema]
+        d = {k: getattr(self, k) for k in f["proof"] if k != "results"}
+        d["results"] = [{k: getattr(r, k) for k in f["result"]} for r in self.results]
         return d
 
     def report_data(self) -> str:
@@ -96,12 +146,17 @@ class Proof:
 
     # --- serialization for the decoupled miner->store->validator flow -------
     def to_json(self) -> str:
-        return json.dumps(asdict(self))
+        d = dict(self.legacy_payload) if self.legacy_payload is not None else self._payload()
+        d["quote"] = asdict(self.quote) if self.quote else None
+        return json.dumps(d)
 
     @classmethod
     def from_json(cls, s: str) -> "Proof":
         d = json.loads(s)
         q = d.get("quote")
+        # A proof with no `schema` key predates payload versioning. Keep its payload verbatim so it
+        # still verifies; a fresh proof always declares its schema and needs no such rescue.
+        legacy = None if "schema" in d else {k: v for k, v in d.items() if k != "quote"}
         return cls(
             epoch=d["epoch"], nonce=d["nonce"], hotkey=d["hotkey"],
             source_hash=d["source_hash"], weights_hash=d["weights_hash"], model_id=d["model_id"],
@@ -122,4 +177,5 @@ class Proof:
             latency_s=float(d.get("latency_s", 0.0)),
             tokens_in=int(d.get("tokens_in", 0)), tokens_out=int(d.get("tokens_out", 0)),
             quote=Quote(**q) if q else None,
+            schema=int(d.get("schema", 1)), legacy_payload=legacy,
         )

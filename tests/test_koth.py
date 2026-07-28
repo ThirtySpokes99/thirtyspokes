@@ -2894,3 +2894,109 @@ def test_reference_drives_the_router_scalar_end_to_end(env):
     v = KOTHValidator(env.approved, "pub", None, KingChain(), env.suite, None, None,
                       pool_reference=lambda e, n: rec)
     assert v._reign_scalar(vd, epoch=7, nonce="n7") == pytest.approx(1.0, abs=1e-6)
+
+
+# --- the fixed routing harness: miners ship WEIGHTS, the subnet owns the engine ------------------
+# Under this architecture a routing head cannot emit an answer and miner code runs nowhere, so the
+# grounding/scan/confinement machinery retires by construction rather than by mitigation. These tests
+# pin the two properties that replace it: the weights blob is inert data, and the head is too small
+# to memorise the task pool.
+
+def _npz(theta, hidden):
+    import io
+    import numpy as np
+    buf = io.BytesIO()
+    np.savez(buf, theta=np.asarray(theta, dtype=np.float32), hidden=np.int32(hidden))
+    return buf.getvalue()
+
+
+def test_weights_are_inert_data_never_code():
+    """`allow_pickle=False` is the load-bearing flag. numpy's pickle path executes arbitrary code at
+    load time, which would reintroduce the exact capability this architecture exists to delete."""
+    import io
+    import pickle
+
+    from thirtyspokes.koth.harness import ArtifactError, load_head
+
+    class Pwn:
+        def __reduce__(self):
+            return (print, ("executed at load time",))
+
+    with pytest.raises(ArtifactError):
+        load_head(pickle.dumps(Pwn()), k=4)
+    with pytest.raises(ArtifactError):
+        load_head(b"not an npz at all", k=4)
+
+
+def test_the_param_cap_is_a_security_bound(env):
+    """The cap is what replaces the fresh-probe audit: a head this small cannot memorise a large task
+    pool, so it has to generalise. An over-cap artifact is a DQ, not a bigger model."""
+    from thirtyspokes.koth.harness import PARAM_CAP, ArtifactError, load_head
+    from thirtyspokes.router import RouterHead
+    ok = RouterHead(384, 4, 16)
+    assert ok.n_params < PARAM_CAP
+    head, theta = load_head(_npz([0.0] * ok.n_params, 16), k=4)
+    assert head.n_params == theta.size
+    big = RouterHead(384, 4, 512)                       # ~200K params, over the cap
+    assert big.n_params > PARAM_CAP
+    with pytest.raises(ArtifactError, match="over cap|> cap"):
+        load_head(_npz([0.0] * big.n_params, 512), k=4)
+
+
+def test_miner_cannot_redefine_the_action_or_feature_space():
+    """d and k come from the harness's pinned encoder and the owner's pinned pool — never from the
+    miner's file. A theta sized for a different pool is rejected rather than silently reinterpreted."""
+    from thirtyspokes.koth.harness import ArtifactError, load_head
+    from thirtyspokes.router import RouterHead
+    for_4 = RouterHead(384, 4, 16).n_params
+    with pytest.raises(ArtifactError, match="expected"):
+        load_head(_npz([0.0] * for_4, 16), k=9)          # artifact built for a 4-model pool
+    with pytest.raises(ArtifactError):
+        load_head(_npz([float("nan")] * for_4, 16), k=4)  # NaN would poison every decision
+
+
+def test_cascade_escalates_until_the_verifier_accepts(env):
+    """The action space: enter at a rung, escalate while the answer does not parse, bank on accept.
+    Must mirror `cascade.to_cascade_cache` so a head trained offline behaves identically live."""
+    from thirtyspokes.koth.harness import run_cascade
+    bench = env.suite[0]                                  # math -> numeric answers
+    pool = ["cheap", "mid", "strong"]
+    order = [0, 1, 2]
+    replies = {"cheap": "", "mid": "not a number", "strong": "42"}
+    seen = []
+
+    def call(model, messages, params):
+        seen.append(model)
+        return replies[model]
+
+    ans, used = run_cascade(0, "Compute 6 * 7.", bench, pool, order, call, {})
+    assert seen == ["cheap", "mid", "strong"] and ans == "42" and used == [0, 1, 2]
+
+    # entering higher skips the cheap rungs entirely — that is the cost lever the router controls
+    seen.clear()
+    ans, used = run_cascade(2, "Compute 6 * 7.", bench, pool, order, call, {})
+    assert seen == ["strong"] and used == [2]
+
+    # a parseable cheap answer banks immediately and never pays for the ladder above it
+    seen.clear()
+    ans, used = run_cascade(0, "Compute 6 * 7.", bench, pool, order,
+                            lambda m, msg, p: (seen.append(m), "42")[1], {})
+    assert seen == ["cheap"] and ans == "42"
+
+
+def test_a_routing_head_cannot_emit_an_answer(env):
+    """The structural claim the whole architecture rests on. The head's output is a distribution over
+    rungs; the answer returned is the pool model's response verbatim. There is no path by which a
+    miner's weights become the graded text, so answer memorisation is impossible by construction."""
+    import numpy as np
+
+    from thirtyspokes.koth.harness import load_head, run_cascade, save_head
+    from thirtyspokes.router import RouterHead
+    k = 3
+    n = RouterHead(384, k, 16).n_params
+    head, theta = load_head(save_head(np.zeros(n), 16), k=k)
+    dist = head.distribution(theta, np.zeros((2, 384)))
+    assert dist.shape == (2, k) and np.allclose(dist.sum(axis=1), 1.0)   # only ever a distribution
+    answer, _ = run_cascade(0, "Compute 1 * 1.", env.suite[0], ["a", "b", "c"], [0, 1, 2],
+                            lambda m, msg, p: "POOL-RESPONSE-1", {})
+    assert answer == "POOL-RESPONSE-1"       # verbatim from the pool, never from the artifact

@@ -18,8 +18,15 @@ dev = ["pytest>=8.0", "math_verify>=0.5"]
 # TLS regression test imports it DIRECTLY to build a hostile CA, and a transitive dependency that
 # silently stops being pulled would turn that security test into a collection error.
 llm = ["httpx>=0.27", "openai>=1.40", "certifi"]
-# Live Bittensor chain integration (offline simulator works without it)
-chain = ["bittensor>=8.0", "huggingface_hub>=0.24"]
+# Live Bittensor chain integration (offline simulator works without it).
+# PINNED BELOW 11: `BittensorChain` drives `subtensor.substrate` directly for the storage reads the
+# SDK does not wrap (CommitmentOf, the Keys uid->hotkey map, SubnetOwnerHotkey, SubnetOwnerCut), and
+# bittensor 11 removed that attribute. With the old `>=8.0` the host resolved 10.5.0 — the version
+# the chain seam was verified against — while a fresh Docker build resolved 11.0.1 and the validator
+# crash-looped on startup with `'Subtensor' object has no attribute 'substrate'`. An unpinned major
+# on the one dependency that talks to the chain is a silent time bomb; porting to 11.x is tracked
+# separately.
+chain = ["bittensor>=10.5,<11", "huggingface_hub>=0.24"]
 # Metered-gateway linchpin: ed25519 receipt signing
 gateway = ["cryptography>=42.0"]
 # Real Intel-TDX attestation: pure-Python DCAP cert-chain (cryptography) + full DCAP

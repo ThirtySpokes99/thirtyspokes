@@ -355,13 +355,28 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
                         commit_window=args.commit_window, grace_blocks=args.grace_blocks,
                         pool_reference=pool_reference,
                         min_headroom_gap=args.min_headroom_gap)
-    ok, why = val.governance_ready()
+    # RETRY THE PREFLIGHT — it reads the chain AND fetches the governance record over HTTP, so a
+    # single transient failure must not permanently kill the validator. Observed on the first real
+    # `docker compose up`: the record was fetchable from the same container seconds later, but the
+    # daemon had already exited FATAL and, under `restart: unless-stopped`, crash-looped forever.
+    # Cold start is the worst moment for this — the suite's dataset downloads run first and share the
+    # (unauthenticated, rate-limited) Hub budget with this fetch. `_effective_governance` caches
+    # last-known-good for mid-run blips; at startup there is nothing cached, so the tolerance has to
+    # be here. Bounded, then still fail closed: an unset gate would admit a forged runtime.
+    ok, why = False, "not_checked"
+    for attempt in range(1, 7):
+        ok, why = val.governance_ready()
+        if ok:
+            break
+        print(f"[koth-validator] governance preflight attempt {attempt}/6 failed ({why}); "
+              f"retrying in {10 * attempt}s", flush=True)
+        time.sleep(10 * attempt)
     if not ok:
         raise SystemExit(
-            f"[koth-validator] FATAL ({why}): enforcing mode requires the owner's approved "
-            "measured-image set (MRTD + RTMR1/2/3 + TCB policy) published on-chain — without it a "
-            "trustless miner could run a tampered runtime and forge its score. The subnet owner must "
-            "publish it with `orchestra-koth-owner`.")
+            f"[koth-validator] FATAL ({why}) after 6 attempts: enforcing mode requires the owner's "
+            "approved measured-image set (MRTD + RTMR1/2/3 + TCB policy) published on-chain — without "
+            "it a trustless miner could run a tampered runtime and forge its score. The subnet owner "
+            "must publish it with `orchestra-koth-owner`.")
     neuron = KOTHValidatorNeuron(val, store, state_path=args.state,
                                  standings_repo=args.standings_repo)
 

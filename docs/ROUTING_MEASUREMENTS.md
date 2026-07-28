@@ -104,11 +104,13 @@ frontier models in the specialist-ceiling run. Two model generations, same struc
 
 ## What this does *not* claim
 
-- **Specialisation is untested at power.** The most specialisation-bearing benchmark (`chinese_zodiac`)
-  ranked **first** at 17.5% captured — the predicted direction — but on n=118 test rows. All
-  `chinese_*` benchmarks together are ~500 rows. RouterBench cannot settle whether routing over
-  genuine language/domain *specialists* (as opposed to capability tiers) works. That would need a
-  purpose-built pool and dataset.
+- **Language specialisation specifically is still untested at power.** The domain test above used
+  code/law/commonsense/math/knowledge. The most *language*-bearing benchmark (`chinese_zodiac`) ranked
+  first in the per-benchmark sweep at 17.5% captured, but on n=118 test rows, and all `chinese_*`
+  benchmarks together are ~500. A pool containing a true language specialist (one that *beats* the
+  frontier model in its language, cheaply) is the only untested configuration — and the requirement
+  above says such a model must exist first, which is a claim about the model landscape, not about
+  routing.
 - **One benchmark did clear the bar.** `hellaswag` (n=3013) captured 11.9% with seed spread **0.027**,
   above eps₀ — the only genuinely competitive spread observed. Its captured value (+0.027) is however
   about the same size as its spread, so skill and training noise are not separable there.

@@ -103,6 +103,24 @@ expensive way to find out.
 
 Live on **testnet 526**: governance published (MRTD `c1ee9c16…`, RTMR1 `515b759e…`, RTMR3
 `c8e9bdc5…`), measured image `v15` published to the HF bucket with a manifest naming the exact
-commit that rebuilds it, two registered miners. The per-epoch reference cron has been **stopped**
-(78 epochs, ~$1.60) and no GCP instances are running. Nothing is billing; the demonstrator still
-stands if it is useful to show.
+commit that rebuilds it, two registered miners. No GCP instances are running.
+
+**Correction (2026-07-28): an earlier version of this section claimed the reference cron had been
+stopped and that "nothing is billing". Both were false.** A check found the cron still installed at
+`*/5 * * * *` and publishing — 126 records over epochs 76533–76602 — at 16 paid pool calls each
+(8 of them gpt-4o), roughly **$0.02/epoch ≈ $6/day**, funding a frontier for a thesis that is closed.
+The validator container was also up, and scoring nothing: every epoch logged `scored=0 dq=5` with
+`grading_unavailable: docker not available`, because the image has no Docker to run the code grader.
+
+The lesson is not the money, it is that **"I stopped it" was written down instead of checked.** A
+cron's failure mode is silence in both directions: it is equally quiet when it should be running and
+when it should not.
+
+To wind down (both reversible — the script and the container are kept):
+
+```bash
+crontab -l | grep -v koth-reference-cron | crontab -   # stop the paid reference publishes
+docker stop thirtyspokes-validator                     # restart later with `docker start`
+```
+
+The demonstrator still stands if it is useful to show; it should just not be running by accident.

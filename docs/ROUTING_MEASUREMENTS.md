@@ -1,4 +1,4 @@
-# Is routing worth paying for? — thirteen measurements
+# Is routing worth paying for? — fourteen measurements
 
 *The decisive negative result for the ThirtySpokes subnet thesis. Every number here is reproducible
 from the scripts named at the bottom; verdicts were pre-committed in each script's docstring before
@@ -297,6 +297,57 @@ which is a build decision and a live spend, not an analysis of existing data. Th
 measurement 13 is unfavourable: the band was already large and non-nested here, and that was not
 enough.
 
+## 14. Genuine language specialists, live: still a dominator pool — the thesis is closed
+
+Measurement 13 left one gap it could not fill: RouterBench's 11 models are all Western-trained, so
+"different models win different languages" was **untestable** there. This tests it with a pool built
+for the question — six models from Chinese labs (Qwen, DeepSeek ×2, MiniMax, GLM, Kimi) against four
+Western (OpenAI ×2, Google, xAI) — on CMMLU vs MMLU, matched MCQ format. 3,000 live OpenRouter calls,
+~$3.
+
+Three strata separate the two things "language specialist" could mean: **cn-specific** (subjects about
+Chinese language/history/culture), **cn-general** (ordinary subjects asked *in Chinese*), and
+**en-control** (the same subjects in English).
+
+| model | lab | cn-specific | cn-general | en-control | $ |
+|---|---|---|---|---|---|
+| deepseek-v4-pro | CN | 0.910 | 0.920 | **0.950** | 0.240 |
+| gemini-3.6-flash | US | 0.880 | **0.950** | 0.940 | 0.583 |
+| kimi-k3 | CN | 0.910 | 0.930 | 0.920 | 0.790 |
+| grok-4.5 | US | 0.860 | 0.930 | 0.930 | 0.621 |
+| glm-5.2 | CN | 0.870 | 0.930 | 0.910 | 0.277 |
+| deepseek-v4-flash | CN | 0.880 | 0.920 | 0.910 | 0.032 |
+
+**No significant language specialisation.** `deepseek-v4-pro` tops cn-specific *and* en-control — a
+Chinese lab's model is the best model on **English** MMLU, ahead of Gemini and Grok. The frontier
+Chinese models are not Chinese specialists; they are simply good at everything, which is the
+dominator-pool problem in its purest form.
+
+| | accuracy | cost |
+|---|---|---|
+| best-single (deepseek-v4-pro) | 0.9267 | $0.125 |
+| achievable stratum-router | 0.9267 | $0.189 |
+| per-ask oracle | 0.9733 | $0.023 |
+
+The **achievable** router — handed the stratum instead of having to predict it, so strictly stronger
+than any learned router — ties best-single to four decimals and costs **51% more**. The 0.047 oracle
+band is per-ask luck again, not stratum-predictable.
+
+### Two harness bugs this measurement caught in itself
+
+Worth recording, because both would have produced a false positive and the first one nearly did:
+
+1. **A token cap fabricated the result.** At `max_tokens=300` the reasoning models spent the whole
+   budget thinking and returned an **empty string**, scored as wrong. This hit the Chinese labs almost
+   only on English (deepseek-v4-pro empty 14/20), manufacturing exactly the "language specialisation"
+   the experiment was looking for: v1 reported deepseek-v4-pro at **0.41** on English. At 4,000 tokens
+   it scores **0.95**. An unanswered ask is not a wrong answer.
+2. **A 3pp lead at n=100 is noise**, not a specialist. One standard error is ~0.03.
+
+Both are now guards in the script: a per-stratum **parse-rate check** that refuses the reading when
+any model's rates are skewed across languages, and a **2-SE significance test** on the winner margin.
+Every successive correction moved the result the same way — toward *less* specialisation.
+
 ## Where this leaves the architecture
 
 The re-architecture succeeded at what it was for: miner-authored answers and miner-authored code are
@@ -305,10 +356,11 @@ becomes unnecessary rather than merely mitigated. What it cannot do is manufactu
 traffic mix measured, a fixed-harness router either loses to a memoriser or captures nothing.
 
 Launching would need traffic where held-out capture clears ~1.6% of the band on a bank of ≥20k asks.
-Nothing measured comes close. The specialist read that ranked highest (17.5%, n=118) is now dead —
-measurement 13 pooled it to n=785 and the CI straddles zero. The only surviving branch is whether a
-purpose-built pool of genuine specialists would make a band learnable that has never been learnable
-yet, which is a live spend rather than an analysis, and carries an unfavourable prior.
+Nothing measured comes close. The specialist branch — the last one open — is now closed at both ends:
+measurement 13 killed the 17.5% (n=118 → n=785, CI straddles zero), and measurement 14 built the
+purpose-made specialist pool that RouterBench could not provide and found the dominator-pool problem
+intact, with a Chinese lab's model winning English. **There is no remaining untested mechanism by
+which routing could have a moat.**
 
 Reproduce: `scripts/memoriser_capacity.py`, `scripts/memoriser_detector.py`,
 `scripts/bank_size_gate.py [--pool all]`, `orchestra-koth-router-sim --bank {400,2000,8000}`.

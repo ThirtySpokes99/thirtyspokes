@@ -1,4 +1,4 @@
-# Is routing worth paying for? — nine measurements, and two adversary bounds
+# Is routing worth paying for? — nine measurements, and three architecture bounds
 
 *The decisive negative result for the ThirtySpokes subnet thesis. Every number here is reproducible
 from the scripts named at the bottom; verdicts were pre-committed in each script's docstring before
@@ -225,13 +225,56 @@ earliest-commit tiebreak instead — an exact copy scores no higher than its ori
 later, so it can never dethrone. Dedup only ever mattered against copies that could win, and a copy
 cannot.
 
+## 12. There is no bank size at which the fixed harness is defensible — on real data
+
+Bounds 10 and 11 pull in opposite directions on the same knob, so the architecture needs a bank large
+enough to defeat memorisation while still leaving a real router something to win. Both were measured
+on synthetic worlds, where the routable signal was placed by hand. This asks the same question of
+RouterBench: 11 real models, real per-ask outcomes, real prices, real MiniLM embeddings.
+
+The reduction that makes it a single experiment: the subnet scores asks drawn from its public bank, so
+every scored ask is one a miner could have trained on. "Memoriser" and "honest router" are not two
+agents — they are one fit read two ways. **In-sample** capture (score on the bank it trained on) is
+what a memoriser collects; **held-out** capture (asks never seen) is genuine routing value; the
+difference is what enumeration buys. Capture is normalised against the band a per-ask oracle opens
+over the best single model, so 1.0 is oracle routing and 0.0 is "always call the best model".
+
+| bank | band | in-sample (memoriser) | held-out (honest) | edge |
+|---|---|---|---|---|
+| **curated pool, K=5** | | | | |
+| 200 | 0.110 | 60.0% | −46.5% | 106.5% |
+| 1,000 | 0.097 | 22.1% | −8.7% | 30.8% |
+| 5,000 | 0.118 | 9.8% | **0.3%** | 9.5% |
+| 10,000 | 0.123 | 4.4% | **0.3%** | 4.0% |
+| 20,000 | 0.125 | 1.5% | −1.0% | 2.5% |
+| **full pool, K=11** | | | | |
+| 1,000 | 0.123 | 16.1% | −5.0% | 21.1% |
+| 5,000 | 0.141 | 4.4% | −0.3% | 4.7% |
+| 20,000 | 0.150 | 1.5% | −1.1% | 2.6% |
+
+**The two curves converge — to zero.** Growing the bank does close the memorisation hole exactly as
+bound 10 predicted (in-sample capture falls 60% → 1.5%), but it closes it by removing the thing being
+memorised, not by making generalisation work. Held-out capture is at or below zero at every bank size
+on both pools; the best value measured anywhere is **0.3%** of a 0.12 band — 0.0004 in absolute score,
+against a reign eps floor of 0.002 that would need **1.6%** capture merely to be competed on.
+
+So the fixed-harness re-architecture has **no viable operating point on this traffic**. Small banks
+hand a memoriser most of the oracle; large banks defend a prize that is not there. A bigger bank of
+the same traffic cannot fix this — only traffic on which a router actually generalises can, which is
+the wall measurements 1–9 already established, reached here from the security side instead of the
+learnability side.
+
 ## Where this leaves the architecture
 
-The two bounds pull in opposite directions on the same knob. A larger bank shrinks the memoriser's
-edge but tightens honest convergence; a smaller bank keeps miners distinguishable but hands the
-memoriser the oracle. The fixed harness is defensible in the large-bank regime **only** — with
-copy-dedup off and seniority doing that job — and the suite it needs (≥20k routable asks) is one the
-subnet does not currently have.
+The re-architecture succeeded at what it was for: miner-authored answers and miner-authored code are
+both gone, the forger is caught by the quote, and the whole grounding/scan/confinement apparatus
+becomes unnecessary rather than merely mitigated. What it cannot do is manufacture a prize. On every
+traffic mix measured, a fixed-harness router either loses to a memoriser or captures nothing.
+
+Launching would need traffic where held-out capture clears ~1.6% of the band on a bank of ≥20k asks.
+Nothing measured so far comes close, and the specialist read that ranked highest (17.5%) was n=118.
+Confirming or killing that would need a purpose-built specialist pool and dataset — the one branch
+these twelve measurements have not closed.
 
 Reproduce: `scripts/memoriser_capacity.py`, `scripts/memoriser_detector.py`,
-`orchestra-koth-router-sim --bank {400,2000,8000}`.
+`scripts/bank_size_gate.py [--pool all]`, `orchestra-koth-router-sim --bank {400,2000,8000}`.

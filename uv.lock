@@ -2067,6 +2067,7 @@ gateway = [
     { name = "cryptography" },
 ]
 llm = [
+    { name = "certifi" },
     { name = "httpx" },
     { name = "openai" },
 ]
@@ -2077,7 +2078,8 @@ tee = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bittensor", marker = "extra == 'chain'", specifier = ">=8.0" },
+    { name = "bittensor", marker = "extra == 'chain'", specifier = ">=10.5,<11" },
+    { name = "certifi", marker = "extra == 'llm'" },
     { name = "cryptography", marker = "extra == 'eval'", specifier = ">=42.0" },
     { name = "cryptography", marker = "extra == 'gateway'", specifier = ">=42.0" },
     { name = "cryptography", marker = "extra == 'tee'", specifier = ">=42.0" },

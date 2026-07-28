@@ -831,9 +831,23 @@ def distribution_duplicates(fingerprints: dict[str, tuple], commit_block: dict[s
     uses — so on a small action space that rule disqualifies honest miners for convergent evolution.
     Two heads can genuinely agree on which rung to enter while holding quite different weights.
 
-    Mean L1 distance between distributions separates them: honest convergent routers measured ~0.235
-    mean L1, while copied weights (even perturbed) stay far below. `max_l1` sits between those, and
-    must be re-derived from `scripts/head_spread.py` whenever the encoder, head size or pool changes.
+    Mean L1 distance between distributions separates them — but ONLY while the honest cohort is still
+    spread out, and that window closes as the subnet matures. Measured in `router_subnet.py` across
+    task-bank sizes (honest-vs-honest | honest-vs-copier):
+
+        bank   400 -> 0.192 | 0.023     clean, 8x margin
+        bank  2000 -> 0.101 | 0.043     tight
+        bank  8000 -> 0.062 | 0.040     OVERLAPPING — a real honest router was disqualified
+
+    The cause is structural, not a bad constant. A fixed harness has one best head, so the better
+    miners get the more they converge on it; "behaves like the leader" stops being evidence of
+    copying and becomes evidence of competence. No threshold survives that, which is why `max_l1`
+    DEFAULTS TO OFF in the validator rather than to a tuned value.
+
+    What actually handles copying is the reign's earliest-commit tiebreak: an exact copy scores no
+    higher than its original and commits later, so it can never dethrone. Dedup only ever mattered
+    against copies that could WIN, and a copy cannot. Enable this only with a margin re-measured on
+    your own traffic via `scripts/head_spread.py`.
     """
     order_hk = sorted(fingerprints, key=lambda h: (commit_block.get(h, 0), h))
     reps: list[tuple[str, np.ndarray]] = []

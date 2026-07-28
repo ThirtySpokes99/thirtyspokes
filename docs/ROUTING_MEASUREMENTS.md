@@ -1,4 +1,4 @@
-# Is routing worth paying for? — eight measurements
+# Is routing worth paying for? — nine measurements, and two adversary bounds
 
 *The decisive negative result for the ThirtySpokes subnet thesis. Every number here is reproducible
 from the scripts named at the bottom; verdicts were pre-committed in each script's docstring before
@@ -162,3 +162,76 @@ Needs `data/routerbench_0shot.pkl` + `data/emb_minilm.npy` (see `realdata.py` fo
 2. **The measurement instruments** — `achievable_gap`, nestedness, the spread/ossification gate. They
    caught three would-be mistakes during this investigation and apply to any future thesis.
 3. **The negative result itself**, which is what this document is for.
+
+
+---
+
+# Addendum — the fixed-harness architecture's own bounds (Phase 4)
+
+The measurements above ask whether routing is *learnable*. These two ask whether the re-architected
+subnet — miners ship only a routing head, the owner's harness runs it — can be *defended*. Both
+verdicts were pre-committed in the script docstrings before the runs.
+
+## 10. The parameter cap does not stop a routing-table memoriser
+
+`harness.py` claimed a ~6.4K-param head was "far too small to memorise a task pool of thousands", and
+that claim was load-bearing: it was the stated replacement for the fresh-probe audit. It is false.
+
+`scripts/memoriser_capacity.py` fits the exact capped architecture to **random** rung labels — the
+hardest possible table, so the result bounds every easier case — with a stronger optimizer than a
+miner would use. EDGE is how far the table carries the attacker from guessing to a perfect oracle.
+
+| task bank | fit | memoriser EDGE |
+|---|---|---|
+| 112 (**the live LCB bank**) | 1.000 | **100%** — the full oracle |
+| 1,000 | 1.000 | 100% |
+| 5,000 | 0.324 | 26% |
+| 20,000 | 0.191 | 12% |
+| 100,000 | 0.139 | 6% |
+
+At the live bank that is 57 parameters per task — enormous overcapacity. **Capacity is a dial, not a
+wall:** the edge decays with bank size but never reaches zero. Holding it under 15% needs **≥20,000
+asks**; the live suite has 112, short by a factor of ~180.
+
+A label-free detector was tried and rejected. `scripts/memoriser_detector.py` tested whether a
+memoriser's decision surface is measurably jaggier than an honest router's (it reads the embedding as
+an index, not a feature). It is — but an honest router trained on 50%-noisy labels, which is what
+real routing signal looks like, is **equally jagged** (1.0×). The gate would have disqualified honest
+miners, so it was not built.
+
+**Consequence:** the anti-memorisation property comes from task-bank SIZE alone. Commit–reveal does
+not substitute for it — the bank is public, so a miner can self-label all 112 LCB problems for a few
+dollars. Any suite adopted for this architecture must be chosen for size as much as for routability.
+
+## 11. Copy-dedup and honest convergence are the same signal
+
+`orchestra-koth-router-sim` runs the architecture end to end against the three adversaries it must
+survive. The forger (reports a slice it never ran) is caught by the quote — the result that justifies
+keeping the TEE after miner code went away. The copier (clones the leader's head and jitters it) is
+caught on the soft distribution at a small bank. But sweeping the bank:
+
+| bank | honest ↔ honest | honest ↔ copier | outcome at threshold 0.05 |
+|---|---|---|---|
+| 400 | 0.192 | 0.023 | clean, 8× margin |
+| 2,000 | 0.101 | 0.043 | tight |
+| 8,000 | 0.062 | 0.040 | **overlapping — a real honest router was disqualified** |
+
+This is structural, not a bad constant. A fixed harness has *one* best head, so the better miners get
+the more they converge on it, and "behaves like the leader" stops being evidence of copying and
+becomes evidence of competence. No threshold survives that.
+
+**Consequence:** `dedup_max_l1` now defaults to **off**. Copying is handled by the reign's
+earliest-commit tiebreak instead — an exact copy scores no higher than its original and commits
+later, so it can never dethrone. Dedup only ever mattered against copies that could win, and a copy
+cannot.
+
+## Where this leaves the architecture
+
+The two bounds pull in opposite directions on the same knob. A larger bank shrinks the memoriser's
+edge but tightens honest convergence; a smaller bank keeps miners distinguishable but hands the
+memoriser the oracle. The fixed harness is defensible in the large-bank regime **only** — with
+copy-dedup off and seniority doing that job — and the suite it needs (≥20k routable asks) is one the
+subnet does not currently have.
+
+Reproduce: `scripts/memoriser_capacity.py`, `scripts/memoriser_detector.py`,
+`orchestra-koth-router-sim --bank {400,2000,8000}`.

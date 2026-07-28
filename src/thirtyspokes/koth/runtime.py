@@ -241,7 +241,12 @@ class KOTHRuntime:
                 chosen_rung=rung, rungs_used=tuple(used),
                 distribution=tuple(round(float(x), 6) for x in dist[i])))
         return self._attest(results, trace, hotkey=hotkey, epoch=epoch, nonce=nonce,
-                            source_hash=H.HARNESS_VERSION,   # the ENGINE is pinned, not miner code
+                            # The ENGINE is pinned, not miner code — so the "source" a router miner
+                            # publishes IS the harness version string. Hashed the same way the
+                            # validator hashes the artifact it downloaded (`hash_source`), because
+                            # the commit binding compares those two directly; stamping the raw
+                            # version here would make every router proof fail `verify_commit`.
+                            source_hash=hash_source(H.HARNESS_VERSION),
                             weights_hash=hash_weights(weights), model_id="router",
                             confined=False)
 

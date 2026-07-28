@@ -45,6 +45,7 @@ from .verify import (
     grounding_check,
     memorization_collapsed_relative,
     decision_regret,
+    distribution_duplicates,
     regret_stats,
     row_weights_for,
     scan_source,
@@ -106,7 +107,8 @@ class KOTHValidator:
                  half_life_epochs: float = 200.0, budget_per_task: float = 0.02,
                  n_expected: int | None = None, commit_window: int | None = None,
                  grace_blocks: int = 0, cost_tiebreak: float = 0.02,
-                 pool_reference=None, min_headroom_gap: float = 0.05):
+                 pool_reference=None, min_headroom_gap: float = 0.05,
+                 dedup_max_l1: float = 0.0):
         # memorization backstop: "grounding" (default) = pure proof-inspection, validator runs NO
         # miner code; "probe" = the legacy re-execution fresh-probe (null-pool/secret-bank upgrade).
         self.audit_mode = audit_mode
@@ -172,6 +174,11 @@ class KOTHValidator:
         # feed, rather than reporting a confident number about nothing.
         self.min_headroom_gap = min_headroom_gap
         self.dedup_agree = dedup_agree
+        # Router-path copy threshold, on mean L1 between soft distributions. OFF by default: honest
+        # routers converge as they improve (measured overlap with copies at an 8k-ask bank — see
+        # `distribution_duplicates`), so any non-zero value eventually disqualifies real miners.
+        # Copying is already handled by the reign's earliest-commit tiebreak, which a copy cannot beat.
+        self.dedup_max_l1 = dedup_max_l1
         # cohort-relative memorization test: need >= min_cohort audited miners to calibrate the
         # probe's difficulty; max_probe_drop caps the allowance so a colluding all-memorizer
         # cohort cannot inflate it (the owner's "no honest probe is harder than this").
@@ -649,8 +656,13 @@ class KOTHValidator:
             ok_g, why_g = grounding_check(proof, trace, self.suite)
             if not ok_g:
                 return E(dq=why_g)
-            # copy-dedup fingerprint = the attested scored-answer vector (no re-execution)
-            fp = tuple(r.answer for r in sorted(proof.results, key=lambda r: (r.benchmark, r.task_id)))
+            # copy-dedup fingerprint (no re-execution either way). On the ROUTER path the answers are
+            # the pool's verbatim output, so every honest router that picks the same rung has an
+            # identical answer vector — dedup on answers would be dedup on the pool. The head's SOFT
+            # distribution is the miner's actual output, so fingerprint on that when present.
+            rs = sorted(proof.results, key=lambda r: (r.benchmark, r.task_id))
+            dists = tuple(tuple(r.distribution) for r in rs if getattr(r, "distribution", ()))
+            fp = dists if len(dists) == len(rs) else tuple(r.answer for r in rs)
         # 6. cost-budgeted eligibility. per_epoch: this slice's cost. accumulate: applied on the
         #    ACCUMULATED cost-per-task in run_epoch, so skip the per-slice check here.
         if self.scoring_mode == "per_epoch":
@@ -918,8 +930,16 @@ class KOTHValidator:
                 verdicts.pop(hk, None)
                 fingerprints.pop(hk, None)      # a DQ'd memorizer must not seed copy-dedup
 
-        # 5. behavioral copy-dedup: near-identical answer vectors -> keep earliest commit
-        for loser, winner in behavioral_duplicates(fingerprints, commit_block, agree=self.dedup_agree).items():
+        # 5. copy-dedup: near-identical behaviour -> keep earliest commit. Two rules, picked by what
+        #    the fingerprint IS (a tuple of distributions on the router path, of answers otherwise),
+        #    so a mixed cohort is deduped correctly under both rather than one rule being wrong for
+        #    half of it.
+        dist_fp = {hk: f for hk, f in fingerprints.items() if f and isinstance(f[0], tuple)}
+        ans_fp = {hk: f for hk, f in fingerprints.items() if hk not in dist_fp}
+        dups = dict(behavioral_duplicates(ans_fp, commit_block, agree=self.dedup_agree))
+        if self.dedup_max_l1 > 0:
+            dups.update(distribution_duplicates(dist_fp, commit_block, max_l1=self.dedup_max_l1))
+        for loser, winner in dups.items():
             dq[loser] = f"copy_of:{winner[:8]}"
             verdicts.pop(loser, None)
 

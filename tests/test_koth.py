@@ -3028,8 +3028,11 @@ def test_router_run_produces_an_attested_decision_proof(env, monkeypatch):
                                  n_per_bench=2, pool=pool, price_of=price.get,
                                  params={"max_tokens": 16})
 
-    # the engine is pinned, not miner code: source_hash is the harness version
-    assert proof.source_hash == H.HARNESS_VERSION
+    # the engine is pinned, not miner code: the "source" is the harness version string, hashed the
+    # same way the validator hashes the artifact it downloads — otherwise the commit binding can
+    # never match and every router proof DQs.
+    from thirtyspokes.koth.store import hash_source
+    assert proof.source_hash == hash_source(H.HARNESS_VERSION)
     for r in proof.results:
         assert 0 <= r.chosen_rung < len(pool)
         assert r.rungs_used and r.rungs_used[0] == r.chosen_rung   # entered where the head said
@@ -3044,7 +3047,7 @@ def test_router_run_produces_an_attested_decision_proof(env, monkeypatch):
     vd = verify_proof(proof, approved_measurements={runtime_measurement()},
                       platform_public_hex=env.platform.public_hex, expect_epoch=1,
                       expect_nonce="n1", expect_hotkey="hk",
-                      expect_source_hash=H.HARNESS_VERSION,
+                      expect_source_hash=hash_source(H.HARNESS_VERSION),
                       expect_weights_hash=proof.weights_hash,
                       suite=env.suite, n_per_bench=2)
     assert vd.valid, vd.reason
@@ -3122,3 +3125,47 @@ def test_dedup_on_distributions_spares_honest_convergent_routers():
     losers = distribution_duplicates(fps, blocks)
     assert losers.get("copier") == "orig", "a weight-perturbing copier must still be caught"
     assert "honest" not in losers, "an honestly convergent router must NOT be flagged"
+
+
+# --- Phase 4: adversaries the ROUTER architecture has to survive ---------------------------------
+
+def test_router_sim_catches_the_forger_and_the_copier():
+    """The two defences that still work once miners ship weights instead of code.
+
+    The forger reports a flawless slice it never ran — only the quote can catch that, which is why
+    the TEE survives the re-architecture even though there is no longer any miner code to confine.
+    The copier clones the leader's head and jitters it, so hash-dedup misses and only the SOFT
+    distribution separates them. Honest miners must come through clean: a copy check that fires on
+    convergent honest routers is worse than no copy check.
+    """
+    from thirtyspokes.koth.router_subnet import run_simulation
+    out = run_simulation(epochs=2, bank=400, verbose=False)
+    dq = out["disqualifications"]
+    assert dq.get("forger") == "bad_platform_quote"
+    assert dq.get("copier", "").startswith("copy_of:")
+    assert "honest-a" not in dq and "honest-b" not in dq       # no false positives at this spread
+
+
+def test_router_memoriser_beats_honest_routers_on_a_small_bank():
+    """THE UNFIXED HOLE, pinned so it cannot be quietly forgotten.
+
+    A memoriser trained on the scored bank has no generalisation at all, and on a small public bank
+    it still outscores routers that had to generalise — because a ~6.4K-param head simply fits the
+    table (`scripts/memoriser_capacity.py`: 100% on a RANDOM table at 1,000 asks). The param cap was
+    claimed to prevent this and does not. The defence is bank SIZE, so this test asserts the failure
+    at a small bank; when the suite grows past the measured binding point it should be inverted.
+    """
+    from thirtyspokes.koth.router_subnet import run_simulation
+    out = run_simulation(epochs=2, bank=400, verbose=False)
+    q = out["decision_quality"]
+    assert q["memoriser"] > q["honest-a"], "memoriser no longer wins — re-measure the bank bound"
+    assert "memoriser" not in out["disqualifications"], "no defence claims to catch this yet"
+
+
+def test_router_copy_dedup_is_off_by_default():
+    """Honest routers converge as they improve, so at scale a copy is indistinguishable from a good
+    independent miner (measured overlap in `distribution_duplicates`). The threshold therefore
+    defaults to OFF — an enabled default would disqualify real miners as the subnet matures."""
+    from thirtyspokes.koth.validator import KOTHValidator
+    import inspect
+    assert inspect.signature(KOTHValidator.__init__).parameters["dedup_max_l1"].default == 0.0

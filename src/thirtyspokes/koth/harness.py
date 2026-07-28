@@ -15,8 +15,15 @@ to a router. Moving the engine into the harness deletes that whole class rather 
     construction, so grounding/laundering/source-scan/weight-scan all retire.
   * miner-authored CODE runs nowhere in the system. Weights load through `np.load(allow_pickle=False)`
     into a strict shape check — never pickle, which is code execution wearing a data costume.
-  * the PARAM CAP is doing security work, not tidiness. A head this small cannot memorise a large task
-    pool; it has to generalise. That is the anti-overfitting bound that replaces the fresh-probe audit.
+  * the PARAM CAP bounds artifact size and copy surface — but it does NOT stop a routing-table
+    memoriser, and an earlier version of this file claimed it did. MEASURED
+    (`scripts/memoriser_capacity.py`): the 6,364-param default head fits a RANDOM rung table for
+    1,000 tasks at 100%, and still beats chance 5x at 5,000. At the live 56-task pool that is 114
+    parameters per task — enormous overcapacity. Memorising DECISIONS is therefore cheap even though
+    memorising ANSWERS is impossible, so the anti-overfitting defence has to be behavioural:
+    `generalisation_gap` scores the head on a HELD-OUT slice, which is free here because a validator
+    can run the head itself (a matrix multiply, no inference). A memoriser scores well on the public
+    slice and at chance on held-out; an honest router scores alike on both.
 
 WHAT A MINER COMPETES ON. Given a task, the head picks WHERE TO ENTER a cheap->expensive ladder. The
 harness invokes that rung, runs the pinned verifier on the answer, and escalates while the verifier
@@ -47,9 +54,10 @@ HARNESS_VERSION = "koth-harness-1"
 ENCODER = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
 
-# A head is d*h + h + h*k + k params. At d=384, k=12, h=16 that is ~6.4K; the cap admits h up to ~128
-# while staying far too small to memorise a task pool of thousands. Lowering this tightens the
-# anti-memorisation bound; raising it widens the competitive surface. It is a security parameter.
+# A head is d*h + h + h*k + k params. At d=384, k=12, h=16 that is ~6.4K; the cap admits h up to ~128.
+# It bounds artifact size, load cost and copy surface. It does NOT bound memorisation — see the module
+# docstring; ~6.4K params memorise a random rung table for 1,000 tasks outright. Treat this as a
+# resource limit, not a security bound, and rely on `smoothness` for the anti-memorisation property.
 PARAM_CAP = 50_000
 DEFAULT_HIDDEN = 16
 

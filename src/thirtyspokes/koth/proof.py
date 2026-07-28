@@ -30,6 +30,18 @@ class BenchmarkResult:
     task_id: str          # the sampled task (validator re-derives the gold from the nonce)
     answer: str           # graded validator-side against the public gold
     cost_usd: float       # metered by the runtime for this task — un-forgeable
+    # --- routing decision (fixed-harness architecture; empty on the legacy free-agent path) ---
+    # Under the harness the miner's whole contribution is the DECISION, so the decision has to be in
+    # the attested payload or a validator can only grade the outcome. Both fields are inside
+    # `report_data` ⇒ inside the quote ⇒ as un-forgeable as the cost.
+    chosen_rung: int = -1          # ladder entry point the head selected (-1 = not a routed run)
+    rungs_used: tuple = ()         # pool indices actually invoked, in order — the cost trail, so a
+                                   # validator can price the run without re-executing it
+    distribution: tuple = ()       # the head's SOFT output over rungs. Copy-dedup fingerprints on
+                                   # this rather than on answers: two heads that agree on argmax may
+                                   # be honestly convergent, while near-identical distributions are
+                                   # the same weights. Measured: independently-trained honest routers
+                                   # reach 0.954 argmax agreement, above the old 0.95 copy threshold.
 
 
 @dataclass(frozen=True)
@@ -93,7 +105,15 @@ class Proof:
         return cls(
             epoch=d["epoch"], nonce=d["nonce"], hotkey=d["hotkey"],
             source_hash=d["source_hash"], weights_hash=d["weights_hash"], model_id=d["model_id"],
-            results=tuple(BenchmarkResult(**r) for r in d["results"]),
+            # COERCE THE SEQUENCE FIELDS BACK TO TUPLES. JSON has no tuple, so `rungs_used` and
+            # `distribution` return as lists; leaving them that way makes an in-memory proof and a
+            # round-tripped one unequal even though both hash the same. This is the same shape as the
+            # earlier `sum([]) -> int 0 vs float 0.0` bug that produced `report_data_mismatch` for
+            # agents making no pool calls, so it is pinned rather than left to chance.
+            results=tuple(BenchmarkResult(**{**r,
+                                             "rungs_used": tuple(r.get("rungs_used", ())),
+                                             "distribution": tuple(r.get("distribution", ()))})
+                          for r in d["results"]),
             total_cost_usd=d["total_cost_usd"], n_calls=d["n_calls"],
             call_log_hash=d["call_log_hash"], measurement=d["measurement"],
             # absent ⇒ False: an old proof that never asserted confinement must not be read as

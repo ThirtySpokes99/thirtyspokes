@@ -3000,3 +3000,51 @@ def test_a_routing_head_cannot_emit_an_answer(env):
     answer, _ = run_cascade(0, "Compute 1 * 1.", env.suite[0], ["a", "b", "c"], [0, 1, 2],
                             lambda m, msg, p: "POOL-RESPONSE-1", {})
     assert answer == "POOL-RESPONSE-1"       # verbatim from the pool, never from the artifact
+
+
+def test_router_run_produces_an_attested_decision_proof(env, monkeypatch):
+    """END-TO-END EVALUATION PIPELINE for a routing model. A miner ships only weights; the harness
+    samples the slice, embeds, picks a rung, runs the ladder, and attests BOTH the outcome and the
+    decision. The decision must be in the payload: under this architecture it IS the miner's
+    contribution, so grading only the answer would score the pool rather than the router."""
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.proof import Proof
+    from thirtyspokes.koth.runtime import KOTHRuntime, runtime_measurement
+    from thirtyspokes.koth.verify import verify_proof
+    from thirtyspokes.router import RouterHead
+
+    pool = ["cheap", "mid", "strong"]
+    price = {"cheap": 0.01, "mid": 0.1, "strong": 1.0}
+    # deterministic stand-in encoder: no network, no model download in CI
+    monkeypatch.setattr(H, "encode",
+                        lambda ps: np.stack([np.full(H.EMBED_DIM, (len(p) % 7) / 7.0) for p in ps]))
+    n = RouterHead(H.EMBED_DIM, len(pool), 8).n_params
+    weights = H.save_head(np.random.default_rng(0).normal(0, 0.3, n), 8)
+
+    rt = KOTHRuntime(env.backend, env.platform)
+    proof, trace = rt.run_router(weights, hotkey="hk", epoch=1, nonce="n1", suite=env.suite,
+                                 n_per_bench=2, pool=pool, price_of=price.get,
+                                 params={"max_tokens": 16})
+
+    # the engine is pinned, not miner code: source_hash is the harness version
+    assert proof.source_hash == H.HARNESS_VERSION
+    for r in proof.results:
+        assert 0 <= r.chosen_rung < len(pool)
+        assert r.rungs_used and r.rungs_used[0] == r.chosen_rung   # entered where the head said
+        assert len(r.distribution) == len(pool)
+        assert abs(sum(r.distribution) - 1.0) < 1e-3               # a distribution, not an answer
+
+    # survives the serialization round trip the miner->store->validator path performs
+    rt2 = Proof.from_json(proof.to_json())
+    assert rt2.report_data() == proof.report_data(), "decision fields broke report_data"
+    assert isinstance(rt2.results[0].rungs_used, tuple)
+
+    vd = verify_proof(proof, approved_measurements={runtime_measurement()},
+                      platform_public_hex=env.platform.public_hex, expect_epoch=1,
+                      expect_nonce="n1", expect_hotkey="hk",
+                      expect_source_hash=H.HARNESS_VERSION,
+                      expect_weights_hash=proof.weights_hash,
+                      suite=env.suite, n_per_bench=2)
+    assert vd.valid, vd.reason

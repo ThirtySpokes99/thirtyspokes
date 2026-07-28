@@ -191,6 +191,60 @@ class KOTHRuntime:
                    for r in rows]
         return results, trace, hardened
 
+    def run_router(self, weights: bytes, *, hotkey: str, epoch: int, nonce: str,
+                   suite: list[Benchmark], n_per_bench: int, pool: list[str], price_of,
+                   params: dict | None = None) -> tuple[Proof, list[dict]]:
+        """THE FIXED-HARNESS PATH: evaluate a miner's routing MODEL (weights only, no miner code).
+
+        Everything the miner does not control happens here: sample the nonce-derived slice, embed the
+        prompts with the pinned frozen encoder, run the miner's head to get a distribution over ladder
+        rungs, then execute the cascade — invoke, verify, escalate — and return the pool model's
+        answer verbatim. The head never touches the answer, so there is nothing to memorise, and no
+        miner code runs at any point.
+
+        The proof records the DECISION (chosen rung, rungs actually invoked, soft distribution)
+        alongside the outcome, because under this architecture the decision *is* the miner's
+        contribution — grading only the answer would score the pool, not the router.
+        """
+        from . import harness as H
+
+        tasks = self._sample_tasks(suite, epoch, nonce, n_per_bench)
+        by_name = {b.name: b for b in suite}
+        head, theta = H.load_head(weights, k=len(pool))       # raises ArtifactError -> caller DQs
+        order = H.rung_order(pool, price_of)
+        emb = H.encode([t["prompt"] for t in tasks])
+        dist = head.distribution(theta, emb)                  # (Q, K) over ladder entry points
+
+        proxy = MeteringProxy(self.backend)
+        trace: list[dict] = []
+        results: list[BenchmarkResult] = []
+        p = dict(params or {"max_tokens": 16384, "reasoning": {"effort": "low"}})
+        for i, t in enumerate(tasks):
+            c0 = proxy.total_cost_usd
+
+            def rec_call(model, messages, prm=None, _tid=t["task_id"], _c0=c0):
+                c1 = proxy.total_cost_usd
+                resp = proxy.call_model(model, messages, prm)   # metered + pinned pool
+                tin, tout = getattr(proxy, "last_tokens", (0, 0))
+                trace.append({"task_id": _tid, "model": model,
+                              "prompt": str(messages[-1]["content"]), "response": str(resp),
+                              "cost_usd": proxy.total_cost_usd - c1,
+                              "tokens_in": tin, "tokens_out": tout,
+                              "latency_s": getattr(proxy, "last_latency_s", 0.0)})
+                return resp
+
+            rung = int(dist[i].argmax())
+            answer, used = H.run_cascade(rung, t["prompt"], by_name[t["benchmark"]], pool, order,
+                                         rec_call, p)
+            results.append(BenchmarkResult(
+                t["benchmark"], t["task_id"], str(answer), proxy.total_cost_usd - c0,
+                chosen_rung=rung, rungs_used=tuple(used),
+                distribution=tuple(round(float(x), 6) for x in dist[i])))
+        return self._attest(results, trace, hotkey=hotkey, epoch=epoch, nonce=nonce,
+                            source_hash=H.HARNESS_VERSION,   # the ENGINE is pinned, not miner code
+                            weights_hash=hash_weights(weights), model_id="router",
+                            confined=False)
+
     def run(self, artifact: Artifact, *, hotkey: str, epoch: int, nonce: str,
             suite: list[Benchmark], n_per_bench: int) -> tuple[Proof, list[dict]]:
         """Returns (attested proof, full behavioral trace). The trace records every
@@ -199,11 +253,20 @@ class KOTHRuntime:
         tasks = self._sample_tasks(suite, epoch, nonce, n_per_bench)
         results, trace, confined = (self._run_confined(artifact, tasks) if self.confine
                                     else self._run_inprocess(artifact, tasks))
+        return self._attest(results, trace, hotkey=hotkey, epoch=epoch, nonce=nonce,
+                            source_hash=artifact.source_hash,   # computed from what actually ran
+                            weights_hash=artifact.weights_hash,
+                            model_id=artifact.model_id, confined=confined)
+
+    def _attest(self, results, trace, *, hotkey, epoch, nonce, source_hash, weights_hash,
+                model_id, confined) -> tuple[Proof, list[dict]]:
+        """Seal a run into a hardware-attested proof. Shared by both run paths so the payload — and
+        therefore what `report_data` covers — cannot drift between them."""
         proof = Proof(
             epoch=epoch, nonce=nonce, hotkey=hotkey,
-            source_hash=artifact.source_hash,        # computed from what actually ran
-            weights_hash=artifact.weights_hash,
-            model_id=artifact.model_id,
+            source_hash=source_hash,
+            weights_hash=weights_hash,
+            model_id=model_id,
             results=tuple(results), total_cost_usd=sum(e["cost_usd"] for e in trace),
             n_calls=len(trace), call_log_hash=signing.sha256_hex(trace),   # binds the published trace
             measurement=runtime_measurement(),

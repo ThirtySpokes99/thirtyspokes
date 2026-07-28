@@ -104,6 +104,34 @@ def save_head(theta: np.ndarray, hidden: int) -> bytes:
     return buf.getvalue()
 
 
+_ENCODER = None
+
+
+def encode(prompts: list[str]) -> np.ndarray:
+    """Embed prompts with the pinned frozen encoder → (Q, EMBED_DIM), L2-normalised.
+
+    This is the miner's entire view of a task. It must produce byte-identical vectors in three
+    places or routing decisions diverge from what was trained and scored: the miner's enclave, the
+    owner's reference build, and the trainer a miner runs at home. Hence a pinned model name, a
+    pinned dimension, and normalisation applied here rather than left to the caller.
+
+    The model is loaded once per process and cached — re-loading per call would dominate the runtime
+    of an 8-task slice. In the measured image the weights are baked in and `HF_HUB_OFFLINE=1`, so
+    this never reaches the network; off-image it downloads once.
+    """
+    global _ENCODER
+    if _ENCODER is None:
+        from sentence_transformers import SentenceTransformer
+        _ENCODER = SentenceTransformer(ENCODER)
+    out = _ENCODER.encode(list(prompts), batch_size=64, show_progress_bar=False,
+                          convert_to_numpy=True, normalize_embeddings=True)
+    emb = np.asarray(out, dtype=np.float64)
+    if emb.ndim != 2 or emb.shape[1] != EMBED_DIM:
+        raise RuntimeError(f"encoder returned {emb.shape}, expected (*, {EMBED_DIM}) — "
+                           f"the pinned encoder does not match the harness")
+    return emb
+
+
 def verifier_ok(answer: str, bench: Benchmark) -> bool:
     """The PINNED verifier: does this answer parse under the benchmark's own grader?
 

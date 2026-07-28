@@ -120,7 +120,7 @@ def main() -> None:
     print("and remember RTMR1 on-chain is the gate that actually stops a bad image.")
     print("\nNow pin the SAME measurements on-chain (validators gate on these, not on the manifest):")
     print(f"  orchestra-koth-owner --mrtd {args.mrtd} --rtmr1 {args.rtmr1} --rtmr2 {args.rtmr2} \\")
-    print(f"    --pool \"{','.join(pool)}\" --netuid 99 --wallet owner --network finney")
+    print(f"    --pool \"{','.join(pool)}\" --netuid ${NETUID} --wallet owner --network ${NETWORK}")
 
 
 if __name__ == "__main__":

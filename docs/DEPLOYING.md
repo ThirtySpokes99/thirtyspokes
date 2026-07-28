@@ -1,6 +1,6 @@
 # ThirtySpokes — deploying the subnet (owner)
 
-How to stand the subnet up on Bittensor mainnet (ThirtySpokes is **netuid 99**) and build the measured
+How to stand the subnet up (currently live on **testnet 526**; mainnet is netuid 99) and build the measured
 runtime image. To run a single node instead, see [`MINER.md`](MINER.md) / [`VALIDATOR.md`](VALIDATOR.md);
 for *how it works*, see [`DESIGN.md`](DESIGN.md). *(Forking this to run your own subnet? Substitute your
 own netuid throughout.)*
@@ -43,7 +43,13 @@ uv run orchestra-koth-local              # decoupled 2-neuron demo (miner upload
 set -a && . ./.env && set +a && uv run python scripts/koth_live_smoke.py   # real models + benchmarks, local chain
 ```
 
-## Production — Bittensor mainnet
+## Production — Bittensor
+
+> **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`). Every command below
+> shows the live testnet target; mainnet (netuid 99, `--network finney`) remains the eventual
+> destination and is the code default, so **pass `--network test` explicitly** while running against
+> 526. Governance, the measured image (`v15`) and the per-epoch pool reference are published there.
+
 
 The trust claim is only real with genuine hardware attestation, so a production subnet needs the
 measured image pinned on-chain **before** miners can earn. Order of operations:
@@ -60,8 +66,8 @@ export OPENROUTER_API_KEY=...            # MINER (runs the benchmark) and OWNER 
                                          # benchmark is graded by executing code (DESIGN.md §5e).
 huggingface-cli login
 btcli wallet new_coldkey && btcli wallet new_hotkey        # one wallet per role
-btcli subnet register --netuid 99 --wallet.name miner     --subtensor.network finney
-btcli subnet register --netuid 99 --wallet.name validator --subtensor.network finney
+btcli subnet register --netuid 526 --wallet.name miner     --subtensor.network test
+btcli subnet register --netuid 526 --wallet.name validator --subtensor.network test
 # owner: enable commit-reveal + a sane tempo on the subnet hyperparams; validator needs stake + vpermit
 ```
 
@@ -75,7 +81,7 @@ no inference, so only the owner can measure what the other pool models would hav
 ```bash
 # once per epoch, next to the validator (a cron / systemd timer is the intended shape)
 set -a && . ./.env && set +a            # OPENROUTER_API_KEY — the OWNER pays for this, not miners
-orchestra-koth-reference --netuid 99 --wallet owner \
+orchestra-koth-reference --netuid 526 --network test --wallet owner \
   --pool "$THE_PINNED_POOL" --n-per-bench 8 \     # MUST match the validators' --n-per-bench
   --deadline-s 900 --call-timeout 180
 ```
@@ -99,10 +105,10 @@ sampling noise — and every validator will decline to score routing on it and p
 Skipping this step is safe: epochs without a reference simply score on absolute accuracy.
 
 **5. Run the validator and the external locked-image miner operator.** Both default to
-`--network finney`.
+`--network finney`, so pass `--network test` for the live 526 deployment.
 ```bash
-orchestra-koth-validator --netuid 99 --wallet validator                 # verify-only; no GPU, no CVM
-orchestra-koth-gcp-miner --netuid 99 --wallet miner --repo YOU/koth-miner \
+orchestra-koth-validator --netuid 526 --network test --wallet validator                 # verify-only; no GPU, no CVM
+orchestra-koth-gcp-miner --netuid 526 --network test --wallet miner --repo YOU/koth-miner \
   --image THE_OWNER_APPROVED_GCP_IMAGE                                  # creates one TDX VM/epoch
 ```
 
@@ -198,7 +204,7 @@ orchestra-koth-owner \
   --mrtd <mrtd_hex> --rtmr1 <rtmr1_hex> --rtmr2 <rtmr2_hex> \
   --pool "openai/gpt-4o-mini,anthropic/claude-opus-4.7" \
   --tcb-accept UpToDate,SWHardeningNeeded \
-  --netuid 99 --wallet owner --network finney
+  --netuid 526 --wallet owner --network finney
 ```
 
 **How it is stored, and why.** The record is ~657 bytes; a plain on-chain commitment's `Raw` field caps

@@ -6,7 +6,10 @@ answers against public gold, score the eligible miners, and set weights. Everyth
 and deterministic, so honest validators converge on the same king. For *how the mechanism works* see
 [`DESIGN.md`](DESIGN.md); to stand up a subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
-> **Live on Bittensor mainnet — netuid 99.** The daemon runs **fail-closed** by default: it scores a
+> **Currently deployed on Bittensor TESTNET — netuid 526** (pass `--network test`; the code
+> default is mainnet `finney`, netuid 99, which remains the eventual destination).
+>
+> The daemon runs **fail-closed** by default: it scores a
 > proof only if the hardware quote matches the owner's pinned measured image. The no-gate (`--insecure`)
 > mode is **refused on mainnet** — it exists for offline development only.
 
@@ -53,9 +56,9 @@ uv pip install -e ".[chain,eval,tee]"     # bittensor + huggingface_hub + datase
 # `--audit-mode probe`, which re-executes every miner's agent and bills YOU for it.
 huggingface-cli login                     # read miners' public bundles + proofs
 btcli wallet new_coldkey && btcli wallet new_hotkey
-btcli subnet register --netuid 99 --wallet.name validator --subtensor.network finney
+btcli subnet register --netuid 526 --wallet.name validator --subtensor.network test
 # you need stake + a vpermit to set weights
-orchestra-koth-validator --netuid 99 --wallet validator
+orchestra-koth-validator --netuid 526 --network test --wallet validator
 ```
 It defaults to mainnet (`--network finney`), starts **secure by default**, and refuses to start until
 the owner's measured-image governance is published on-chain.
@@ -71,12 +74,12 @@ for the optional public standings feed, `HF_TOKEN` for compatibility/gated datas
 
 ```bash
 cp .env.example .env          # set VALIDATOR_WALLET; add standings credentials if publishing
-                              # (NETUID=99 and NETWORK=finney are pre-filled)
+                              # (NETUID=526 and NETWORK=test for the live testnet deployment)
 docker compose up -d --build  # build the image + start the daemon
 docker compose logs -f        # watch it verify + score each epoch
 ```
 
-Config comes from `.env` (`NETUID` = 99 and `NETWORK` = `finney` are pre-filled; set
+Config comes from `.env` (`NETUID` = 526 and `NETWORK` = `test` for the live deployment; set
 `VALIDATOR_WALLET` and `VALIDATOR_HOTKEY`, plus the optional standings and
 `COMMIT_WINDOW` / `GRACE_BLOCKS` settings). Enforce mode is on by default.
 

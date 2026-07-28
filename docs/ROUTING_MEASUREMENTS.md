@@ -1,4 +1,4 @@
-# Is routing worth paying for? — nine measurements, and three architecture bounds
+# Is routing worth paying for? — thirteen measurements
 
 *The decisive negative result for the ThirtySpokes subnet thesis. Every number here is reproducible
 from the scripts named at the bottom; verdicts were pre-committed in each script's docstring before
@@ -264,6 +264,39 @@ the same traffic cannot fix this — only traffic on which a router actually gen
 the wall measurements 1–9 already established, reached here from the security side instead of the
 learnability side.
 
+## 13. The specialist branch: the 17.5% was noise, and the band is large but still unlearnable
+
+Measurement 9 left one thread live — `chinese_zodiac` ranked FIRST at 17.5% captured, the predicted
+direction, since language competence is the one axis where models plausibly differ in KIND rather than
+TIER. But n=118. RouterBench holds **785** Chinese-language rows across 16 slices; pooling them gives
+6.6x the sample, with a size-matched English control so an effect has to be specific to the traffic
+rather than a property of small banks.
+
+| traffic | n | best model | band | nestedness | sole-correct | held-out capture (90% CI) |
+|---|---|---|---|---|---|---|
+| chinese | 785 | gpt-4-1106-preview | **0.2358** | **0.000** | **21.8%** | +3.0% [−3.8%, +11.8%] |
+| english (control) | 785 | gpt-4-1106-preview | 0.1643 | 0.000 | 5.0% | −16.1% [−36.6%, +1.4%] |
+
+**The 17.5% does not survive pooling** — at 6.6x the sample the CI straddles zero. It was a lucky
+split.
+
+The more useful result is what the Chinese traffic *does* have. Its band is **0.236**, roughly double
+the general case; nestedness is **0.000**; and **21.8%** of asks are solved by exactly one model,
+4.4x the English control. This is the most structurally routable traffic in the dataset — precisely
+what the specialist thesis said to go looking for. A capped router still captures nothing from it.
+
+That tests the **learnability** half of the specialist hypothesis on the best available case, and it
+fails, exactly as mechanism 1 predicts: the band is real, it is not nested, and it is still not in the
+prompt.
+
+What this data *cannot* test is the **pool** half. All 11 RouterBench models are Western-trained and
+gpt-4 wins both traffics, so "different models win different languages" is unmeasurable here. That is
+**untestable, not closed** — and the distinction matters. Settling it needs a purpose-built pool
+containing genuine specialists (a Chinese-trained model against a Western one) plus matched traffic,
+which is a build decision and a live spend, not an analysis of existing data. The prior from
+measurement 13 is unfavourable: the band was already large and non-nested here, and that was not
+enough.
+
 ## Where this leaves the architecture
 
 The re-architecture succeeded at what it was for: miner-authored answers and miner-authored code are
@@ -272,9 +305,10 @@ becomes unnecessary rather than merely mitigated. What it cannot do is manufactu
 traffic mix measured, a fixed-harness router either loses to a memoriser or captures nothing.
 
 Launching would need traffic where held-out capture clears ~1.6% of the band on a bank of ≥20k asks.
-Nothing measured so far comes close, and the specialist read that ranked highest (17.5%) was n=118.
-Confirming or killing that would need a purpose-built specialist pool and dataset — the one branch
-these twelve measurements have not closed.
+Nothing measured comes close. The specialist read that ranked highest (17.5%, n=118) is now dead —
+measurement 13 pooled it to n=785 and the CI straddles zero. The only surviving branch is whether a
+purpose-built pool of genuine specialists would make a band learnable that has never been learnable
+yet, which is a live spend rather than an analysis, and carries an unfavourable prior.
 
 Reproduce: `scripts/memoriser_capacity.py`, `scripts/memoriser_detector.py`,
 `scripts/bank_size_gate.py [--pool all]`, `orchestra-koth-router-sim --bank {400,2000,8000}`.

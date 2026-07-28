@@ -37,6 +37,11 @@ services:
       - --network=${NETWORK:-finney}               # mainnet
       - --state=/state/koth_validator_state.json
       - --standings-repo=${STANDINGS_REPO:-}        # e.g. thirtyspokes/standings; blank disables
+      # F2 grace: score an epoch ~10 min after it opens (50 blocks @ 12s). REQUIRED for the
+      # router scalar: the owner's pool reference for epoch N is published a few minutes into
+      # N, so scoring N the instant it opens finds no reference and silently falls back to the
+      # absolute scalar -- forever. Must stay < epoch_blocks (100).
+      - --grace-blocks=${GRACE_BLOCKS:-50}
       # --- optional (uncomment to enable) -----------------------------------------------------------
       # anti-grind (F7) + grace (F2) windows — opt-in; calibrate first (docs/VALIDATOR.md):
       # - --commit-window=${COMMIT_WINDOW:-8}

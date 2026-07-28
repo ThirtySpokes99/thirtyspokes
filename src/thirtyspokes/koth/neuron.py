@@ -151,7 +151,19 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
         """Score and durably stage one epoch, rolling back every in-memory mutation on failure."""
         before = self.val.snapshot()
         try:
-            self.val.run_epoch(self.get_proof, epoch=epoch, submit_weights=False)
+            rep = self.val.run_epoch(self.get_proof, epoch=epoch, submit_weights=False)
+            # SUCCESS MUST BE AUDIBLE. This previously logged only on failure, so a validator scoring
+            # every epoch correctly printed nothing after the startup banner — indistinguishable from
+            # one that had silently wedged, which is precisely how the reference cron failed unnoticed
+            # for three ticks. One line per epoch: who scored, who was disqualified and why, whether
+            # the traffic was routable at all, and where the weight went.
+            king = self.val.reign.members[0].sub.hotkey[:10] if self.val.reign.members else "-"
+            ref = (rep.audit or {}).get("pool_reference") or {}
+            routable = ref.get("routable")
+            print(f"[koth-validator] epoch {epoch}: scored={len(rep.scored)} dq={len(rep.dq)} "
+                  f"king={king} uids={len(rep.weights_by_uid)}"
+                  + (f" routable={routable} gap={ref.get('achievable_gap')}" if ref else "")
+                  + (f" dq_reasons={sorted(set(rep.dq.values()))}" if rep.dq else ""), flush=True)
         except Exception as exc:  # noqa: BLE001 — public RPC failures are retried from a clean state
             self.val.restore(before)
             reconnect = getattr(self.val.chain, "reconnect", None)

@@ -327,8 +327,29 @@ else:
     from thirtyspokes.koth.benchmarks import real_suite
     suite = real_suite()
 started = time.monotonic()
-proof, trace = rt.run(art, hotkey=hotkey, epoch=epoch, nonce=nonce,
-                      suite=suite, n_per_bench=n_per_bench)
+# DISPATCH ON THE ARTIFACT, exactly as `miner.run_once` does. This script is a SECOND copy of the
+# run logic — it lives inside the image, not in the library — and it was still calling rt.run()
+# unconditionally long after the routing path was wired everywhere else. The effect was invisible
+# and total: a miner would get the router path on its laptop and the agent path on the hardware that
+# actually earns, and the image would carry a 750 MB encoder it never touched.
+from thirtyspokes.koth.miner import is_routing_artifact
+if is_routing_artifact(art):
+    from thirtyspokes.koth import harness as H
+    # The head emits rung indices into the HARNESS pool. RTMR3 binds the metadata pool_list, so if
+    # those two disagree the miner is scored against a ladder its head never saw. Refuse rather than
+    # silently route into the wrong action space.
+    if sorted(pool_list) != sorted(H.pool_models()):
+        raise SystemExit("KOTH-ERROR routing artifact but koth-pool != harness ROUTING_POOL: "
+                         "%s vs %s" % (sorted(pool_list), sorted(H.pool_models())))
+    print("KOTH-MODE routing harness=%s rungs=%d" % (H.HARNESS_VERSION, len(H.pool_models())),
+          flush=True)
+    proof, trace = rt.run_router(art.weights, hotkey=hotkey, epoch=epoch, nonce=nonce,
+                                 suite=suite, n_per_bench=n_per_bench,
+                                 pool=H.pool_models(), price_of=H.price_of)
+else:
+    print("KOTH-MODE free-agent (legacy)", flush=True)
+    proof, trace = rt.run(art, hotkey=hotkey, epoch=epoch, nonce=nonce,
+                          suite=suite, n_per_bench=n_per_bench)
 run_seconds = time.monotonic() - started
 print("KOTH-RUN tasks=%d calls=%d cost=%.5f" % (
     len(proof.results), proof.n_calls, proof.total_cost_usd), flush=True)

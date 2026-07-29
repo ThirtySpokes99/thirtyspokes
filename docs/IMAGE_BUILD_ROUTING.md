@@ -86,7 +86,7 @@ RTMR2 must stay zero — the UKI boots directly as `/EFI/BOOT/BOOTX64.EFI` becau
 not start on GCP TDVF, so there is no GRUB command stream. A non-zero RTMR2 means the boot path
 changed and the pinned values are wrong.
 
-### Captured 2026-07-29 — GCP C3, Intel TDX, us-central1-a
+### Captured 2026-07-29 — v18, SUPERSEDED (see v19 below)
 
 | | |
 |---|---|
@@ -143,14 +143,45 @@ print(owner_expected_rtmr3(runtime_measurement=runtime_measurement(),
       suite_version=SUITE_VERSION, pool_allow_list=POOL))   # must equal the captured RTMR3
 ```
 
+### v19 — the shipped image (supersedes v18)
+
+v18 was built, hardware-measured and had governance published for it **while being incapable of
+running a routing model.** The image embeds its own runner as a heredoc in the build script, and that
+copy still called `rt.run()` unconditionally long after the routing path was wired into miner.py,
+devkit.py, validator.py and trainer.py. Nothing tests shell-embedded Python, so it passed every check
+that existed. The tell was in v18's own serial log — `KOTH-ART origin=fallback` and no mode line at
+all — and it was read past.
+
+v19 dispatches on the artifact exactly as `miner.run_once` does, so **both** paths work: routing heads
+through `run_router`, legacy free-agent bundles through `rt.run`. It also refuses to start when the
+injected `koth-pool` disagrees with the harness `ROUTING_POOL`, because RTMR3 binds the metadata pool
+while the head emits into the harness pool — disagreement means scoring a head against a ladder it
+never saw. And it prints `KOTH-MODE`, so a run that cannot say which engine it used is visibly broken.
+
+| | |
+|---|---|
+| UKI sha256 | `478138cb33db3dd8fbd23145c80a782ea1dd4e7f5d24f57a27505831a2f0f154` (reproducible, 2 dirs) |
+| MRTD | `c1ee9c16…` unchanged (GCP TDVF) |
+| **RTMR1** | `f208520a724ba67be76a35e3fc080a805d526daa381cd336932e82d1968b4b890a71c77d2fb7595f6f22645de40b1558` |
+| RTMR2 | `000…0` |
+| RTMR3 | `80f37f62…` **unchanged from v18 — and that is correct**: RTMR3 binds runtime+suite+pool, none of which moved. Only the image's runner changed, which moves RTMR1. An RTMR3 that had also moved would mean the harness contract shifted when it should not have |
+
+**Hardware-verified routing run** (`koth-router-v19`, GCP C3 TDX): a 6,279-param head injected via CVM
+metadata produced `KOTH-MODE routing harness=koth-harness-2 rungs=7`, `KOTH-ART origin=injected`,
+then `KOTH-RUN tasks=3 calls=3 cost=$0.00777` in 207s. Three tasks, three calls — the head chose a
+rung and the verifier accepted first try each time, so nothing escalated.
+
 ### Published 2026-07-29 — testnet 526
 
 ```
-on-chain digest : 9ba743457bdbcedf8b49bbde2a206f78423410e74a2d121e582a04d71862a989
+on-chain digest : a65b5f8cc6025674dccb84fb409e0a76365a8ea72ae680d6ef4939b63c8eb191
 measurement     : c8c5d2ffddf5ae57464b37ecc756ea1cc87bb379b084f49355f8a50baabb401f
-rtmr1 / rtmr3   : f1af6c81… / 80f37f62…        (hardware-captured; rtmr3 computed == measured)
+rtmr1 / rtmr3   : f208520a… / 80f37f62…        (v19; rtmr3 computed == measured)
 pool            : 7 models
 ```
+
+The earlier v18 record (`9ba74345…`, rtmr1 `f1af6c81…`) is superseded and pinned an image that could
+not run routing models.
 
 **The publish appeared to hang for 35 minutes and had actually already succeeded.** `huggingface_hub`
 leaves non-daemon uploader threads behind, so the process blocked in a futex at shutdown with its

@@ -3537,3 +3537,26 @@ def test_weights_can_never_execute_code(tmp_path):
     assert not marker.exists(), "loading weights EXECUTED the pickled payload"
     with pytest.raises(H.ArtifactError):
         H.load_head(pickle.dumps({"theta": [1.0], "hidden": 4}), k=len(H.pool_models()))
+
+
+def test_the_measured_image_dispatches_on_the_artifact_like_the_miner_does():
+    """THE IMAGE IS A SECOND COPY OF THE RUN LOGIC, and CI never executes it.
+
+    `build_koth_image_prod.sh` embeds its own runner as a heredoc. The routing path was wired into
+    miner.py, devkit.py, validator.py and trainer.py — and that heredoc kept calling `rt.run()`
+    unconditionally, so a miner would have got the router path locally and the AGENT path on the
+    hardware that actually earns. The image was built, measured on TDX, and had governance published
+    for it before anyone noticed, because nothing tests shell-embedded Python.
+
+    This cannot execute the heredoc, so it asserts the dispatch is present and symmetric. A crude
+    check that fails loudly beats an untested second implementation.
+    """
+    import pathlib
+    src = pathlib.Path("scripts/build_koth_image_prod.sh").read_text()
+    assert "is_routing_artifact(art)" in src, "the image does not dispatch on the artifact"
+    assert "rt.run_router(" in src, "the image can never run a routing model"
+    assert "rt.run(art," in src, "the image dropped the legacy free-agent path"
+    # the ladder the head is scored on must equal the one measured into RTMR3
+    assert "H.pool_models()" in src and "sorted(pool_list)" in src, (
+        "the image does not verify the injected pool against the harness pool, so a head could be "
+        "routed into an action space it never trained on")

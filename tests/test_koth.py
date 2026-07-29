@@ -3400,3 +3400,28 @@ def test_embeddings_are_quantised_so_three_machines_agree(monkeypatch):
     b = H.encode(["x", "y"])
     assert np.array_equal(a, b), "sub-noise float jitter survives into the embedding"
     assert a.shape == (2, H.EMBED_DIM)
+
+
+def test_decision_scoring_refuses_a_mismatched_reference_pool():
+    """A reference built over a different pool must NOT be scored against.
+
+    `decision_regret` filters picks with `0 <= r < obj.shape[1]`, so against a narrower reference
+    every rung past its width vanishes — no error, just most of the miner's contribution deleted and
+    a confident number computed from the remainder. The live reference cron was in exactly this
+    state: a 2-model pool against a 7-rung action space, which would have scored rungs 0-1 and
+    silently discarded 0-6's majority.
+    """
+    from thirtyspokes.koth.harness import pool_models
+    from thirtyspokes.koth.verify import decision_regret
+
+    k = len(pool_models())
+    assert k > 2
+    narrow = {"models": ["a", "b"], "task_ids": ["t0", "t1"],
+              "scores": [[1.0, 1.0], [0.0, 1.0]], "costs": [[0.01, 0.1], [0.01, 0.1]],
+              "verifier_ok": [[True, True], [True, True]]}
+    # a head that used the real action space: only its lowest rungs survive the width filter
+    chosen = {"t0": 0, "t1": k - 1}
+    ds = decision_regret(chosen, narrow, list(range(2)))
+    assert ds["asks_matched"] == 1, (
+        "decision_regret silently dropped the out-of-range rung — which is precisely why the "
+        "validator must compare pools before scoring rather than trusting this to fail loudly")

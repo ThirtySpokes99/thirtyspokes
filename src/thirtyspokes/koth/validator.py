@@ -108,7 +108,7 @@ class KOTHValidator:
                  n_expected: int | None = None, commit_window: int | None = None,
                  grace_blocks: int = 0, cost_tiebreak: float = 0.02,
                  pool_reference=None, min_headroom_gap: float = 0.05,
-                 dedup_max_l1: float = 0.0):
+                 dedup_max_l1: float = 0.0, routing_pool: list | None = None):
         # memorization backstop: "grounding" (default) = pure proof-inspection, validator runs NO
         # miner code; "probe" = the legacy re-execution fresh-probe (null-pool/secret-bank upgrade).
         self.audit_mode = audit_mode
@@ -179,6 +179,12 @@ class KOTHValidator:
         # `distribution_duplicates`), so any non-zero value eventually disqualifies real miners.
         # Copying is already handled by the reign's earliest-commit tiebreak, which a copy cannot beat.
         self.dedup_max_l1 = dedup_max_l1
+        # The action space this validator scores decisions against. Defaults to the harness pool,
+        # which is what a real deployment runs; the offline sims pass their own mock ladder. Held
+        # explicitly rather than read from the harness at use-time so a validator cannot be scoring
+        # one action space while comparing against another's reference.
+        from .harness import pool_models as _pool_models
+        self.routing_pool = list(routing_pool) if routing_pool is not None else _pool_models()
         # cohort-relative memorization test: need >= min_cohort audited miners to calibrate the
         # probe's difficulty; max_probe_drop caps the allowance so a colluding all-memorizer
         # cohort cannot inflate it (the owner's "no honest probe is harder than this").
@@ -908,11 +914,21 @@ class KOTHValidator:
                 try:
                     chosen = {r.task_id: r.chosen_rung for r in ev.proof_results or ()
                               if getattr(r, "chosen_rung", -1) >= 0}
+                    # THE REFERENCE'S COLUMNS ARE THE ACTION SPACE. A head emits rung indices into
+                    # the harness's pool, and `decision_regret` DROPS any rung past the reference's
+                    # width — silently. So a reference built over a different pool does not fail, it
+                    # deletes most of every miner's contribution and reports a confident number from
+                    # what survives. Refuse instead, and say so in the diagnostics.
                     if chosen and ref.get("verifier_ok"):
-                        order = list(range(len(ref.get("models") or [])))
-                        ds = decision_regret(chosen, ref, order)
-                        if ds:
-                            audit_detail.setdefault("decision", {})[hk] = ds
+                        want = list(self.routing_pool)
+                        have = list(ref.get("models") or [])
+                        if have != want:
+                            audit_detail.setdefault("decision_skipped", {})[hk] = (
+                                f"reference pool {have} != harness pool {want}")
+                        else:
+                            ds = decision_regret(chosen, ref, list(range(len(have))))
+                            if ds:
+                                audit_detail.setdefault("decision", {})[hk] = ds
                 except Exception:               # noqa: BLE001 — diagnostics must never fail a miner
                     pass
             if ev.dq:

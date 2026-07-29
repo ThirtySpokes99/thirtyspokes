@@ -285,7 +285,7 @@ def chain_reader(chain, *, n_per_bench: int, owner_hotkey: str | None = None,
     return read
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901
     """`orchestra-koth-reference` — the owner-side producer.
 
     Measures every pinned pool model on the epoch's slice and publishes the signed result, which is
@@ -297,6 +297,7 @@ def main() -> None:
 
     from ..eval import config
     from ..gateway.gateway import OpenRouterBackend
+    from . import harness as _H
     from .benchmarks import real_suite
     from .epoch import current_epoch, epoch_nonce
 
@@ -305,7 +306,14 @@ def main() -> None:
     p.add_argument("--wallet", default="owner")
     p.add_argument("--hotkey", default="default", help="hotkey NAME inside the wallet")
     p.add_argument("--network", default="finney")
-    p.add_argument("--pool", required=True, help="comma-separated pinned model allow-list")
+    # Defaults to the harness's ROUTING_POOL, and that default is load-bearing. The reference's
+    # columns ARE the router's action space: a head emits rung indices into this list, and
+    # `decision_regret` silently DROPS any rung past the reference's width. Publishing a reference
+    # over a different pool therefore does not error — it quietly deletes most of every miner's
+    # contribution from the score. The cron previously passed a 2-model list against a 7-rung pool.
+    p.add_argument("--pool", default=",".join(_H.pool_models()),
+                   help="comma-separated pinned model allow-list (default: the harness routing pool, "
+                        "which is what miners route over — override only if you know why)")
     p.add_argument("--n-per-bench", type=int, default=8,
                    help="MUST match the validators' --n-per-bench, or the record will not match")
     p.add_argument("--epoch", type=int, help="default: the current epoch")

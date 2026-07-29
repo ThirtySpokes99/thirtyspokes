@@ -250,6 +250,9 @@ def _run(world, suite, backend, platform, chain, store, scored_n, bank,
                         # explicit: the validator DEFAULTS this off, and the sweep below
                         # shows why — at a large bank it disqualifies honest routers
                         dedup_max_l1=dedup_l1,
+                        # the sim's own mock ladder, not the production pool: the validator must
+                        # score decisions against the action space the heads actually emitted into
+                        routing_pool=list(POOL),
                         # the owner's reference for exactly this epoch's slice — the same asks the
                         # harness will draw, so the decision is scored against every alternative
                         pool_reference=lambda e, nc: world.reference(

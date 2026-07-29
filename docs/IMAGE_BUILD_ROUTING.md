@@ -191,8 +191,27 @@ prints + `os._exit(0)`, the same fix `reference.py` already carried), but if you
 build: **check the chain before re-running.** `chain.governance_digest()` tells you whether it landed;
 re-running a publish that already succeeded is harmless but the 35 minutes are not.
 
-**6. Smoke the enforcing path** — `scripts/koth_enforce_smoke.py` must accept a proof from the pinned
-image and reject wrong-image, mock and tampered variants.
+**6. Smoke the enforcing path** — `scripts/koth_enforce_smoke.py`, run **inside a TDX guest** (the
+measured image has no shell, so use a stock Ubuntu CVM with the wheel installed).
+
+**Run 2026-07-29 on a GCP C3 — ALL CHECKS PASSED:**
+
+```
+[2] RTMR3 self-measure == owner-expected                MATCH
+[3] quote vs sysfs, all 5 measurements                  MATCH
+[4] enforce=True, fully pinned      valid=True  score=0.526
+[5] 8 fail-closed paths, each rejecting for the right reason:
+    wrong image (RTMR2)  -> unapproved_runtime      MRTD not approved  -> unapproved_runtime
+    MRTD gate unset      -> mrtd_gate_unset         RTMR gate unset    -> rtmr_gate_unset
+    RTMR gate incomplete -> rtmr_gate_unset         TCB policy unset   -> tcb_policy_unset
+    mock TEE quote       -> mock_quote_rejected     tampered (cost=0)  -> report_data_mismatch
+```
+
+The first run **failed its own accept step** with `unconfined_agent`: the smoke built its runtime
+without `confine=True`, while production uses `confine=True, require_confinement=True` and
+`enforce=True` rejects any proof whose attested `confined` flag is false. The script predated the
+confinement gate and nothing re-ran it on hardware afterwards, so a check documented as "the full
+enforce gate" could never have passed. Fixed to mirror production.
 
 ## The residual risk I could not remove
 

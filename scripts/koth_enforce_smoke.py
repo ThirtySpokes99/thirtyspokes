@@ -54,7 +54,15 @@ def main() -> None:
     pool = MockPool()
     allow = pool.allowed
     backend = PinnedBackend(pool, allow)
-    runtime = KOTHRuntime(backend, tdx.TDXPlatform())     # REAL hardware attestation root
+    # confine=True MIRRORS PRODUCTION. The measured image runs
+    # `KOTHRuntime(..., confine=True, require_confinement=True)`, and `enforce=True` REJECTS any
+    # proof whose attested `confined` flag is false (`unconfined_agent`) — an unconfined agent has
+    # network egress and can reach an off-allow-list model with its own key, voiding the pool
+    # pinning and the metering. Without these flags this smoke fails its own ACCEPT step on every
+    # honest run, which is exactly what it did: it was written before the confinement gate landed and
+    # nothing re-ran it on hardware afterwards.
+    runtime = KOTHRuntime(backend, tdx.TDXPlatform(),      # REAL hardware attestation root
+                          confine=True, require_confinement=True)
 
     # 2. bind the runtime into RTMR3 (one-way; idempotent within a boot)
     rtmr3 = runtime.measure_self(allow)

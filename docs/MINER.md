@@ -235,12 +235,12 @@ No token needed:
 ```bash
 BASE=https://huggingface.co/buckets/thirtyspokes/cvm-runtime-image/resolve
 
-curl -sL $BASE/runtime/latest.json                       # -> {"version": "v14"}
+curl -sL $BASE/runtime/latest.json                       # -> {"version": "v20"}
 
 # the manifest first: hashes, measurements, and the recipe commit that built the image
-curl -sL $BASE/runtime/v14/manifest.json | tee manifest.json
+curl -sL $BASE/runtime/v20/manifest.json | tee manifest.json
 
-curl -sLO $BASE/runtime/v14/koth-runtime.tar.gz
+curl -sLO $BASE/runtime/v20/koth-runtime.tar.gz
 sha256sum koth-runtime.tar.gz     # MUST equal manifest.image.sha256
 ```
 
@@ -267,14 +267,14 @@ Import the disk into your own cloud (GCP shown; Azure DCesv6 and bare metal work
 
 ```bash
 gsutil cp koth-runtime.tar.gz gs://YOUR-BUCKET/
-gcloud compute images create koth-runtime-v14 \
+gcloud compute images create koth-runtime-v20 \
   --source-uri=gs://YOUR-BUCKET/koth-runtime.tar.gz \
   --guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC
 
 gcloud compute instances create my-koth-miner \
   --zone=us-central1-a --machine-type=c3-standard-4 \
   --confidential-compute-type=TDX --maintenance-policy=TERMINATE \
-  --image=koth-runtime-v14 \
+  --image=koth-runtime-v20 \
   --network-interface=nic-type=GVNIC --boot-disk-size=50GB \
   --metadata="^@^koth-epoch=<E>@koth-nonce=<N>@koth-hotkey=<YOUR_SS58>@koth-pool=<ALLOW_LIST>" \
   --metadata-from-file=koth-secrets=secrets.env,\
@@ -287,12 +287,15 @@ runs with **zero network egress**; its only channel is the metered `call_model`.
 
 | the image, pinned | |
 |---|---|
-| GCP image | `koth-runtime-v14` |
-| UKI sha256 | `4757aaabe0cfef16732da7db6c92043cde55552c379d6048b8c7149fa5daff63` |
-| MRTD | `9bf86e6280ec4282…` *(GCP TDVF — identical on every GCP TDX guest, a coarse check only)* |
-| **RTMR1** | `6d8893eb9255aad4b52045250f6aaecefbf93163ebcc2b9e3149930314df6c04…` **← the per-image anchor** |
-| RTMR2 | `0000…` *(zero under direct-UKI boot)* |
-| RTMR3 | derived from runtime+suite+pool, extended by the runtime at startup |
+| GCP image / bucket version | `koth-runtime-v20` |
+| image sha256 | `cbf0936ddef265112591835b30215ca69ce643dcf92249bb139b7b1db90d9e26` |
+| UKI sha256 | `1b49dec7ae0098705b03318b6ff0cab44628e73b7fcb02fa550b25a5ce901a4d` |
+| verity roothash | `4d776060b394e58b551feda9b71e77738b43818301168104f8182458272a6dd4` |
+| recipe commit | `25f50c6816e565a4be62982552b3efcc9fec4f07` |
+| MRTD | `c1ee9c16…` *(GCP TDVF — identical on every GCP TDX guest, a coarse check only)* |
+| **RTMR1** | `76947191ea7fde9f24fe498b17592f97ba0960cd95103ec77c876220be9cbf7d0d1e5c2da05a495f27bf953874425e6b` **← the per-image anchor** |
+| RTMR3 | `80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044` *(binds runtime+suite+pool)* |
+| on-chain governance | `b024c4161a1bcf41529c8f4aa92658152901902ca78853ef4f335ec62d097771` |
 
 The validator gates every proof on MRTD + RTMR1/2/3 against the owner's on-chain record. Change *any*
 byte of the rootfs and RTMR1 changes → `unapproved_runtime` → you earn nothing.

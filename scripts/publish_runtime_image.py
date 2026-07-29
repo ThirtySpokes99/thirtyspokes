@@ -83,6 +83,29 @@ def build_manifest(*, version: str, image_path: str, uki_sha256: str, roothash: 
     }
 
 
+def _refuse_unless_reproducible(dry_run: bool) -> str:
+    """The manifest's whole value is `recipe_commit`: check out that revision, rebuild, confirm you
+    got this image. If the working tree moved after the build, that claim is FALSE and the first
+    miner to test it concludes the publisher is either careless or lying.
+
+    This happened. v19 was published-ready with a recipe_commit naming source that had changed after
+    the build (miner.py), and only a `--dry-run` plus a manual wheel comparison caught it. The check
+    is mechanical, so it should not depend on remembering to look.
+    """
+    import subprocess
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
+                           check=True).stdout.strip()
+    if dirty and not dry_run:
+        raise SystemExit(
+            "REFUSING TO PUBLISH: the working tree is dirty, so recipe_commit "
+            f"{head[:12]} does not describe what was built.\n"
+            f"Uncommitted:\n{dirty}\n"
+            "Commit (or stash), REBUILD, re-measure on TDX, then publish.")
+    return head
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Publish the KOTH measured runtime image to HuggingFace")
     p.add_argument("--version", required=True, help="image version, e.g. v14")
@@ -96,6 +119,7 @@ def main() -> None:
     p.add_argument("--pool", required=True, help="comma-separated owner-pinned model allow-list")
     p.add_argument("--dry-run", action="store_true", help="print the manifest, upload nothing")
     args = p.parse_args()
+    _refuse_unless_reproducible(args.dry_run)
 
     pool = [m.strip() for m in args.pool.split(",") if m.strip()]
     man = build_manifest(version=args.version, image_path=args.image, uki_sha256=args.uki_sha256,
@@ -120,7 +144,11 @@ def main() -> None:
     print("and remember RTMR1 on-chain is the gate that actually stops a bad image.")
     print("\nNow pin the SAME measurements on-chain (validators gate on these, not on the manifest):")
     print(f"  orchestra-koth-owner --mrtd {args.mrtd} --rtmr1 {args.rtmr1} --rtmr2 {args.rtmr2} \\")
-    print(f"    --pool \"{','.join(pool)}\" --netuid ${NETUID} --wallet owner --network ${NETWORK}")
+    # ${{...}} escapes to a literal ${...}: these are SHELL variables for the operator to fill in,
+    # not f-string fields. Unescaped, this raised NameError *after* a successful upload — making a
+    # publish that had entirely worked look like it had failed.
+    print(f"    --pool \"{','.join(pool)}\" --netuid ${{NETUID}} --wallet owner "
+          f"--network ${{NETWORK}}")
 
 
 if __name__ == "__main__":

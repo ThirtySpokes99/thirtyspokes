@@ -207,3 +207,46 @@ on a rounding boundary can still differ, and a near-tie in the head's output can
 effect is rare and shows up as a miner's local dev-kit result occasionally disagreeing with their
 attested run. Removing it entirely would mean replacing torch with a fixed-point or ONNX encoder,
 which is a real option if miners report it as a problem — and a much larger change than this one.
+
+
+---
+
+## v20 — SHIPPED (2026-07-29)
+
+The published image. v18 could not run routing models; v19 could, but its manifest named a
+`recipe_commit` that would **not** rebuild it, because `miner.py` changed after the build. v20 was
+built from a clean tree at the commit it claims.
+
+| | |
+|---|---|
+| bucket | `runtime/v20/` in `thirtyspokes/cvm-runtime-image` |
+| image sha256 | `cbf0936ddef265112591835b30215ca69ce643dcf92249bb139b7b1db90d9e26` |
+| UKI sha256 | `1b49dec7ae0098705b03318b6ff0cab44628e73b7fcb02fa550b25a5ce901a4d` (reproducible, 2 dirs) |
+| verity roothash | `4d776060b394e58b551feda9b71e77738b43818301168104f8182458272a6dd4` |
+| recipe commit | `25f50c6816e565a4be62982552b3efcc9fec4f07` |
+| **RTMR1** | `76947191ea7fde9f24fe498b17592f97ba0960cd95103ec77c876220be9cbf7d0d1e5c2da05a495f27bf953874425e6b` |
+| RTMR3 | `80f37f62…` unchanged across v18→v20, correctly: it binds runtime+suite+pool, and only the image changed |
+| on-chain governance | `b024c4161a1bcf41529c8f4aa92658152901902ca78853ef4f335ec62d097771` (testnet 526) |
+
+Hardware-verified: `KOTH-MODE routing harness=koth-harness-2 rungs=7`, `KOTH-ART origin=injected`.
+
+### The chain anyone can check without trusting the publisher
+
+```
+recipe_commit 25f50c6 → rebuild → UKI 1b49dec7… → boot on TDX → RTMR1 76947191…
+                                                                 ↕ must match
+                                    on-chain governance b024c416…
+```
+
+### Publish LAST, and the guard that now enforces it
+
+Three images were built this session and two were wrong, both for the same reason: **the tree kept
+moving after the build.** An image is a snapshot; every commit under `src/` invalidates it, and
+nothing in the process objected.
+
+`publish_runtime_image.py` now **refuses to publish from a dirty tree**, because the failure is
+mechanical and should not depend on someone remembering to compare wheel hashes. It does not yet
+verify that the baked wheel matches a fresh build of HEAD — that is the stronger check and the one
+that actually caught v19; worth adding if this cycle repeats.
+
+Order that works: freeze the tree → tests green → build → measure → publish governance → publish image.

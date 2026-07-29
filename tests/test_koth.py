@@ -3344,3 +3344,32 @@ def test_trainer_produces_a_loadable_head_and_holds_out(monkeypatch):
     assert stats["n_holdout"] > 0 and stats["n_train"] > stats["n_holdout"]
     assert 0.0 <= stats["decision_quality"] <= 1.0
     assert stats["oracle"] >= stats["router"]          # cannot beat the per-ask oracle
+
+
+def test_devkit_and_miner_agree_on_which_engine_runs(env, monkeypatch):
+    """The dev kit's whole promise is "what I see locally is what the validator scores". That is
+    only true if it dispatches on the artifact exactly as the miner daemon does — otherwise it lies
+    to precisely the miners who rely on it, and the routing decisions never appear in the report."""
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.devkit import evaluate
+    from thirtyspokes.koth.miner import routing_artifact
+    from thirtyspokes.router import RouterHead
+
+    k = len(H.pool_models())
+    monkeypatch.setattr(H, "encode",
+                        lambda ps: np.stack([np.full(H.EMBED_DIM, (len(p) % 7) / 7.0) for p in ps]))
+    theta = np.random.default_rng(0).normal(0, 0.3, RouterHead(H.EMBED_DIM, k, 8).n_params)
+    art = routing_artifact(H.save_head(theta, 8))
+
+    class AnyPool:
+        """Answers for whatever rung the head picks — the dev kit must exercise the pinned pool."""
+        def complete(self, model, messages, params):
+            assert model in H.pool_models(), f"routed to an unpinned model: {model}"
+            return "Answer: 1", 8, 4, 0.0001
+
+    r = evaluate(art, pool_backend=AnyPool(), suite=env.suite, n_per_bench=2, f_min=0.0)
+    assert r["valid"], r["reason"]
+    assert r["decisions"], "a routing model was scored without reporting its decisions"
+    assert all(0 <= d["rung"] < k for d in r["decisions"])

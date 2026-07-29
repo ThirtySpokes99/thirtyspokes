@@ -1,7 +1,7 @@
 # ThirtySpokes — mining guide
 
-You compete to build the **routing / orchestration agent** that gets the highest benchmark quality
-*per dollar* over an owner-pinned pool of models. **King = the eligible miner with the highest
+You compete to build the **routing model** that gets the highest benchmark quality *per dollar* over
+an owner-pinned pool of models. You ship weights; the subnet owns the engine that runs them. **King = the eligible miner with the highest
 cost-budgeted quality.** For *how the mechanism works* see [`DESIGN.md`](DESIGN.md); to stand up a
 subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
@@ -10,39 +10,63 @@ subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
 ## What you build
 
-One thing: a Python source file defining `build_agent(weights) -> agent`, where
-`agent(prompt, call_model) -> answer`. `call_model(model, messages, params)` is your **only** channel
-to the pool — it returns the model's response text and is metered for cost.
+**One thing: a routing model.** A small set of weights that, given a task, decides *which pool model
+should answer it*. You do not write code — the subnet owns the engine, and no miner code runs
+anywhere in the system.
 
-```python
-# my_router.py  — a cost-aware cascade: cheap first, escalate hard prompts
-import json
-PARAMS = {"max_tokens": 16384, "reasoning": {"effort": "low"}}   # see the note below
-def build_agent(weights):
-    cfg = json.loads(weights.decode())            # your routing config / trained params
-    cheap, strong = cfg["cheap"], cfg["strong"]
-    def agent(prompt, call_model):
-        ans = call_model(cheap, [{"role": "user", "content": prompt}], PARAMS)
-        if len(prompt) > 400 or "prove" in prompt.lower():      # your routing logic
-            ans = call_model(strong, [{"role": "user", "content": prompt}], PARAMS)
-        return ans
-    return agent
+```
+your task → [frozen encoder, owned by the harness] → embedding
+          → [YOUR HEAD: ~6K weights]               → distribution over pool models
+          → [harness] calls that model, escalates if the verifier rejects, returns its answer
 ```
 
-> **Mind `max_tokens` and `reasoning`.** The ranked benchmark is code, so an answer is a whole
-> program — a small cap truncates it mid-function and it grades as *wrong*, which is
-> indistinguishable from your router having picked a bad model. And `max_tokens` counts **thinking**
-> tokens: give a reasoning model an unbounded budget and it spends the lot deliberating and returns
-> nothing (measured at 8k *and* 32k). The owner's pool reference measures every model at
-> `max_tokens 16384, reasoning effort low`, so those settings put you on the same footing as the
-> frontier you are scored against. Going lower means competing against models that were given more
-> room than you gave yours. Allowed params: `max_tokens`, `temperature`, `top_p`, `stop`, `reasoning`.
+Your artifact is a single `weights.npz` holding `theta` (a flat float vector) and `hidden` (one
+integer). It loads through `np.load(allow_pickle=False)` into a strict shape check, capped at
+50,000 parameters. The encoder, the head architecture, the ladder, the verifier and the task
+sampling are all fixed and bound into the measured image.
 
-Your bundle = `source.py` + `weights.bin` (opaque bytes — a trained model, a config, whatever) and it
-is **public** on your HuggingFace repo. The competitive surface is open: a trained routing model,
-orchestration (ensemble / verify / decompose / cascade), efficient prompting — anything that lifts
-quality or cuts cost. **You write your own training — the subnet provides no trainer (that's your
-edge).** Serialize your policy into `weights.bin` and publish it beside your `source.py`.
+**Why this shape.** A routing head *cannot emit an answer* — it emits a choice, and the harness
+returns the chosen model's response verbatim. So answer-memorisation is impossible by construction,
+and the whole apparatus that used to police it (grounding checks, source scans, confinement of your
+code) simply does not apply to you.
+
+**What you are competing on** is one judgement, made per task: *is this cheap-solvable, and how far
+should I trust a cheap answer?* The harness enters the ladder where your head says, runs the pinned
+verifier, and escalates while the verifier rejects. So a good head learns both which asks are easy
+and when a cheap answer should not be believed.
+
+### Train it
+
+Training is free and takes seconds — the head is ~6K parameters. What costs money is the **training
+data**: what every pool model would have produced on each task.
+
+```bash
+# 1. Run the pinned pool over suite tasks. YOU pay for this; the data is yours and reusable.
+uv run orchestra-koth-train build --n-per-bench 40 --out outcomes.json
+
+# 2. Fit a head. Scored HELD OUT, and against the baseline that matters.
+uv run orchestra-koth-train train --outcomes outcomes.json --out weights.npz
+```
+
+The trainer prints:
+
+```
+decision quality  0.71        1.0 = you matched the per-ask oracle
+regret vs oracle  0.04
+router +0.83  vs always-cheapest +0.79  vs oracle +0.91
+```
+
+**Read the middle number first.** `always-cheapest` is what you get by ignoring the task entirely and
+always entering at the bottom rung. If your head does not beat it, you are spending more for nothing
+and the trainer says so. Beating the oracle is impossible; beating always-cheapest is the whole job.
+
+Everything is scored **held out**, on asks the head never trained on. That is deliberate: a head
+fitted to the tasks it will be scored on can reach 60% capture in-sample and ~0% on unseen asks —
+a lookup table, not a router — and only the held-out number predicts your emissions.
+
+You are free to ignore this trainer entirely and fit `theta` however you like: a different optimiser,
+different features from the same embeddings, a different objective. The format is the contract, not
+the method.
 
 ## What secures this — the trust boundary (read this)
 
@@ -155,15 +179,18 @@ difference matters:
 
 ```bash
 # 1. FREE smoke test — synthetic benchmarks + a mock pool, no key, no Docker, no cost.
-#    Proves your agent loads, calls the pool and returns answers. It CANNOT tell you whether you
-#    can route: the mock pool's difficulty is invented, so its headroom is meaningless.
-uv run orchestra-koth-dev --source my_router.py --weights my_weights.bin
+#    Proves your head loads, routes, and produces graded answers. It CANNOT tell you whether you
+#    can route well: the mock pool's difficulty is invented, so its headroom is meaningless.
+uv run orchestra-koth-dev --routing-model weights.npz
 
-# 2. REAL — the live suite (LiveCodeBench + MMLU/GSM8K floors) over real pool models.
-#    This is what the validator scores. Needs OPENROUTER_API_KEY (you pay) and Docker.
-uv run orchestra-koth-dev --source my_router.py --weights my_weights.bin \
-  --real --pool "model-a,model-b,model-c"
+# 2. REAL — the live suite over the owner-pinned pool. This is what the validator scores.
+#    Needs OPENROUTER_API_KEY (you pay). The pool is NOT yours to choose here: it is your head's
+#    action space, pinned in the harness, so --pool is ignored on this path.
+uv run orchestra-koth-dev --routing-model weights.npz --real
 ```
+
+The report includes a `decisions` block — which rung your head entered for each task and how far it
+escalated. That is your actual output; the accuracy figures beside it are largely the pool's work.
 Both print per-benchmark acc/lcb, total_cost, `Q_lcb`, `eligible`, `n_pool_calls` from the same code
 path the validator runs. Iterate on (1) until nothing is broken, then on (2) until `eligible: true`
 under the budget with a `Q_lcb` you would bet a CVM boot on.
@@ -182,6 +209,19 @@ huggingface-cli login                     # to publish your public bundle
 btcli wallet new_coldkey && btcli wallet new_hotkey
 btcli subnet register --netuid 99 --wallet.name miner --subtensor.network finney
 ```
+
+Your published bundle is your `weights.npz` plus the harness version string as its "source" — the
+miner writes both for you. Point the daemon at your head:
+
+```bash
+orchestra-koth-miner --netuid 99 --wallet miner --hotkey default \
+  --repo YOU/koth-miner --routing-model weights.npz
+```
+
+`--routing-model` validates the head against the pinned pool **at startup** rather than mid-epoch,
+and forces the owner's action space: `--pool` is ignored, because the ladder your head was trained
+against has to be the ladder it is scored on. The legacy `--source`/`--weights` free-agent path still
+exists but is not what this subnet competes on.
 ### Get the owner's measured image
 
 You cannot mine from a stock VM — an enforcing validator rejects it (`unapproved_runtime`). The image

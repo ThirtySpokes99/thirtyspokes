@@ -39,19 +39,34 @@ sudo scripts/build_koth_image_prod.sh
 confirm the size — if `hf/` did not grow by ~90 MB the model is not there and every routing run will
 fail at boot with `HF_HUB_OFFLINE=1`.
 
-**2. Image size.** Expect roughly **+300 MB**: ~200 MB CPU-only torch, ~50 MB transformers, ~90 MB
-model. The recipe pins the CPU wheel explicitly *before* `sentence-transformers`, because the default
-resolve pulls the **1.2 GB CUDA build** — GPU runtime this image can never use, hashed into RTMR1.
-If the image jumped by more than a gigabyte, that pin failed.
+**2. Image size — MEASURED, and my first estimate was wrong.** I predicted "+300 MB, ~200 MB torch".
+The real CPU-only torch is **750 MB**, so the true addition is ~840 MB and the finished image is
+**2.8 GB**. Recorded because the prediction was off by 2.5x and the runbook should carry the measured
+number, not the guess.
+
+The CPU pin still held, which is the thing that actually matters: the recipe installs CPU-only torch
+explicitly *before* `sentence-transformers`, because the default resolve pulls the **1.2 GB CUDA
+build** — GPU runtime this image can never use, every byte hashed into RTMR1. Verify the pin by its
+signature rather than by total size: **`site-packages/nvidia/` must not exist**. If it does, the pin
+failed and the image carries a CUDA stack it will never run.
 
 **3. Reproducibility — build TWICE, in DIFFERENT directories.** This has bitten three times already
 (venv shebangs, `.pyc` `co_filename`, pip `RECORD`), and torch adds a large new surface:
 
 ```bash
-BUILD_DIR=/var/tmp/repro-A sudo scripts/build_koth_image_prod.sh
-BUILD_DIR=/var/tmp/repro-B sudo scripts/build_koth_image_prod.sh
-sha256sum /var/tmp/repro-{A,B}/out/koth.efi        # must be IDENTICAL
+OUT=/var/tmp/repro-A bash scripts/build_koth_image_prod.sh
+OUT=/var/tmp/repro-B bash scripts/build_koth_image_prod.sh
+sha256sum /var/tmp/repro-{A,B}/koth-runtime.efi     # must be IDENTICAL
 ```
+
+**Run 2026-07-29 — PASSED.** Both builds produced
+
+```
+516ab1799edd7551f9613ca98292a9ddee4609b3affb100b072ed0c34d0298bf  koth-runtime.efi
+```
+
+so torch's ~750 MB of new binary surface carries no build-path, timestamp or pid into the rootfs.
+(The variable is `OUT`, not `BUILD_DIR` — an earlier draft of this runbook named the wrong one.)
 
 Compare the **UKI and roothash**, never `koth-runtime.raw` — its ESP differs by ~14 unmeasured bytes
 every build. A mismatch means something wrote a path, a timestamp or a pid into the rootfs; the

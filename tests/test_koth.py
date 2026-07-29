@@ -3592,6 +3592,11 @@ def test_miner_and_validator_agree_on_slice_size():
         f"slice size disagrees: miner class={miner_default} miner cli={mnr} validator cli={val} "
         f"-> every miner on defaults would be DQ'd `unexpected_task`")
 
+    op = cli_default("src/thirtyspokes/koth/gcp_operator.py")
+    assert op == val, (
+        f"the GCP operator boots miners at n_per_bench={op} while the validator scores {val} — "
+        f"every epoch it produces would be DQ'd `unexpected_task`")
+
     cron = pathlib.Path("scripts/koth-reference-cron.sh").read_text()
     m = re.search(r"--n-per-bench (\d+)", cron)
     assert m and int(m.group(1)) == val, (

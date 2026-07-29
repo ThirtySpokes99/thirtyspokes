@@ -3425,3 +3425,115 @@ def test_decision_scoring_refuses_a_mismatched_reference_pool():
     assert ds["asks_matched"] == 1, (
         "decision_regret silently dropped the out-of-range rung — which is precisely why the "
         "validator must compare pools before scoring rather than trusting this to fail loudly")
+
+
+# --- claims-as-assertions: every recent defect was a docstring the code did not honour ----------
+# The param cap "prevented memorisation" (it did not), report_data survived schema growth (it did
+# not), HARNESS_VERSION was in the runtime measurement (it was not), the reference pool matched the
+# action space (it did not). Each was found by writing a test for something already asserted in
+# prose. These pin the remaining load-bearing claims so the next drift fails CI instead of mainnet.
+
+def test_calibration_constants_stay_on_the_right_side_of_their_measurements():
+    """Every threshold here was set from a measurement, and each has a side it must stay on."""
+    import inspect
+
+    from thirtyspokes.koth.harness import ROUTING_POOL, price_of
+    from thirtyspokes.koth.validator import KOTHValidator
+    d = {k: v.default for k, v in inspect.signature(KOTHValidator.__init__).parameters.items()}
+
+    # honest routers were MEASURED at 0.954 action agreement; a copy threshold at or below that
+    # disqualifies miners for convergent evolution (scripts/head_spread.py)
+    assert d["dedup_agree"] > 0.954, "copy threshold sits below measured honest agreement"
+
+    # distribution dedup cannot be separated from honest convergence at scale, so it ships OFF
+    assert d["dedup_max_l1"] == 0.0
+
+    # NOT comparable: budget_per_task is DOLLARS (a spend ceiling), cost_tiebreak is SCORE POINTS
+    # (a ranking deduction). An earlier version of this test asserted one was smaller than the other,
+    # which is a unit error dressed as an invariant. Assert what each actually has to satisfy.
+    assert d["budget_per_task"] > 0, "no spend ceiling at all"
+    # quality must LEAD and cost must only break ties: a full-scale cost deduction cannot outweigh a
+    # real accuracy difference, and per-benchmark accuracy differences worth ranking are >= ~0.05
+    assert 0 < d["cost_tiebreak"] <= 0.05, "cost stopped being a tiebreak and became the score"
+
+    # the ladder must be ordered, or 'escalate' can mean 'get cheaper'
+    assert [price_of(m) for m, _i, _o in ROUTING_POOL] == sorted(price_of(m) for m, _i, _o in ROUTING_POOL)
+
+    # the ladder must actually be a LADDER: a pool whose ends are close gives a router nothing to
+    # trade off, which is the dominator-pool failure measured five times in docs/ROUTING_MEASUREMENTS.md
+    cheap, dear = price_of(ROUTING_POOL[0][0]), price_of(ROUTING_POOL[-1][0])
+    assert dear / cheap >= 10.0, f"price ladder spans only {dear / cheap:.1f}x — too flat to route on"
+
+
+def test_the_measurement_actually_covers_what_the_docstrings_claim_it_covers():
+    """`runtime_measurement` is the only thing standing between miners and an unapproved engine.
+    harness.py claimed membership before it was true, so assert it component by component: a change
+    to ANY of these must move the measurement, or an owner could swap the engine underneath miners
+    without invalidating a single approved-measurement entry."""
+    from thirtyspokes.koth import harness as H, runtime as R
+
+    base = R.runtime_measurement()
+    for attr, mod, new in [("HARNESS_VERSION", H, "changed-harness"),
+                           ("SUITE_VERSION", R, "changed-suite"),
+                           ("KOTH_RUNTIME_VERSION", R, "changed-runtime")]:
+        old = getattr(mod, attr)
+        try:
+            setattr(mod, attr, new)
+            assert R.runtime_measurement() != base, (
+                f"{attr} is NOT part of the attested measurement — it can change without "
+                f"invalidating any approved image")
+        finally:
+            setattr(mod, attr, old)
+    assert R.runtime_measurement() == base
+
+
+def test_a_routing_head_can_never_author_an_answer():
+    """The claim the whole architecture rests on: answer-memorisation is impossible BY CONSTRUCTION,
+    which is why grounding/scan/confinement retire on this path. If a head could influence the
+    returned text, every one of those retirements would be unsafe."""
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.router import RouterHead
+
+    pool = H.pool_models()
+    theta = np.random.default_rng(0).normal(0, 5.0, RouterHead(H.EMBED_DIM, len(pool), 8).n_params)
+    head, th = H.load_head(H.save_head(theta, 8), k=len(pool))
+    dist = head.distribution(th, np.random.default_rng(1).normal(0, 1, (4, H.EMBED_DIM)))
+    assert dist.shape == (4, len(pool))
+    assert np.allclose(dist.sum(axis=1), 1.0)            # only ever a distribution over ACTIONS
+    assert ((dist >= 0) & (dist <= 1)).all()
+
+    sentinel = "POOL-RESPONSE-VERBATIM-9f3a"
+    answer, used = H.run_cascade(0, "anything", None, pool, list(range(len(pool))),
+                                 lambda m, msg, p: sentinel, {})
+    assert answer == sentinel, "the harness altered the pool's answer"
+    assert used and pool[used[0]] in pool
+
+
+def test_weights_can_never_execute_code(tmp_path):
+    """`allow_pickle=False` is load-bearing: numpy's pickle path runs arbitrary code at load time,
+    which would reintroduce the exact capability the fixed harness exists to remove."""
+    import io
+    import pickle
+
+    import numpy as np
+    import pytest
+
+    from thirtyspokes.koth import harness as H
+
+    # The payload must execute on LOAD, not while being built — an earlier version raised inside
+    # __reduce__ during np.save, so it only proved the test could not construct its own attack.
+    marker = tmp_path / "pwned"
+
+    class Boom:
+        def __reduce__(self):
+            return (pathlib.Path.touch, (marker,))
+
+    buf = io.BytesIO()
+    np.save(buf, np.array([Boom()], dtype=object), allow_pickle=True)
+    with pytest.raises(H.ArtifactError):
+        H.load_head(buf.getvalue(), k=len(H.pool_models()))
+    assert not marker.exists(), "loading weights EXECUTED the pickled payload"
+    with pytest.raises(H.ArtifactError):
+        H.load_head(pickle.dumps({"theta": [1.0], "hidden": 4}), k=len(H.pool_models()))

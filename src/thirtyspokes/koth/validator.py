@@ -98,13 +98,13 @@ class KOTHValidator:
                  budget: float = 0.5, f_min: float = 0.1, margin: float = 0.03,
                  tol: float = 0.02, cost_tol: float = 0.10, min_tasks: int = 5,
                  cost_margin: float = 0.10,
-                 dedup_agree: float = 0.95, epoch_blocks: int = EPOCH_BLOCKS,
+                 dedup_agree: float = 0.98, epoch_blocks: int = EPOCH_BLOCKS,
                  pool_spec: dict | None = None, approved_mrtd=None, approved_rtmr=None,
                  tcb_accept: frozenset | None = None, collateral: str | None = None,
                  pccs_url: str | None = None, enforce: bool = False, probe_bank=None,
                  min_cohort: int = 3, max_probe_drop: float = 0.25,
                  audit_mode: str = "grounding", scoring_mode: str = "accumulate",
-                 half_life_epochs: float = 200.0, budget_per_task: float = 0.02,
+                 half_life_epochs: float = 200.0, budget_per_task: float = 0.015,
                  n_expected: int | None = None, commit_window: int | None = None,
                  grace_blocks: int = 0, cost_tiebreak: float = 0.02,
                  pool_reference=None, min_headroom_gap: float = 0.05,
@@ -118,6 +118,11 @@ class KOTHValidator:
         # the offline sim, but it makes the crown a per-epoch lottery: a single lucky slice can
         # dethrone, and nothing costs a miner for the epochs it hides.
         self.scoring_mode = scoring_mode
+        # 0.015 $/task. MEASURED cost of the pinned ladder: $0.00036 at the cheapest rung to
+        # $0.00367 at the priciest, so escalating through ALL SEVEN rungs on one ask costs ~$0.0092.
+        # This ceiling therefore permits a full escalation with headroom for price drift, while a
+        # head that escalates on everything runs out of budget — which is the intended pressure:
+        # entering high is a decision, not a free default.
         self.budget_per_task = budget_per_task
         self._evidence = EvidenceStore(half_life_epochs)
         self.pool_spec = pool_spec or {"kind": "mock"}    # sandbox runs the probe against this pool
@@ -173,6 +178,11 @@ class KOTHValidator:
         # not". Below it the validator declines to score frontier-relatively and says so in the
         # feed, rather than reporting a confident number about nothing.
         self.min_headroom_gap = min_headroom_gap
+        # 0.98, not 0.95. MEASURED (scripts/head_spread.py): independently-trained HONEST routers
+        # reach 0.954 action agreement over a small action space, so the old default sat BELOW
+        # honest convergence and would disqualify miners for agreeing with each other. Copies are
+        # near-identical, not merely similar; the gap between 0.954 and a real copy is wide enough
+        # that 0.98 separates them without inventing a cheat.
         self.dedup_agree = dedup_agree
         # Router-path copy threshold, on mean L1 between soft distributions. OFF by default: honest
         # routers converge as they improve (measured overlap with copies at an 8k-ask bank — see

@@ -278,7 +278,13 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
                    help="hotkey NAME inside the wallet (the one registered on the subnet — it signs "
                         "set_weights). A wallet can hold several; only 'default' was reachable before.")
     p.add_argument("--network", default="finney")
-    p.add_argument("--n-per-bench", type=int, default=8)
+    # 16, not 8. The reign scalar is a Wilson LOWER bound, so small slices are penalised hard —
+    # measured at n=8 the penalty was ~4x the entire measurable band, i.e. the scalar read noise.
+    # Accumulate mode pools across epochs so this is time-to-confidence rather than a hard floor,
+    # and 16 halves how long a new miner waits to be ranked on skill instead of on sample size.
+    # It is also the OWNER's per-epoch bill: the reference costs n_per_bench x |pool| calls, so 16
+    # over a 7-rung ladder is ~112 calls/epoch. Raising this raises that linearly.
+    p.add_argument("--n-per-bench", type=int, default=16)
     p.add_argument("--poll", type=float, default=12.0)
     p.add_argument("--insecure", action="store_true",
                    help="DEV/OFFLINE ONLY: accept the mock TEE + skip the measured-image gate "

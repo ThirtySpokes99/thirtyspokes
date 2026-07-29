@@ -199,6 +199,97 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
             self._stop.wait(poll_s)
 
 
+class _RoutingPool:
+    """Mock backend over the PINNED routing pool, with a real quality/price gradient.
+
+    MockPool serves cheap/mid/strong, but a routing head emits rungs into `harness.ROUTING_POOL`, so
+    a local run needs a backend that answers to those exact ids — otherwise the miner cannot even
+    invoke the ladder it was trained against.
+    """
+
+    def __init__(self):
+        from . import harness as H
+        self.models = H.pool_models()
+        self.price = {m: H.price_of(m) for m in self.models}
+
+    def complete(self, model, messages, params):
+        if model not in self.price:
+            raise ValueError(f"unpinned model {model}")
+        rung = self.models.index(model)
+        prompt = str(messages[-1]["content"])
+        # higher rungs answer correctly more often — a real ladder, so routing has something to learn
+        ok = (hash((prompt, rung)) % 10) < (4 + rung)
+        text = "Answer: 4" if ok else "..."
+        tin, tout = 32, 8
+        return text, tin, tout, (tin + tout) / 1000.0 * self.price[model] / 1000.0
+
+
+def run_local_routing(epochs: int = 3, verbose: bool = True) -> dict:
+    """THE ROUTING LOOP THROUGH THE REAL DAEMONS — the seam nothing else covers.
+
+    `run_local` below exercises the free-agent path, and `orchestra-koth-router-sim` exercises the
+    validator against hand-built proofs. Neither runs a ROUTING artifact through
+    `KOTHMinerNeuron.run_once` -> store -> `KOTHValidator.run_epoch`, which is the path a live miner
+    actually takes. Both bugs found this session lived in exactly that kind of uncovered second path:
+    the image's runner, and the reference pool. So this closes it.
+    """
+    import numpy as np
+
+    from . import harness as H
+    from .miner import routing_artifact
+    from ..router import RouterHead
+    root = tempfile.mkdtemp(prefix="koth_routing_")
+    backend, platform = _RoutingPool(), Platform()
+    chain = LocalFileChain(f"{root}/chain")
+    store = LocalBundleStore(f"{root}/store")
+    chain.register("burn")
+    suite = default_suite()
+    k, hid, N_PER = len(H.pool_models()), 8, 4
+    n = RouterHead(H.EMBED_DIM, k, hid).n_params
+
+    val = KOTHValidator({runtime_measurement()}, platform.public_hex, chain, KingChain(),
+                        suite, store, backend, n_per_bench=N_PER, budget=0.5, f_min=0.0,
+                        routing_pool=H.pool_models())
+    miners = {}
+    for label, seed in (("router-a", 1), ("router-b", 5)):
+        theta = np.random.default_rng(seed).normal(0, 0.4, n)
+        # n_per_bench passed to BOTH sides: a mismatch is `unexpected_task` for every miner
+        miners[label] = KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
+                                        routing_artifact(H.save_head(theta, hid)), f"{label}/repo",
+                                        n_per_bench=N_PER)
+    name = {m.hotkey: nm for nm, m in miners.items()}
+    for m in miners.values():
+        m.publish()
+    get_proof = store_get_proof(store)
+
+    emissions: dict = defaultdict(float)
+    dq: dict = {}
+    decisions = 0
+    for _e in range(epochs):
+        chain.advance(EPOCH_BLOCKS)
+        epoch = current_epoch(chain)
+        for m in miners.values():
+            m.run_once(epoch)
+        rep = val.run_epoch(get_proof)
+        uid_hk = chain.hotkeys()
+        for uid, w in rep.weights_by_uid.items():
+            emissions[name.get(uid_hk.get(uid, ""), "burn")] += w
+        dq.update({name.get(h, h): r for h, r in rep.dq.items()})
+        decisions += sum(len(v) for v in (rep.audit.get("decision") or {}).values())
+
+    if verbose:
+        print(f"routing loop through the REAL daemons (file-chain + store + mock TEE) @ {root}")
+        total = sum(v for kk, v in emissions.items() if kk != "burn") or 1.0
+        for who in list(miners) + ["burn"]:
+            v = emissions.get(who, 0.0)
+            share = "  --" if who == "burn" else f"{v/total*100:5.1f}%"
+            tag = f"  [DQ: {dq[who]}]" if who in dq else ""
+            print(f"  {who:10s} {v:6.3f}  {share}{tag}")
+        if dq:
+            print(f"  disqualifications: {dq}")
+    return {"emissions": dict(emissions), "dq": dq, "root": root}
+
+
 def run_local(epochs: int = 3, verbose: bool = True) -> dict:
     """Offline decoupled demo: miners upload proofs, validator downloads + scores — and in the
     default "grounding" mode the validator runs NO miner code. Honest miners RELAY a pool model's
@@ -223,13 +314,18 @@ def run_local(epochs: int = 3, verbose: bool = True) -> dict:
               "    return agent\n")
     art = lambda model: Artifact(_RELAY, json.dumps({"model": model}).encode(), model)  # noqa: E731
 
+    # ONE slice size, passed to BOTH sides. The validator re-derives the slice and rejects a proof
+    # whose task set differs (`unexpected_task`), so miner and validator n_per_bench are not two
+    # settings — they are one setting stored twice, and letting them default independently is what
+    # disqualified every miner when the validator default moved 8 -> 16.
+    N_PER = 8
     val = KOTHValidator({runtime_measurement()}, platform.public_hex, chain, KingChain(),
-                        suite, store, backend, n_per_bench=8, budget=0.5, f_min=0.1)
+                        suite, store, backend, n_per_bench=N_PER, budget=0.5, f_min=0.1)
     miners = {
         "strong": KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
-                                  art("strong"), "strong/repo"),
+                                  art("strong"), "strong/repo", n_per_bench=N_PER),
         "weak": KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
-                                art("cheap"), "weak/repo"),
+                                art("cheap"), "weak/repo", n_per_bench=N_PER),
     }
     name = {m.hotkey: n for n, m in miners.items()}
     for m in miners.values():

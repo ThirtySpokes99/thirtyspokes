@@ -240,7 +240,7 @@ def test_freeloader_that_stops_mining_earns_nothing_end_to_end(env):
     val = KOTHValidator({runtime_measurement()}, env.platform.public_hex, chain, KingChain(),
                         env.suite, store, MockPool(), n_per_bench=8, budget_per_task=1.0, f_min=0.0)
     mk = lambda m, r: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
-                                      chain, store, art(m), r)
+                                      chain, store, art(m), r, n_per_bench=N_PER_BENCH)
     freeloader, honest = mk("cheap", "f/repo"), mk("strong", "h/repo")
     for m in (freeloader, honest):
         m.publish()
@@ -454,9 +454,9 @@ def test_accumulate_mode_crowns_and_pools(env):
                         Reign(eps0=0.0, eps_floor=0.0), env.suite, store, MockPool(), n_per_bench=8,
                         budget_per_task=1.0, f_min=0.0, scoring_mode="accumulate", half_life_epochs=50)
     strong = KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite, chain, store,
-                             art("strong"), "s/repo")
+                             art("strong"), "s/repo", n_per_bench=N_PER_BENCH)
     weak = KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite, chain, store,
-                           art("cheap"), "w/repo")
+                           art("cheap"), "w/repo", n_per_bench=N_PER_BENCH)
     for m in (strong, weak):
         m.publish()
     gp = store_get_proof(store)
@@ -518,7 +518,7 @@ def test_commit_window_binds_proof_to_one_run(env):
                         Reign(eps0=0.0, eps_floor=0.0), env.suite, store, MockPool(), n_per_bench=8,
                         budget=999.0, f_min=0.0, commit_window=W, scoring_mode="per_epoch")
     mk = lambda repo, cp: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
-                                          chain, store, art(), repo, commit_proofs=cp)
+                                          chain, store, art(), repo, commit_proofs=cp, n_per_bench=N_PER_BENCH)
     honest, nocommit, swap, late = mk("h/r", True), mk("n/r", False), mk("s/r", False), mk("l/r", True)
     for m in (honest, nocommit, swap, late):
         m.publish()
@@ -578,7 +578,7 @@ def test_grace_window_presence_deterministic(env):
     art = lambda: Artifact(relay, json.dumps({"model": "strong"}).encode(), "strong")  # noqa: E731
     W, G = 5, 20
     mk = lambda repo: KOTHMinerNeuron(Signer().public_hex, MockPool(), env.platform, env.suite,  # noqa: E731
-                                      chain, store, art(), repo, commit_proofs=True)
+                                      chain, store, art(), repo, commit_proofs=True, n_per_bench=N_PER_BENCH)
     present, absent = mk("p/r"), mk("a/r")
     for m in (present, absent):
         m.publish()
@@ -665,9 +665,9 @@ def test_v2_pinned_pool_gates(tmp_path):
                         pool_spec={"kind": "mockpool"})
     miners = {
         "honest": KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
-                                  Artifact(_V2_ROUTER, json.dumps({"model": "strong"}).encode(), "s"), "honest/repo"),
+                                  Artifact(_V2_ROUTER, json.dumps({"model": "strong"}).encode(), "s"), "honest/repo", n_per_bench=N_PER_BENCH),
         "nocall": KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
-                                  Artifact(_NOCALL_SRC, b"{}", "n"), "nocall/repo"),
+                                  Artifact(_NOCALL_SRC, b"{}", "n"), "nocall/repo", n_per_bench=N_PER_BENCH),
     }
     name = {m.hotkey: n for n, m in miners.items()}
     for m in miners.values():
@@ -1718,7 +1718,7 @@ def test_standings_payload_is_real_and_flush_never_raises():
     val = KOTHValidator({runtime_measurement()}, platform.public_hex, chain, KingChain(),
                         suite, store, backend, n_per_bench=8, budget=0.5, f_min=0.1)
     miners = [KOTHMinerNeuron(Signer().public_hex, backend, platform, suite, chain, store,
-                              Artifact(relay, json.dumps({"model": m}).encode(), m), f"{m}/repo")
+                              Artifact(relay, json.dumps({"model": m}).encode(), m), f"{m}/repo", n_per_bench=N_PER_BENCH)
               for m in ("strong", "cheap")]
     for m in miners:
         m.publish()
@@ -1854,7 +1854,7 @@ def test_grounding_validator_needs_no_llm_and_never_infers():
                         suite, store, NoInferenceBackend(), n_per_bench=8, budget=0.5, f_min=0.1,
                         audit_mode="grounding")
     miners = [KOTHMinerNeuron(Signer().public_hex, MockPool(), platform, suite, chain, store,
-                              Artifact(relay, json.dumps({"model": m}).encode(), m), f"{m}/repo")
+                              Artifact(relay, json.dumps({"model": m}).encode(), m), f"{m}/repo", n_per_bench=N_PER_BENCH)
               for m in ("strong", "cheap")]
     for m in miners:
         m.publish()
@@ -1898,7 +1898,7 @@ def test_commit_pins_the_exact_published_bytes_and_revision():
     src = "def build_agent(w):\n    return lambda p, c: 'x'\n"
     art = Artifact(src, b'{"model": "cheap"}', "cheap")
     m = KOTHMinerNeuron(Signer().public_hex, MockPool(), Platform(), default_suite(),
-                        chain, store, art, "me/repo")
+                        chain, store, art, "me/repo", n_per_bench=N_PER_BENCH)
     m.publish()
 
     c = [x for x in chain.revealed_commitments() if x.hotkey == m.hotkey][0]
@@ -3560,3 +3560,63 @@ def test_the_measured_image_dispatches_on_the_artifact_like_the_miner_does():
     assert "H.pool_models()" in src and "sorted(pool_list)" in src, (
         "the image does not verify the injected pool against the harness pool, so a head could be "
         "routed into an action space it never trained on")
+
+
+def test_miner_and_validator_agree_on_slice_size():
+    """A MISMATCH HERE TAKES THE WHOLE SUBNET DOWN, SILENTLY.
+
+    The validator re-derives the nonce-seeded slice itself and rejects any proof whose task set
+    differs (`unexpected_task` — a DQ). So the miner's n_per_bench and the validator's are not two
+    settings, they are one setting stored twice. Raising the validator from 8 to 16 while leaving the
+    miner at 8 disqualified every miner on defaults; it was caught by an integration run, not by any
+    unit test, because each side is individually correct.
+
+    The reference builder must match too: its record is keyed to the same slice.
+    """
+    import inspect
+    import pathlib
+    import re
+
+    from thirtyspokes.koth.miner import KOTHMinerNeuron
+    miner_default = inspect.signature(KOTHMinerNeuron.__init__).parameters["n_per_bench"].default
+
+    def cli_default(path, flag="--n-per-bench"):
+        src = pathlib.Path(path).read_text()
+        m = re.search(rf'"{re.escape(flag)}", type=int, default=(\d+)', src)
+        return int(m.group(1)) if m else None
+
+    val = cli_default("src/thirtyspokes/koth/neuron.py")
+    mnr = cli_default("src/thirtyspokes/koth/miner.py")
+    assert val is not None and mnr is not None
+    assert miner_default == val == mnr, (
+        f"slice size disagrees: miner class={miner_default} miner cli={mnr} validator cli={val} "
+        f"-> every miner on defaults would be DQ'd `unexpected_task`")
+
+    cron = pathlib.Path("scripts/koth-reference-cron.sh").read_text()
+    m = re.search(r"--n-per-bench (\d+)", cron)
+    assert m and int(m.group(1)) == val, (
+        f"the reference cron measures a different slice ({m.group(1) if m else '?'}) than the "
+        f"validator scores ({val}) — the frontier would not describe the scored asks")
+
+
+def test_routing_loop_through_the_real_daemons(monkeypatch):
+    """END TO END on the path a live miner takes: KOTHMinerNeuron.run_once (router dispatch) ->
+    store -> KOTHValidator.run_epoch (verify, grade, score the decision, crown).
+
+    Neither existing harness covers this. `run_local` exercises the free-agent path;
+    `orchestra-koth-router-sim` drives the validator with hand-built proofs. The gap between them is
+    where both of this session's worst bugs lived — the image's runner still calling rt.run(), and a
+    miner/validator slice-size mismatch that DQ'd every miner. This run found the second one.
+    """
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.neuron import run_local_routing
+
+    # deterministic stand-in encoder: no model download in CI
+    monkeypatch.setattr(H, "encode", lambda ps: np.stack(
+        [np.full(H.EMBED_DIM, (len(p) % 11) / 11.0) for p in ps]))
+    out = run_local_routing(epochs=2, verbose=False)
+    assert not out["dq"], f"a routing miner was disqualified on the real path: {out['dq']}"
+    paid = {k: v for k, v in out["emissions"].items() if k != "burn" and v > 0}
+    assert paid, "no routing miner earned anything — the loop scored nobody"

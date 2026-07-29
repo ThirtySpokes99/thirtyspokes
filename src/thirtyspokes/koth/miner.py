@@ -71,7 +71,7 @@ def is_routing_artifact(artifact: Artifact) -> bool:
 class KOTHMinerNeuron:
     def __init__(self, hotkey: str, backend: ModelBackend, platform: Platform,
                  suite: list[Benchmark], chain, store, artifact: Artifact, repo: str, *,
-                 n_per_bench: int = 8, epoch_blocks: int = EPOCH_BLOCKS, confine: bool = False,
+                 n_per_bench: int = 16, epoch_blocks: int = EPOCH_BLOCKS, confine: bool = False,
                  commit_proofs: bool = False, confine_timeout: float = 120.0):
         self.hotkey = hotkey                    # ss58 wallet hotkey on a real chain
         self.rt = KOTHRuntime(backend, platform, confine=confine,
@@ -185,7 +185,11 @@ def main() -> None:  # pragma: no cover — live daemon (needs bittensor + HF + 
     p.add_argument("--model", default="openai/gpt-4o-mini", help="reference router's pool model (if no --source)")
     p.add_argument("--pool", default="openai/gpt-4o-mini,anthropic/claude-opus-4.7",
                    help="owner-pinned model allow-list (comma-separated) — publish this from the subnet owner")
-    p.add_argument("--n-per-bench", type=int, default=8)
+    # MUST EQUAL THE VALIDATOR'S. The validator re-derives the slice from (nonce, epoch, bench) and
+    # rejects any proof whose task set differs — `unexpected_task`, a DQ. Raising one side only takes
+    # the whole subnet down silently, which is exactly what happened when the validator went 8 -> 16
+    # and this line did not: every miner on defaults was disqualified. Pinned by a test.
+    p.add_argument("--n-per-bench", type=int, default=16)
     p.add_argument("--poll", type=float, default=12.0)
     p.add_argument("--confine", action="store_true",
                    help="run the agent in the no-egress netns confinement (production CVM)")

@@ -289,8 +289,24 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
         return int(self.subtensor.get_current_block())
 
     def commit(self, hotkey: str, data: str) -> None:
-        self.subtensor.set_reveal_commitment(
-            wallet=self.wallet, netuid=self.netuid, data=data, blocks_until_reveal=self.reveal_blocks)
+        """Publish the artifact commitment, and RAISE if the chain did not accept it.
+
+        This used to discard the return value. `set_reveal_commitment` returns `(ok, message)`, so a
+        rejected extrinsic looked exactly like a successful one — measured: a commit reported success,
+        never appeared after its full 360-block reveal window, and the failure was only visible by
+        re-submitting and printing the result. A miner that believes it committed will mine for hours
+        and be scored `no_proof` every epoch with nothing anywhere saying why.
+        """
+        res = self.subtensor.set_reveal_commitment(
+            wallet=self.wallet, netuid=self.netuid, data=data,
+            blocks_until_reveal=self.reveal_blocks)
+        # bittensor returns (bool, str) here, but has changed this shape before; treat a bare False
+        # or a (False, msg) as failure and anything else as success rather than guessing.
+        ok, msg = res if isinstance(res, tuple) else (bool(res), "")
+        if not ok:
+            raise RuntimeError(f"artifact commit REJECTED by the chain: {msg or res!r}. "
+                               f"Nothing is bound on-chain, so every proof this miner uploads will "
+                               f"be unscorable.")
 
     @staticmethod
     def _latest(entries) -> tuple[int, str] | None:

@@ -3625,3 +3625,36 @@ def test_routing_loop_through_the_real_daemons(monkeypatch):
     assert not out["dq"], f"a routing miner was disqualified on the real path: {out['dq']}"
     paid = {k: v for k, v in out["emissions"].items() if k != "burn" and v > 0}
     assert paid, "no routing miner earned anything — the loop scored nobody"
+
+
+def test_a_provider_failure_does_not_destroy_the_epoch():
+    """One bad HTTP response must not kill a run that has already done 49 minutes of work.
+
+    MEASURED on a live TDX epoch: OpenRouter returned a body httpx could not parse, the
+    JSONDecodeError propagated out of `complete()`, koth-report.service died, and the miner earned
+    nothing for the whole epoch. Everywhere else in this codebase a model failure is DATA — a failed
+    rung the cascade escalates past — and the enclave was the one place that crashed instead.
+
+    The SDK's own retries do not cover this: it retries connection errors and 5xx statuses, not a 200
+    whose body will not parse.
+    """
+    from thirtyspokes.gateway.gateway import OpenRouterBackend
+
+    class Boom:
+        calls = 0
+
+        class chat:  # noqa: N801 — mirrors the SDK's shape
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    Boom.calls += 1
+                    raise ValueError("Expecting value: line 4185 column 1 (char 23012)")
+
+    be = OpenRouterBackend.__new__(OpenRouterBackend)
+    be._client = Boom()
+    be._price_fn = lambda m: (0.001, 0.001)
+
+    text, tin, tout, cost = be.complete("some/model", [{"role": "user", "content": "hi"}], {})
+    assert text == "" and cost == 0.0, "a failed rung must cost nothing and answer nothing"
+    assert tin == 0 and tout == 0
+    assert Boom.calls == 3, f"expected 3 attempts before degrading, got {Boom.calls}"

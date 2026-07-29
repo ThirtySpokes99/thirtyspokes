@@ -110,8 +110,31 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
         reasoning = p.pop("reasoning", None)
         if reasoning is not None:
             body["reasoning"] = reasoning
-        r = self._client.chat.completions.create(
-            model=model, messages=messages, extra_body=body, **p)
+        # A PROVIDER FAILURE IS DATA, NOT A CRASH — the convention everywhere else in this codebase,
+        # and the enclave was the one place that ignored it. MEASURED: a live epoch ran 49 minutes,
+        # completed its tasks, and died on `httpx ... .json()` raising JSONDecodeError because
+        # OpenRouter returned a non-JSON body (an HTML error page or a truncated response). One bad
+        # HTTP response destroyed the whole epoch's work and the miner earned nothing.
+        #
+        # The SDK's own retries do not cover this: it retries connection errors and 5xx statuses, not
+        # a 200 whose body will not parse. So retry here, then DEGRADE: an unanswerable rung returns
+        # an empty answer at zero cost, which is exactly what the cascade already handles — the
+        # verifier rejects it and the ladder escalates.
+        import time as _time
+        last = None
+        for attempt in range(3):
+            try:
+                r = self._client.chat.completions.create(
+                    model=model, messages=messages, extra_body=body, **p)
+                break
+            except Exception as e:      # noqa: BLE001 — any provider failure, incl. unparseable bodies
+                last = e
+                if attempt < 2:
+                    _time.sleep(1.5 * (attempt + 1))
+        else:
+            print(f"[pool] {model} failed after 3 attempts ({type(last).__name__}: "
+                  f"{str(last)[:120]}) — treating as an unanswered rung", flush=True)
+            return "", 0, 0, 0.0
         u = r.usage
         tin, tout = u.prompt_tokens, u.completion_tokens
         cost = None

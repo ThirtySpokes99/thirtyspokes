@@ -399,6 +399,29 @@ have converged with frontier models on everything that can be exactly graded, so
 already ~oracle. A routing subnet needs a pool where no single model dominates on quality-per-dollar,
 and no such pool has been found.
 
+### The dominator claim, retested properly
+
+The measurement above used a pool whose most expensive member was a *flash* model (4x realised cost
+spread) and a "hard" tier built from AIME — which a cheap flash model scored **0.938** on, i.e.
+recall, not capability. That is weak ground for a claim as strong as "cheap models have converged
+with frontier models", so it was retested against both objections at once: a **10x realised** price
+ladder, and a **procedurally generated** hard tier (modular exponentiation, 8-step arithmetic chains,
+combinatorics) that cannot be contaminated because the items are drawn at run time.
+
+| tier | qwen3.7-flash | deepseek-v4-pro | gpt-5.6-terra | kimi-k3 |
+|---|---|---|---|---|
+| easy | 0.92 | 1.00 | 0.83 | 0.92 |
+| medium-hard | 0.83 | 0.83 | 0.83 | 0.92 |
+| **hard-proc** | **1.00** | 0.92 | 1.00 | 1.00 |
+| **$/task** | **0.00036** | 0.00227 | 0.00064 | 0.00367 |
+
+The cheapest model in the pool is at or near the best on every tier, including the uncontaminated
+hard one, at **1/10th** the price of the most expensive. The expectation going in was the opposite —
+that tasks designed to break small models would manufacture a gradient. They did not. `n=12` per
+cell, so single numbers carry ~±0.1, but the pattern is consistent across three tiers and four models.
+
+**The dominator result is therefore a property of the model market, not of the earlier pool.**
+
 Two instrument notes, recorded because both would have produced false results:
 * the **parse-rate guard** built after measurement 14 fired on its own here — `deepseek-v4-flash`
   returned nothing on 67% of AIME asks, and its 0.333 "accuracy" was exactly its parse rate;
@@ -419,5 +442,23 @@ purpose-made specialist pool that RouterBench could not provide and found the do
 intact, with a Chinese lab's model winning English. **There is no remaining untested mechanism by
 which routing could have a moat.**
 
+### A caveat on all of this that outweighs the numbers
+
+Three traffic sets were built for this question, and **each one determined its answer before it ran**:
+LiveCodeBench (uniformly hard and nested → no gradient possible), MMLU-Pro as a "hard" tier
+(saturated → dominator guaranteed), procedural modular arithmetic (built to break small models →
+expected to show a gradient, and notably did not). When the choice of dataset decides the result, the
+measurement is reporting the choice.
+
+So the missing input is not another benchmark. It is **what traffic this subnet is actually for**.
+Until that exists, any of these numbers can be reproduced or reversed by picking a different set. Once
+it exists the check is fast, and the instruments are built — run them in this order, because the first
+one is a five-minute gate that would have saved most of this programme:
+
+1. **does the cheapest model dominate on quality-per-dollar?** → if yes, stop; no router or traffic fixes it
+2. is difficulty legible in the prompt? (`difficulty_predictability.py`, AUC)
+3. does a trained router capture the band held out? (`routing_traffic_measure.py`)
+
 Reproduce: `scripts/memoriser_capacity.py`, `scripts/memoriser_detector.py`,
-`scripts/bank_size_gate.py [--pool all]`, `orchestra-koth-router-sim --bank {400,2000,8000}`.
+`scripts/bank_size_gate.py [--pool all]`, `orchestra-koth-router-sim --bank {400,2000,8000}`,
+`scripts/{difficulty_predictability,routing_traffic,routing_traffic_measure}.py`.

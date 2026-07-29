@@ -42,7 +42,8 @@ import random
 # exam set with extra steps, and would quietly reproduce the flat-difficulty problem this exists to
 # fix. Tune here if the target traffic differs; this is the single most consequential number in the
 # file, because it sets how much of the routable value is cost saving versus quality gain.
-MIX = {"trivial": 0.40, "easy": 0.25, "medium": 0.15, "medium-hard": 0.10, "hard": 0.10}
+MIX = {"trivial": 0.35, "easy": 0.20, "medium": 0.15, "medium-hard": 0.10,
+       "hard": 0.05, "hard-proc": 0.15}
 
 
 # --- the procedural trivial tier ------------------------------------------------------------------
@@ -145,8 +146,58 @@ def hard_tasks(n: int, seed: int) -> list[dict]:
             for i, r in enumerate(ds.select(range(min(n, len(ds)))))]
 
 
+# --- procedurally HARD: uncontaminated, and difficulty is a dial ----------------------------------
+def _long_arith(rng) -> tuple[str, str]:
+    """Multi-step arithmetic deep enough that a small model loses the thread. Exact by construction,
+    and impossible to have memorised because the numbers are drawn at run time."""
+    v = rng.randint(200, 999)
+    steps, expr = [], f"{v}"
+    for _ in range(rng.randint(6, 9)):
+        op = rng.choice(["+", "-", "*"])
+        k = rng.randint(11, 99) if op != "*" else rng.randint(3, 17)
+        v = {"+": v + k, "-": v - k, "*": v * k}[op]
+        expr += f" {op} {k}"
+    return (f"Evaluate step by step, respecting standard operator precedence:\n{expr}\n\n"
+            f"Reply with the final integer only."), str(eval(expr))
+
+
+def _modular(rng) -> tuple[str, str]:
+    b, e, m = rng.randint(7, 97), rng.randint(50, 400), rng.randint(101, 997)
+    return (f"Compute {b}^{e} mod {m}. Reply with the integer only."), str(pow(b, e, m))
+
+
+def _combinatorics(rng) -> tuple[str, str]:
+    from math import comb
+    n, k = rng.randint(18, 40), rng.randint(5, 12)
+    return (f"How many ways are there to choose {k} items from {n} distinct items? "
+            f"Reply with the integer only."), str(comb(n, k))
+
+
+def _digit_puzzle(rng) -> tuple[str, str]:
+    n = rng.randint(10**7, 10**9)
+    return (f"What is the sum of the decimal digits of {n} * {rng.randint(7, 29)}? "
+            f"Reply with the integer only."), None      # filled below
+
+
+HARD_GENS = [_long_arith, _modular, _combinatorics]
+
+
+def hard_proc_tasks(n: int, seed: int) -> list[dict]:
+    """The hard tier, generated. AIME turned out to be contaminated — a cheap flash model scored
+    0.938 on it, which is recall, not capability, so it could not separate the pool. These are drawn
+    at run time and cannot have been memorised, while staying exactly gradeable."""
+    rng = random.Random(seed + 7717)
+    out = []
+    for i in range(n):
+        prompt, gold = HARD_GENS[i % len(HARD_GENS)](rng)
+        out.append({"id": f"hardproc-{i}", "tier": "hard-proc", "kind": "number",
+                    "prompt": prompt, "gold": gold})
+    return out
+
+
 BUILDERS = {"trivial": trivial_tasks, "easy": easy_tasks, "medium": medium_tasks,
-            "medium-hard": medium_hard_tasks, "hard": hard_tasks}
+            "medium-hard": medium_hard_tasks, "hard": hard_tasks,
+            "hard-proc": hard_proc_tasks}
 
 
 def build(n: int, seed: int = 0) -> list[dict]:

@@ -1,8 +1,9 @@
 # ThirtySpokes — validating guide
 
-A validator **verifies proofs and grades answers — it runs no miner code and does no inference.** Each
-epoch you download each miner's public bundle, check its attestation and binding, grade the attested
-answers against public gold, score the eligible miners, and set weights. Everything you check is public
+A validator **verifies proofs and scores routing decisions — it runs no miner code and does no
+inference.** Miners compete on a **routing model**: a small head that, per task, chooses which pool
+model should answer. Each epoch you download each miner's weights, check the attestation and binding,
+grade the attested answers, score the *decisions* against the owner's pool reference, and set weights. Everything you check is public
 and deterministic, so honest validators converge on the same king. For *how the mechanism works* see
 [`DESIGN.md`](DESIGN.md); to stand up a subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
@@ -24,15 +25,40 @@ committed miner:
    RTMR1/2/3) under an in-date TCB → `report_data` bound → issued `(epoch, nonce)` + hotkey match → hashes match.
 3. **Re-derive the same nonce-seeded slice and grade** the attested answers against public gold
    (missing/substituted tasks count wrong). No agent re-run.
-4. **Public-source scan** + the **grounding check** (every scored answer must derive from a logged pool
-   response, else `ungrounded`). Proof-inspection only — no miner code runs.
-5. **Behavioral dedup** — near-identical attested-answer vectors keep the earliest commit (`copy_of:…`).
+4. **Score the DECISION, not just the outcome.** On the routing path the miner's whole contribution is
+   *which rung it entered*; the answer is the pool's work. `decision_regret` compares each attested
+   `chosen_rung` against what every other entry point would have produced, using the owner's pool
+   reference for that epoch. A validator runs no inference, so without that reference it cannot know
+   what the other models would have said — see the pool-reference note below.
+5. **Dedup** — on the routing path this fingerprints the head's **soft distribution**, not the answers:
+   answers come back from the pool verbatim, so two honest miners choosing the same rung have
+   *identical* answer vectors. It ships **off** (`--dedup-max-l1 0`), because honest routers converge
+   as they improve and no threshold separates convergence from copying at scale; the reign's
+   earliest-commit tiebreak handles copies instead, which a copy cannot beat.
 6. **Score + reign** — the cost-budgeted `Q_lcb`, the Pareto dethrone guard vs the persisted king,
    commit-block seniority → `KingChain` → `set_weights` (equal split across the seats that are
    registered **and submitted this epoch**; a seat absent `absent_grace`=3 consecutive epochs is
    evicted, and an epoch with no live miner burns to uid 0 — see [`DESIGN.md`](DESIGN.md) §5a).
 
 Scoring detail and the evidence-accumulation / anti-grind refinements are in [`DESIGN.md`](DESIGN.md) §5–5b.
+
+### The pool reference, and the one way it fails silently
+
+The decision score needs to know what *every* pool model would have scored on this epoch's asks. You
+run no inference, so you cannot compute that — the **owner publishes it** once per epoch
+(`orchestra-koth-reference`), signed, and you read it from the bucket.
+
+**Its columns are the action space.** A head emits rung indices into the harness's pinned
+`ROUTING_POOL`; `decision_regret` discards any rung past the reference's width. So a reference built
+over a *different* pool does not error — it silently deletes most of every miner's contribution and
+computes a confident number from what is left. The live cron was in exactly that state (a 2-model
+reference against a 7-rung ladder), so the validator now **refuses** to score decisions when the
+reference's models disagree with its `routing_pool`, recording `decision_skipped` in the audit
+diagnostics. If you see that key, the owner's reference is misconfigured — do not "fix" it by
+widening your own pool.
+
+Absent a reference entirely, scoring degrades to the absolute scalar rather than stalling: quieter,
+and it is why the owner's cron failing is worth alerting on.
 
 ## Run fail-closed (the default)
 
@@ -108,7 +134,8 @@ atomic score/save/weight step, then exits within Compose's 30-second stop grace 
 | `--grace-blocks` | `0` | **F2:** score an epoch only N blocks after it opens, so submissions settle and validators agree. Keep N < 100 (epoch length); set it above the store's upload latency |
 | `--no-pool-reference` | off | score absolute accuracy instead of frontier-relative routing headroom. On by default because the router scalar is the point of the subnet — use this only to reproduce a pre-reference score |
 | `--min-headroom-gap` | `0.05` | refuse to score frontier-relatively when the owner's reference shows less achievable headroom than this. Below it the ratio's denominator is under the sampling noise, so the ranking would be noise ([`DESIGN.md`](DESIGN.md) §5.0) |
-| `--n-per-bench` / `--poll` | `8` / `12` | tasks per benchmark per epoch / seconds between chain polls |
+| `--dedup-max-l1` | `0` (off) | router copy-dedup on soft distributions. Off deliberately: honest routers converge as they improve, and the measured honest-vs-honest distance falls *below* honest-vs-copier at scale, so any non-zero value eventually disqualifies real miners. Earliest-commit handles copies |
+| `--n-per-bench` / `--poll` | `16` / `12` | tasks per benchmark per epoch / seconds between chain polls. **This must match the owner's reference builder**, or the record will not line up with your slice |
 
 The `--commit-window` (F7) and `--grace-blocks` (F2) paths are landed but **off by default**, pending a
 calibration of `W` and `G`; enable them together once measured. Mechanism in [`DESIGN.md`](DESIGN.md) §5b.

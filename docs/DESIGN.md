@@ -9,7 +9,21 @@ binding). For how to **run** one, see [`MINER.md`](MINER.md), [`VALIDATOR.md`](V
 **King-of-the-Hill over miner-run, TEE-attested benchmarks.** Miners run the owner-given
 benchmark suite inside their own TEE and publish an attested proof to their own HuggingFace
 repo; validators only verify the proof and grade the reports — no validator-side inference,
-no centralized API. A math formula over the verified reports crowns the king. The load-bearing
+no centralized API.
+
+> **What a miner submits is a ROUTING MODEL** (`koth/harness.py`): a ~6K-parameter head that, per
+> task, picks where to enter a cheap→expensive ladder over the owner-pinned pool. It is weights
+> only — **no miner code runs anywhere in the system**. The encoder, the head architecture, the
+> ladder, the verifier and the task sampling all live in the owner's measured image and are bound
+> into RTMR3 alongside `HARNESS_VERSION`.
+>
+> This deletes a class of attack rather than mitigating it: a head *cannot emit an answer*, so
+> answer-memorisation is impossible by construction and the grounding check, source scan, weight
+> scan and no-egress confinement all become unnecessary on this path rather than merely enforced.
+> What it does **not** delete is decision-memorisation — a head can still learn a
+> `task → best rung` table, and the parameter cap does not prevent that
+> (`docs/ROUTING_MEASUREMENTS.md` §10). The legacy free-agent path below is retained for reference
+> and is what the `scan_source` / `grounding_check` machinery still guards. A math formula over the verified reports crowns the king. The load-bearing
 idea: because the artifact (source **and** weights) is public and **cryptographically bound**
 to what ran, cheating is publicly detectable rather than something we must prevent by hiding
 data — which is what makes **static public benchmarks** (math, MMLU, GPQA, SWE-bench Pro) safe

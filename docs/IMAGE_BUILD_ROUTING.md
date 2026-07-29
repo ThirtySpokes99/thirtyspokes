@@ -86,11 +86,44 @@ RTMR2 must stay zero — the UKI boots directly as `/EFI/BOOT/BOOTX64.EFI` becau
 not start on GCP TDVF, so there is no GRUB command stream. A non-zero RTMR2 means the boot path
 changed and the pinned values are wrong.
 
+### Captured 2026-07-29 — GCP C3, Intel TDX, us-central1-a
+
+| | |
+|---|---|
+| UKI sha256 | `516ab1799edd7551f9613ca98292a9ddee4609b3affb100b072ed0c34d0298bf` |
+| verity roothash | `b4ae50b9ecfb1adb9877e41ac8bef9bd2d00aa7e2415953af9b784ba6cff00a5` |
+| runtime measurement | `c8c5d2ffddf5ae57464b37ecc756ea1cc87bb379b084f49355f8a50baabb401f` |
+| MRTD | `c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5` |
+| RTMR0 | `c49d22aff6edb37cb6178defb05e0e2b512c26960e6ee73b1ea303365a31def807ab2ad71e5874236feca2ca552c6307` |
+| **RTMR1** | `f1af6c815e19b58ae2ae3937514f2a7c903fe5f502627ec584e5b6d6a00018286747391dd39f70bd8b0e0dc0a4949f91` |
+| RTMR2 | `000…0` ✅ zero — direct-UKI boot, no GRUB command stream |
+| RTMR3 | `80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044` |
+| dm-verity | `True` |
+
+All three expectations held:
+
+* **RTMR1 CHANGED** — `f1af6c81…`, against the previous image's `515b759e…`. It is the per-image
+  anchor, and the harness, encoder and pool all changed, so a value that had *not* moved would have
+  meant the new engine was not actually measured.
+* **RTMR2 is zero**, confirming the UKI boots directly as `/EFI/BOOT/BOOTX64.EFI` — systemd-boot does
+  not start on GCP TDVF, so there is no GRUB command stream to measure.
+* **MRTD is unchanged** at `c1ee9c16…`. Expected: it is Google's TDVF firmware, identical on every GCP
+  TDX guest, so it is a coarse "genuine GCP TDX" check and **never** a per-image discriminator.
+
+RTMR3 (`80f37f62…`) binds runtime + suite + **pool**, so it is only reproducible by a guest booting
+this image against the same 7-rung `ROUTING_POOL`. Booting with any other pool string yields a
+different RTMR3 that no honest miner can match — which is why the measurement boot passed the pinned
+pool explicitly.
+
 **5. Publish governance.**
 
 ```bash
-orchestra-koth-owner approve-measurement --measurement c8c5d2ff... \
-  --mrtd $MRTD --rtmr1 $RTMR1 --rtmr3 $RTMR3
+orchestra-koth-owner approve-measurement \
+  --measurement c8c5d2ffddf5ae57464b37ecc756ea1cc87bb379b084f49355f8a50baabb401f \
+  --mrtd c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5 \
+  --rtmr1 f1af6c815e19b58ae2ae3937514f2a7c903fe5f502627ec584e5b6d6a00018286747391dd39f70bd8b0e0dc0a4949f91 \
+  --rtmr2 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 \
+  --rtmr3 80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044
 ```
 
 **6. Smoke the enforcing path** — `scripts/koth_enforce_smoke.py` must accept a proof from the pinned

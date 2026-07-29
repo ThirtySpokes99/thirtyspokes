@@ -1,4 +1,4 @@
-# Is routing worth paying for? — fourteen measurements
+# Is routing worth paying for? — fifteen measurements
 
 *The decisive negative result for the ThirtySpokes subnet thesis. Every number here is reproducible
 from the scripts named at the bottom; verdicts were pre-committed in each script's docstring before
@@ -347,6 +347,63 @@ Worth recording, because both would have produced a false positive and the first
 Both are now guards in the script: a per-stratum **parse-rate check** that refuses the reading when
 any model's rates are skewed across languages, and a **2-SE significance test** on the winner margin.
 Every successive correction moved the result the same way — toward *less* specialisation.
+
+## 15. The benchmarks WERE a confound — and the negative result survives anyway, for another reason
+
+Every measurement above used exam sets: LiveCodeBench, GSM8K, MMLU, MMLU-Pro, RouterBench, CMMLU.
+That is a confound, not a control. Exam sets are curated to be uniformly hard, which deletes the
+exact variance a router exists to detect, and the headline mechanism recorded above — *"the routable
+signal is luck, and luck is not in the prompt"* — may be a property of the instrument.
+
+**It largely was.** `difficulty_predictability.py` measures held-out AUC for "the cheap model solves
+this", from the prompt embedding alone:
+
+| | AUC |
+|---|---|
+| WITHIN one exam source (mean of 30) | 0.543 |
+| grade-school-math | **0.500** — chance |
+| hellaswag / arc-challenge | 0.512 / 0.496 |
+| ACROSS the RouterBench blend | 0.618 |
+| **production-shaped traffic** (`routing_traffic.py`) | **0.812** |
+
+Difficulty is *invisible* inside an exam set and *plainly legible* on traffic with a real spread.
+That is a +0.27 AUC swing, and it means the prompt-legibility half of the earlier conclusion does not
+hold up.
+
+**The economics do not care.** Running the full measurement on that traffic — 600 asks over a
+40% trivial / 25% easy / 15% medium / 10% medium-hard / 10% AIME mix, 4-model 2026 pool, 2,400 live
+calls:
+
+| | |
+|---|---|
+| best-single (qwen3.7-flash) | +0.9352 |
+| trained router, held out | **+0.8912** |
+| per-ask oracle | +0.9663 |
+| band | **0.0311** — captured **−141.6%** |
+
+The router is *worse than doing nothing*. Not because it cannot tell hard from easy — it can, at
+AUC 0.812 — but because there is nowhere better to send the hard ones. `qwen3.7-flash` is at or near
+the best on **every tier** at a quarter the frontier price, including AIME, where it beats
+`gemini-3.6-flash` 0.938 to 0.896.
+
+### What this changes
+
+The earlier write-up conflated two failures. They separate cleanly:
+
+* **legible difficulty** — SOLVED. Needs production-shaped traffic, not exam sets. AUC 0.812.
+* **a pool worth routing between** — UNSOLVED, and now failed in five pools: RouterBench 11-model,
+  curated 5-model, CN-vs-US specialists, and the 2026 pinned pool.
+
+So routing's blocker is neither the router nor the traffic. It is the **model market**: cheap models
+have converged with frontier models on everything that can be exactly graded, so best-single is
+already ~oracle. A routing subnet needs a pool where no single model dominates on quality-per-dollar,
+and no such pool has been found.
+
+Two instrument notes, recorded because both would have produced false results:
+* the **parse-rate guard** built after measurement 14 fired on its own here — `deepseek-v4-flash`
+  returned nothing on 67% of AIME asks, and its 0.333 "accuracy" was exactly its parse rate;
+* an n=10 pilot showed qwen 0.80 vs gemini 1.00 on AIME and looked like a capability gradient. At
+  n≈48 it **reversed**. Pilots at that size are directional at best, and this one pointed the wrong way.
 
 ## Where this leaves the architecture
 

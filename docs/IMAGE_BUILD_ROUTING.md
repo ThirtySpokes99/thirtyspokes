@@ -118,13 +118,47 @@ pool explicitly.
 **5. Publish governance.**
 
 ```bash
-orchestra-koth-owner approve-measurement \
-  --measurement c8c5d2ffddf5ae57464b37ecc756ea1cc87bb379b084f49355f8a50baabb401f \
+# NO --measurement and NO --rtmr3: the CLI DERIVES both. `runtime_measurement()` is computed from
+# the code you are running, and RTMR3 from `owner_expected_rtmr3(measurement, suite, pool)`. An
+# earlier draft of this runbook invented those two flags; they do not exist and the command failed.
+# Deriving them is the safer design — the owner cannot publish a measurement that disagrees with
+# the code, only one that disagrees with the HARDWARE, which is what the pre-flight below catches.
+orchestra-koth-owner \
+  --netuid 526 --network test --wallet minirouter --hotkey owner-hotkey \
   --mrtd c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5 \
   --rtmr1 f1af6c815e19b58ae2ae3937514f2a7c903fe5f502627ec584e5b6d6a00018286747391dd39f70bd8b0e0dc0a4949f91 \
   --rtmr2 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 \
-  --rtmr3 80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044
+  --pool "qwen/qwen3.7-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-pro,z-ai/glm-5.2,openai/gpt-5.6-luna,google/gemini-3.6-flash,moonshotai/kimi-k3"
 ```
+
+**PRE-FLIGHT, do this first.** The owner publishes a *computed* RTMR3; the guest produces a *measured*
+one. If they differ, governance rejects every honest miner and the failure looks like the miners are
+at fault. Verified 2026-07-29 — computed == measured == `80f37f62…`:
+
+```bash
+python -c "
+from thirtyspokes.koth.rtmr import owner_expected_rtmr3
+from thirtyspokes.koth.runtime import SUITE_VERSION, runtime_measurement
+print(owner_expected_rtmr3(runtime_measurement=runtime_measurement(),
+      suite_version=SUITE_VERSION, pool_allow_list=POOL))   # must equal the captured RTMR3
+```
+
+### Published 2026-07-29 — testnet 526
+
+```
+on-chain digest : 9ba743457bdbcedf8b49bbde2a206f78423410e74a2d121e582a04d71862a989
+measurement     : c8c5d2ffddf5ae57464b37ecc756ea1cc87bb379b084f49355f8a50baabb401f
+rtmr1 / rtmr3   : f1af6c81… / 80f37f62…        (hardware-captured; rtmr3 computed == measured)
+pool            : 7 models
+```
+
+**The publish appeared to hang for 35 minutes and had actually already succeeded.** `huggingface_hub`
+leaves non-daemon uploader threads behind, so the process blocked in a futex at shutdown with its
+output still buffered in the pipe — a completed publish that looks identical to a dead one. The retry
+only revealed it by returning `Transaction Already Imported`. Fixed in `owner.py` (staged flushed
+prints + `os._exit(0)`, the same fix `reference.py` already carried), but if you are on an older
+build: **check the chain before re-running.** `chain.governance_digest()` tells you whether it landed;
+re-running a publish that already succeeded is harmless but the 35 minutes are not.
 
 **6. Smoke the enforcing path** — `scripts/koth_enforce_smoke.py` must accept a proof from the pinned
 image and reject wrong-image, mock and tampered variants.

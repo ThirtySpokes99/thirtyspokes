@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import json
 
+import os
+import sys
+
 from .rtmr import owner_expected_rtmr3
 from .runtime import SUITE_VERSION, runtime_measurement
 
@@ -68,12 +71,25 @@ def main() -> None:
     from ..subnet.chain import BittensorChain
     from . import governance
     chain = BittensorChain(args.netuid, args.wallet, network=args.network, hotkey=args.hotkey)
+    # STAGE-BY-STAGE AND FLUSHED. A publish that prints nothing until it exits is indistinguishable
+    # from a publish that died — measured: this command ran 35 minutes with a blank terminal while
+    # having ALREADY succeeded, and the retry only revealed it via "Transaction Already Imported".
+    print(f"[owner] publishing record v{rec['version']} to netuid {args.netuid} "
+          f"({args.network})…", flush=True)
     chain.publish_owner_measurements(rec)      # record -> bucket (by hash); hash -> chain (plain)
     d = governance.digest(rec)
-    print(f"published owner measurement record v{rec['version']} to netuid {args.netuid}")
-    print(f"  digest (on-chain) : {d}")
-    print(f"  record  (bucket)  : {governance.record_path(d)}")
-    print("  visible to validators IMMEDIATELY — the record is hash-committed, not timelocked.")
+    print(f"published owner measurement record v{rec['version']} to netuid {args.netuid}", flush=True)
+    print(f"  digest (on-chain) : {d}", flush=True)
+    print(f"  record  (bucket)  : {governance.record_path(d)}", flush=True)
+    print("  visible to validators IMMEDIATELY — the record is hash-committed, not timelocked.",
+          flush=True)
+    # HARD EXIT. huggingface_hub leaves NON-DAEMON uploader threads behind, so the interpreter blocks
+    # in a futex at shutdown long after the work is done — the same defect already fixed in
+    # `reference.py`. Everything above is committed and flushed by here; anything still running is a
+    # library thread with nothing left to do. Without this the operator sees a hung process and may
+    # kill and re-run a publish that already landed.
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

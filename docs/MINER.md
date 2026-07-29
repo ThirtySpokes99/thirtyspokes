@@ -5,7 +5,10 @@ an owner-pinned pool of models. You ship weights; the subnet owns the engine tha
 cost-budgeted quality.** For *how the mechanism works* see [`DESIGN.md`](DESIGN.md); to stand up a
 subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
-> **Live on Bittensor mainnet — netuid 99.** Validators run **fail-closed**: to earn anything you must
+> **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`); mainnet is netuid 99
+> on `finney` and remains the eventual destination. This line previously read "live on mainnet —
+> netuid 99" while DEPLOYING.md and VALIDATOR.md both said testnet 526; the operational target
+> (`.env`, the reference cron, the published governance) is **526**. Validators run **fail-closed**: to earn anything you must
 > run the owner's measured runtime image on a confidential VM. A mock TEE or stock CVM earns **nothing**.
 
 ## What you build
@@ -207,14 +210,14 @@ uv pip install -e ".[chain,eval,tee]"     # tee extra = full DCAP verification o
 export OPENROUTER_API_KEY=...             # you pay your own inference
 huggingface-cli login                     # to publish your public bundle
 btcli wallet new_coldkey && btcli wallet new_hotkey
-btcli subnet register --netuid 99 --wallet.name miner --subtensor.network finney
+btcli subnet register --netuid 526 --wallet.name miner --subtensor.network test
 ```
 
 Your published bundle is your `weights.npz` plus the harness version string as its "source" — the
 miner writes both for you. Point the daemon at your head:
 
 ```bash
-orchestra-koth-miner --netuid 99 --wallet miner --hotkey default \
+orchestra-koth-miner --netuid 526 --network test --wallet miner --hotkey default \
   --repo YOU/koth-miner --routing-model weights.npz
 ```
 

@@ -3276,3 +3276,71 @@ def test_a_proof_still_verifies_after_the_payload_gains_fields():
     fresh = Proof(1, "n", "hk", "a", "b", "router", (), 0.0, 0, "h", "m")
     assert fresh.schema == 2
     assert "schema" in json.loads(fresh.to_json())
+
+
+def test_miner_routes_when_the_artifact_is_a_routing_model(env, monkeypatch):
+    """THE SUBNET'S LOOP, miner half: a routing model must be RUN as a routing model.
+
+    The engine is chosen from the artifact's own bytes, not from a CLI flag, so a miner cannot
+    publish a head and have it executed as an agent (or vice versa) — the bytes the validator
+    downloads decide which engine produced the proof, which is exactly what the binding attests.
+    """
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.miner import is_routing_artifact, reference_artifact, routing_artifact
+    from thirtyspokes.koth.store import hash_source
+    from thirtyspokes.router import RouterHead
+
+    k = len(H.pool_models())
+    theta = np.random.default_rng(0).normal(0, 0.3, RouterHead(H.EMBED_DIM, k, 8).n_params)
+    art = routing_artifact(H.save_head(theta, 8))
+    assert is_routing_artifact(art)
+    assert not is_routing_artifact(reference_artifact("mid"))
+    # the published "source" IS the harness version, so the validator's recomputed hash matches
+    # what run_router stamps into the proof
+    assert art.source_hash == hash_source(H.HARNESS_VERSION)
+
+
+def test_pinned_routing_pool_is_ordered_cheap_to_expensive():
+    """The ladder's order is the action space. `run_cascade` escalates by POSITION, so an
+    out-of-order pool would make 'escalate' sometimes mean 'get cheaper' — silently inverting what
+    every miner trained against."""
+    from thirtyspokes.koth import harness as H
+    prices = [H.price_of(m) for m in H.pool_models()]
+    assert prices == sorted(prices), f"ROUTING_POOL is not cheap->expensive: {prices}"
+    assert len(set(H.pool_models())) == len(H.pool_models()), "duplicate model in the pool"
+    assert H.price_of("not-a-real-model") == float("inf")     # unknown sorts last, never raises
+
+
+def test_trainer_produces_a_loadable_head_and_holds_out(monkeypatch):
+    """Miner half, end to end: outcomes -> weights.npz that `load_head` accepts, scored HELD OUT.
+
+    Held-out scoring is the load-bearing part. Measurement 12 found in-sample capture of 60% beside
+    held-out capture of ~0 on the same data — the difference between a router and a lookup table —
+    so a trainer that reported training-set quality would tell a miner exactly the wrong thing.
+    """
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.trainer import train_head
+
+    n, k = 120, len(H.pool_models())
+    rng = np.random.default_rng(0)
+    tier = rng.integers(0, k, n)                       # difficulty, legible in the prompt
+    S = (np.arange(k)[None, :] >= tier[:, None]).astype(float)
+    C = np.tile(np.linspace(0.001, 0.05, k), (n, 1))
+    oc = {"models": H.pool_models(), "task_ids": [f"t{i}" for i in range(n)],
+          "prompts": [f"tier-{tier[i]} question {i}" for i in range(n)],
+          "scores": S.tolist(), "costs": C.tolist(),
+          "verifier_ok": np.ones((n, k), bool).tolist()}
+    # deterministic stand-in encoder: no model download in CI, tier recoverable from the prompt
+    monkeypatch.setattr(H, "encode", lambda ps: np.stack(
+        [np.full(H.EMBED_DIM, (int(p.split("-")[1].split()[0]) + 1) / 10.0) for p in ps]))
+
+    weights, stats = train_head(oc, hidden=8, seed=0, iters=300)
+    head, theta = H.load_head(weights, k=k)            # the artifact the miner would publish
+    assert head.n_params <= H.PARAM_CAP
+    assert stats["n_holdout"] > 0 and stats["n_train"] > stats["n_holdout"]
+    assert 0.0 <= stats["decision_quality"] <= 1.0
+    assert stats["oracle"] >= stats["router"]          # cannot beat the per-ask oracle

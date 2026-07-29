@@ -50,6 +50,24 @@ def reference_artifact(model: str = "mid") -> Artifact:
     return Artifact(REFERENCE_SRC, json.dumps({"model": model}).encode(), model)
 
 
+def routing_artifact(weights: bytes) -> Artifact:
+    """A ROUTING-MODEL submission: weights only, no miner code.
+
+    The "source" is the pinned harness version string, because on this path the engine is the
+    owner's and the miner supplies nothing but the head. `runtime.run_router` stamps
+    `hash_source(HARNESS_VERSION)` into the proof, and the validator recomputes the same hash from
+    the bundle it downloads — so this is what makes the commit binding line up. Anything else here
+    and every proof this miner produces fails `verify_commit`.
+    """
+    from . import harness as H
+    return Artifact(H.HARNESS_VERSION, weights, "router")
+
+
+def is_routing_artifact(artifact: Artifact) -> bool:
+    from . import harness as H
+    return artifact.source_text == H.HARNESS_VERSION
+
+
 class KOTHMinerNeuron:
     def __init__(self, hotkey: str, backend: ModelBackend, platform: Platform,
                  suite: list[Benchmark], chain, store, artifact: Artifact, repo: str, *,
@@ -108,8 +126,18 @@ class KOTHMinerNeuron:
         if epoch is None:
             epoch = current_epoch(self.chain, self.epoch_blocks)
         nonce = epoch_nonce(epoch, self.chain.beacon(epoch))    # both sides derive the same
-        proof, trace = self.rt.run(self.artifact, hotkey=self.hotkey, epoch=epoch, nonce=nonce,
-                                   suite=self.suite, n_per_bench=self.n_per_bench)
+        # ROUTER PATH vs legacy free-agent path. Chosen from the artifact itself rather than a flag,
+        # so a miner cannot publish a routing head and be run as an agent (or vice versa) — the
+        # bytes the validator downloads decide which engine ran, which is what the binding attests.
+        if is_routing_artifact(self.artifact):
+            from . import harness as H
+            proof, trace = self.rt.run_router(
+                self.artifact.weights, hotkey=self.hotkey, epoch=epoch, nonce=nonce,
+                suite=self.suite, n_per_bench=self.n_per_bench,
+                pool=H.pool_models(), price_of=H.price_of)
+        else:
+            proof, trace = self.rt.run(self.artifact, hotkey=self.hotkey, epoch=epoch, nonce=nonce,
+                                       suite=self.suite, n_per_bench=self.n_per_bench)
         if self.commit_proofs and self._artifact_revealed():
             self.chain.commit_proof(self.hotkey, epoch, proof.report_data())  # bind THIS run before revealing
         self.store.upload_proof(self.repo, epoch, proof.to_json())
@@ -147,6 +175,11 @@ def main() -> None:  # pragma: no cover — live daemon (needs bittensor + HF + 
                         "can hold several; only 'default' was reachable before.")
     p.add_argument("--network", default="finney")
     p.add_argument("--repo", required=True, help="your OWN HF model repo, e.g. you/koth-miner")
+    p.add_argument("--routing-model", metavar="WEIGHTS.NPZ",
+                   help="THE ROUTING-MODEL PATH (what this subnet competes on): your trained head "
+                        "from `orchestra-koth-dev train`. Weights only — the owner's harness supplies "
+                        "the encoder, the ladder and the verifier, and no miner code runs anywhere. "
+                        "Overrides --source/--weights/--pool: the action space is owner-pinned.")
     p.add_argument("--source", help="path to YOUR build_agent(weights) source (else the reference router)")
     p.add_argument("--weights", help="path to YOUR weights.bin")
     p.add_argument("--model", default="openai/gpt-4o-mini", help="reference router's pool model (if no --source)")
@@ -164,9 +197,22 @@ def main() -> None:  # pragma: no cover — live daemon (needs bittensor + HF + 
     args = p.parse_args()
 
     cfg = config.LiveConfig(); cfg.require_key()
-    allow = {m.strip() for m in args.pool.split(",")}
+    if args.routing_model:
+        # The pool is NOT a miner choice on this path — it is the head's action space, pinned in the
+        # harness and bound into the measured image. Taking it from --pool would let a miner train
+        # against one ladder and be scored on another.
+        from . import harness as H
+        allow = set(H.pool_models())
+    else:
+        allow = {m.strip() for m in args.pool.split(",")}
     backend = PinnedBackend(OpenRouterBackend(cfg.api_key, cfg.base_url, price_fn=config.price_for), allow)
-    if args.source:
+    if args.routing_model:
+        artifact = routing_artifact(open(args.routing_model, "rb").read())
+        from . import harness as H
+        H.load_head(artifact.weights, k=len(H.pool_models()))   # fail NOW, not mid-epoch
+        print(f"[koth-miner] routing model: {args.routing_model} "
+              f"({len(H.pool_models())} rungs, harness {H.HARNESS_VERSION})")
+    elif args.source:
         weights = open(args.weights, "rb").read() if args.weights else b'{"model": "%s"}' % args.model.encode()
         artifact = Artifact(open(args.source).read(), weights, "custom")
     else:

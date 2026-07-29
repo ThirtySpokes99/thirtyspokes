@@ -62,6 +62,45 @@ PARAM_CAP = 50_000
 DEFAULT_HIDDEN = 16
 
 
+# THE ACTION SPACE. A routing head emits a distribution over these, in this order, so the pool is
+# part of the harness contract rather than a runtime argument: change it and `HARNESS_VERSION` must
+# change with it, which changes RTMR3 and resets every miner's evidence. That is the point — a miner
+# trained against one action space must not be silently scored against another.
+#
+# Ordered cheap -> expensive by blended price. Prices are $/M tokens (input, output) and are
+# ADVERTISED, not trusted: real cost is metered inside the enclave from the provider's own usage
+# figures, so a stale entry here changes the ladder's ORDER but can never change what a miner is
+# billed. Re-sort after a provider price change.
+ROUTING_POOL: tuple[tuple[str, float, float], ...] = (
+    ("qwen/qwen3.7-flash",          0.03,  0.13),
+    ("deepseek/deepseek-v4-flash",  0.14,  0.28),
+    ("deepseek/deepseek-v4-pro",    0.43,  0.87),
+    # glm BEFORE gpt-5.6-luna: ordering is by the BLENDED price (2.01 vs 2.38), not by input price,
+    # which puts them the other way round. `trainer.cascade_outcomes` assumes this list is already
+    # cheap->expensive, so a wrong order silently trains every miner against a ladder where
+    # "escalate" sometimes means "get cheaper". Caught by a test, not by reading.
+    ("z-ai/glm-5.2",                0.77,  2.42),
+    ("openai/gpt-5.6-luna",         0.50,  3.00),
+    ("google/gemini-3.6-flash",     1.50,  7.50),
+    ("moonshotai/kimi-k3",          3.00, 15.00),
+)
+
+
+def pool_models() -> list[str]:
+    """The pinned action space as model ids. `len()` of this is the head's output width `k`."""
+    return [m for m, _i, _o in ROUTING_POOL]
+
+
+def price_of(model: str) -> float:
+    """Blended $/M used only to ORDER the ladder. Completion tokens dominate real spend on these
+    workloads, so they carry most of the weight; an unknown model sorts last rather than raising,
+    because an ordering helper must never be able to fail a miner's run."""
+    for m, pin, pout in ROUTING_POOL:
+        if m == model:
+            return (pin + 3.0 * pout) / 4.0
+    return float("inf")
+
+
 class ArtifactError(ValueError):
     """The miner's weights blob is unusable. Always a DQ, never a crash: a malformed artifact is a
     miner problem and must not take the runtime down."""

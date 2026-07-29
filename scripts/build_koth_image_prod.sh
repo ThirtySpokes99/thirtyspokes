@@ -102,8 +102,17 @@ VENV_STAGE="${VENV_STAGE:-/var/tmp/koth-venv-stage}"
 rm -rf "$VENV_STAGE"
 python3 -m venv --copies "$VENV_STAGE"
 # openai: the pool client (OpenRouterBackend). datasets: the real MMLU/GSM8K loaders.
+# sentence-transformers: the ROUTING HARNESS's frozen encoder. A routing head's only view of a task
+# is this embedding, so it has to run inside the measured image — a miner cannot supply it and the
+# runtime cannot fetch it at boot (HF_HUB_OFFLINE=1, and anything unmeasured is outside RTMR1).
+#
+# CPU-ONLY TORCH, EXPLICITLY. The default wheel is the CUDA build: ~1.2 GB of GPU runtime this image
+# can never use, all of it inside dm-verity and hashed into RTMR1. The CPU wheel is ~200 MB.
+# Installed FIRST so the sentence-transformers resolve cannot pull the CUDA one back in.
+"$VENV_STAGE/bin/pip" install -q --no-cache-dir \
+  --index-url https://download.pytorch.org/whl/cpu torch
 "$VENV_STAGE/bin/pip" install -q --no-cache-dir "$WHEEL" 'cryptography>=42' 'dcap-qvl>=0.5' numpy \
-  openai datasets
+  openai datasets sentence-transformers
 cp -a "$VENV_STAGE" "$OUT/mkosi.extra/opt/koth/venv"
 
 # REWRITE THE STAGING PATH OUT OF THE IMAGE COPY. `python -m venv` bakes its own absolute location
@@ -177,6 +186,20 @@ else
     echo "FATAL: could not pre-populate the benchmark cache (need network here)"; exit 1; }
 fi
 
+# BAKE THE ROUTING ENCODER. Same argument as the benchmark data: fetched at boot it would be
+# network-dependent, unmeasured, and free to change under the subnet. Baked, it sits under dm-verity
+# and is pinned by RTMR1, so "which encoder ran" becomes a hardware fact. Downloaded through the
+# image's OWN venv so the cache layout is exactly what the runtime will read at boot.
+HF_HOME="$HFC" "$VENV_STAGE/bin/python" - <<'ENCPY' >/dev/null 2>&1 || {
+from sentence_transformers import SentenceTransformer
+from thirtyspokes.koth.harness import ENCODER, EMBED_DIM
+m = SentenceTransformer(ENCODER)
+v = m.encode(["warm the cache and prove the dimension"], convert_to_numpy=True,
+             normalize_embeddings=True)
+assert v.shape[1] == EMBED_DIM, f"encoder gives {v.shape[1]}, harness expects {EMBED_DIM}"
+ENCPY
+    echo "FATAL: could not pre-populate the routing encoder cache (need network here)"; exit 1; }
+
 # Strip the cache's build junk, or the rootfs is NOT reproducible. The dataset bytes themselves are
 # deterministic, but `datasets` leaves two things that are not:
 #   * .lock files whose FILENAME embeds the absolute cache path (…_root_repro-A_… vs …-B…), so every
@@ -186,6 +209,11 @@ fi
 # would be rejected as `unapproved_runtime`. Neither is data; both are regenerated at need.
 find "$HFC" -name '*.lock' -delete
 rm -rf "$HFC/xet/logs"
+# The encoder cache leaks the same WAY the dataset cache does: HF writes .no_exist marker dirs and
+# torch/transformers leave __pycache__, both varying per run. Not data, regenerated on demand, and
+# each one changes the rootfs -> the verity roothash -> RTMR1 -> every rebuilt image is rejected.
+find "$HFC" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+find "$HFC" -type d -name '.no_exist' -prune -exec rm -rf {} + 2>/dev/null || true
 
 # DHCP for the GCP NIC — the minimal image ships no .network, so networkd never configures the
 # interface (metadata unreachable + wait-online times out ~2min). This fixes both.

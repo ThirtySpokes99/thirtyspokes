@@ -210,7 +210,20 @@ def run_simulation(epochs: int = 4, bank: int = 400, dedup_l1: float = 0.05,
 
     # The pinned encoder is replaced by the world's deterministic embedding: the sim must run
     # offline in CI, and MiniLM would add a model download without changing what is being tested.
+    # RESTORED in the finally below — this used to be a bare assignment, which left every later
+    # caller in the process holding a stand-in encoder that KeyErrors on any prompt the sim did not
+    # generate. Harmless-looking, and it silently broke an unrelated test.
+    _real_encode = H.encode
     H.encode = world.embed
+    try:
+        return _run(world, suite, backend, platform, chain, store, scored_n, bank,
+                    epochs, dedup_l1, verbose)
+    finally:
+        H.encode = _real_encode
+
+
+def _run(world, suite, backend, platform, chain, store, scored_n, bank,
+         epochs, dedup_l1, verbose) -> dict:
 
     scored_idx = list(range(scored_n))
     train_idx = list(range(scored_n, bank))        # disjoint: honest routers must generalise

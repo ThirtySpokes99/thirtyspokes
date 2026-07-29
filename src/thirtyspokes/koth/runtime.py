@@ -46,7 +46,19 @@ SUITE_VERSION = "koth-suite-4"
 
 
 def runtime_measurement() -> str:
-    return signing.sha256_hex({"runtime": KOTH_RUNTIME_VERSION, "suite": SUITE_VERSION})
+    """What the enclave attests it is running. Changing any component here changes the measurement,
+    which invalidates every approved-measurement entry and resets accumulated evidence — that is the
+    intended contract for an engine change, not an accident to route around.
+
+    HARNESS_VERSION is in here because `harness.py` is the ENGINE on the routing path: it owns the
+    encoder, the head architecture, the ladder and the verifier. `harness.py` documented this
+    inclusion before it existed, so a changed harness would NOT have changed the measurement, and
+    miners could have been scored under an engine the owner never approved. Imported lazily: the
+    harness pulls in the router + benchmarks, and this function is called from import-time paths.
+    """
+    from .harness import HARNESS_VERSION
+    return signing.sha256_hex({"runtime": KOTH_RUNTIME_VERSION, "suite": SUITE_VERSION,
+                               "harness": HARNESS_VERSION})
 
 
 def mock_vendor_platform() -> Platform:

@@ -46,13 +46,20 @@ from .benchmarks import Benchmark
 # Bumped whenever the harness's OBSERVABLE behaviour changes (action space, verifier, encoder,
 # feature construction). Folded into `runtime_measurement()` beside SUITE_VERSION, so a changed
 # harness changes RTMR3 and every miner's evidence resets — the same contract a suite rotation has.
-HARNESS_VERSION = "koth-harness-1"
+# koth-harness-2: the routing pool became part of the harness contract (ROUTING_POOL), embeddings
+# are quantised to EMBED_DECIMALS so three machines agree, and HARNESS_VERSION is now genuinely
+# folded into `runtime_measurement()` — it was documented as such but was not, so a harness change
+# would not have changed RTMR3 and miners could have been scored under an unapproved engine.
+HARNESS_VERSION = "koth-harness-2"
 
 # The frozen encoder. Pinned by name because the embedding must be byte-identical in the miner's
 # enclave, in the owner's reference build, and in the trainer a miner runs at home; a different
 # encoder silently changes every routing decision.
 ENCODER = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
+# Decimal places every embedding is rounded to. Part of the harness contract: change it
+# and every routing decision can change, so it moves only with HARNESS_VERSION.
+EMBED_DECIMALS = 6
 
 # A head is d*h + h + h*k + k params. At d=384, k=12, h=16 that is ~6.4K; the cap admits h up to ~128.
 # It bounds artifact size, load cost and copy surface. It does NOT bound memorisation — see the module
@@ -176,7 +183,14 @@ def encode(prompts: list[str]) -> np.ndarray:
     if emb.ndim != 2 or emb.shape[1] != EMBED_DIM:
         raise RuntimeError(f"encoder returned {emb.shape}, expected (*, {EMBED_DIM}) — "
                            f"the pinned encoder does not match the harness")
-    return emb
+    # QUANTISE, because the byte-identical claim above is otherwise false. Torch CPU kernels are not
+    # bit-reproducible across microarchitectures — a miner's laptop and an AVX-512 CVM can differ in
+    # the last few bits of every component. Those differences are far below anything semantic, but
+    # they occasionally flip an argmax near a decision boundary, which a miner would experience as
+    # their local dev-kit result disagreeing with their attested run for no visible reason.
+    # Rounding well above the noise floor makes the three copies agree in practice, and costs
+    # nothing: 1e-6 is ~4 orders of magnitude finer than any distinction a 6K-param head resolves.
+    return np.round(emb, EMBED_DECIMALS)
 
 
 def verifier_ok(answer: str, bench: Benchmark) -> bool:

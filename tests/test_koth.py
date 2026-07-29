@@ -3373,3 +3373,30 @@ def test_devkit_and_miner_agree_on_which_engine_runs(env, monkeypatch):
     assert r["valid"], r["reason"]
     assert r["decisions"], "a routing model was scored without reporting its decisions"
     assert all(0 <= d["rung"] < k for d in r["decisions"])
+
+
+def test_embeddings_are_quantised_so_three_machines_agree(monkeypatch):
+    """The harness promises byte-identical embeddings in the enclave, the owner's reference build and
+    the miner's home trainer. Torch CPU kernels are NOT bit-reproducible across microarchitectures,
+    so that promise is false without quantisation — and the failure mode is invisible: a rare argmax
+    flip that makes a miner's local dev-kit result disagree with their attested run for no reason
+    they can see. Rounding well above the noise floor makes the copies agree."""
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+
+    class Jittery:
+        """Two machines computing 'the same' embedding, differing in the last bits."""
+        def __init__(self, eps):
+            self.eps = eps
+
+        def encode(self, prompts, **kw):
+            base = np.linspace(0.1, 0.9, H.EMBED_DIM)[None, :].repeat(len(prompts), 0)
+            return base + self.eps
+
+    monkeypatch.setattr(H, "_ENCODER", Jittery(0.0))
+    a = H.encode(["x", "y"])
+    monkeypatch.setattr(H, "_ENCODER", Jittery(1e-12))     # sub-noise disagreement
+    b = H.encode(["x", "y"])
+    assert np.array_equal(a, b), "sub-noise float jitter survives into the embedding"
+    assert a.shape == (2, H.EMBED_DIM)

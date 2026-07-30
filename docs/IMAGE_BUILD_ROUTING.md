@@ -269,3 +269,62 @@ verify that the baked wheel matches a fresh build of HEAD — that is the strong
 that actually caught v19; worth adding if this cycle repeats.
 
 Order that works: freeze the tree → tests green → build → measure → publish governance → publish image.
+
+---
+
+## PROVEN END TO END ON TESTNET 526 — 2026-07-30, epoch 76729
+
+Two miners with genuinely different routing policies, competing on real Intel TDX hardware, scored by
+an enforcing validator, crowned by the reign, emissions set on chain.
+
+```
+epoch 76729: scored=1  dq=4  king=5G1PepNNhF…
+  uid 3  head A (lam=0.50, frugal)   k = {mmlu 2, math 2, code 1}   $0.00055/task
+  uid 4  head B (lam=0.05, quality)  k = {mmlu 2, math 2, code 2}   $0.00271/task   <- CROWNED
+  last_submitted_weights = {'4': 1.0}
+```
+
+**The competition was decided on merit.** Head B routes to stronger models and took the ranked code
+benchmark 2/2 where A took 1/2 — the same ordering its offline training predicted (code 0.938 vs
+0.875). Nothing about the outcome was hardcoded; the reign ranked them on `Q_lcb − cost` and picked
+the better router.
+
+Every link verified, none simulated:
+
+| link | evidence |
+|---|---|
+| miner trains a head offline | `/root/koth-miner-work` (outside the repo), 48 tasks x 7 models, $1.32 |
+| publishes weights + commits on chain | `thirtyspokes/koth-miner-router{,-b}`, revealed commit |
+| boots the owner's measured image on TDX | `koth-runtime-v22`, RTMR1 `158ed9b1…` matching governance |
+| head routes, harness executes the cascade | `KOTH-MODE routing harness=koth-harness-2 rungs=7` |
+| hardware-attested proof uploaded | `proofs/<epoch>.json`, real DCAP quote |
+| validator binds + verifies under `enforce=True` | no attestation-class DQ |
+| grades answers incl. sandboxed code execution | host daemon via socket, `KOTH_GRADE_DIR` aligned |
+| evidence accumulates, floor applies | `k > 0`, A still below floor from its miss deficit |
+| reign crowns, weights set on chain | `{'4': 1.0}` |
+
+### The nine bugs this run found, none visible offline
+
+1. the measured image ran the AGENT path for routing artifacts (a second copy of the run logic, untested)
+2. the reference pool could silently diverge from the router's action space
+3. miner/validator slice-size mismatch — `unexpected_task` for every miner
+4. slice size made an epoch physically impossible (a proof that overruns is unrecoverable, not late)
+5. one malformed provider response destroyed a 49-minute epoch
+6. `commit()` reported success on a rejected extrinsic
+7. routing proofs attested `confined=False` — the whole path was unscoreable under `enforce=True`
+8. the shipped validator container had no docker CLI (`docker.io` ships the DAEMON; the client is `docker-cli`, a dropped *Recommends*)
+9. the sandbox bind-mount resolved in the host namespace, so code never graded even with a working client
+
+Each was found only by running the real thing, and several were masked by a *different* component's
+error message — `below_floor:mmlu` in particular stood in for "no proof found" for hours, because a
+miss clears its own reason and re-fails on the accumulated floor.
+
+### Operational constraints measured here, not documented anywhere before
+
+* **Epoch length caps slice size.** ~90s/pool-call over 3 benchmarks against 100-block (~20 min)
+  epochs means `n_per_bench=2`. 16 was impossible; 4 straddled the boundary and landed ~half the time.
+* **A quality-biased router is penalised twice** — once by the cost term, again by the epoch clock,
+  because bigger models are slower. The achievable policy space is narrower than the pool implies.
+* **A registered-but-silent miner accrues `miss=0` evidence** and needs either a re-commit (which
+  resets it) or ~10 good epochs to dig out. Miner A is still below the floor for exactly this reason
+  while miner B, freshly committed, cleared it immediately.

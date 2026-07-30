@@ -414,33 +414,25 @@ def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypat
     assert elapsed < unbounded, f"{elapsed:.1f}s is not under the {unbounded:.0f}s of an unbounded run"
 
 
-def test_reference_skips_an_epoch_it_cannot_reach_in_time(monkeypatch, capsys):
+def test_reference_skips_an_epoch_it_cannot_reach_in_time():
     """A reference arriving after the grace point describes a slice already scored without it: the
     calls are spent and the epoch falls back to absolute accuracy anyway. Observed on 76755."""
-    import types
-
-    from thirtyspokes.koth import reference
     from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    from thirtyspokes.koth.reference import seconds_until_scored
 
-    epoch = 100
+    epoch, grace, deadline = 100, 85, 600.0
+    open_block = epoch * EPOCH_BLOCKS
 
-    class Chain:
-        def __init__(self, *a, **k): pass
-        def owner_measurements(self): return {"grace_blocks": 85}
-        # 80 blocks in: only 5 blocks (60s) left before scoring, far under a 600s deadline
-        def current_block(self): return epoch * EPOCH_BLOCKS + 80
-        def beacon(self, e): return "b" * 16
+    # early in the epoch: the whole deadline fits before scoring
+    assert seconds_until_scored(epoch, grace, open_block + 5) == 80 * 12.0
+    assert seconds_until_scored(epoch, grace, open_block + 5) > deadline
 
-    import thirtyspokes.subnet.chain as chain_mod
-    monkeypatch.setattr(chain_mod, "BittensorChain", Chain)
-    monkeypatch.setattr(reference, "current_epoch", lambda c, *a, **k: epoch, raising=False)
+    # 80 blocks in: 60s left, so a 600s run would land long after the epoch was scored
+    assert seconds_until_scored(epoch, grace, open_block + 80) == 5 * 12.0
+    assert seconds_until_scored(epoch, grace, open_block + 80) < deadline
 
-    args = types.SimpleNamespace(
-        netuid=526, wallet="w", network="test", hotkey="hk", epoch=None,
-        pool=",".join(__import__("thirtyspokes.koth.harness", fromlist=["x"]).pool_models()),
-        deadline_s=600.0, call_timeout=120.0, n_per_bench=2, max_tokens=16384,
-        reasoning_effort=None, bucket=None)
-    monkeypatch.setattr(reference, "_parse_args", lambda: args, raising=False)
+    # past the grace point entirely -> negative, still less than any deadline
+    assert seconds_until_scored(epoch, grace, open_block + 95) < 0
 
-    # the guard is the first thing after epoch selection, so reaching the pool would mean it failed
-    assert "skipping rather than spending calls" in __import__("inspect").getsource(reference.main)
+    # no published grace -> no opinion, the caller proceeds as before
+    assert seconds_until_scored(epoch, None, open_block + 80) is None

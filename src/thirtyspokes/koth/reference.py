@@ -219,6 +219,18 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
     }
 
 
+def seconds_until_scored(epoch: int, grace_blocks, current_block: int) -> float | None:
+    """Wall-clock left before validators score `epoch`, or None if the owner published no grace.
+
+    A reference arriving after that point describes a slice already scored without it, so the calls
+    are spent for nothing and the epoch falls back to absolute accuracy anyway (observed on 76755).
+    """
+    if not grace_blocks:
+        return None
+    from .epoch import EPOCH_BLOCKS
+    return ((epoch * EPOCH_BLOCKS + int(grace_blocks)) - current_block) * 12.0
+
+
 def publish(record: dict, sign, *, bucket: str | None = None, token: str | None = None) -> str:
     """Sign and upload to the owner's bucket at this epoch's derived path. Returns the path."""
     import os
@@ -359,16 +371,13 @@ def main() -> None:  # noqa: C901
     # Observed on 76755. The grace point is published in governance precisely so both sides agree on
     # the deadline — the owner's own tooling should honour the same number it asks miners to.
     if args.epoch is None:
-        from .epoch import EPOCH_BLOCKS
         gov = chain.owner_measurements() or {}
-        grace = gov.get("grace_blocks")
-        if grace:
-            left_s = ((epoch * EPOCH_BLOCKS + int(grace)) - chain.current_block()) * 12.0
-            if left_s < args.deadline_s:
-                print(f"[koth-reference] epoch {epoch} scores in {left_s:.0f}s, less than the "
-                      f"{args.deadline_s:.0f}s deadline — skipping rather than spending calls on a "
-                      f"record that would arrive too late", flush=True)
-                return
+        left_s = seconds_until_scored(epoch, gov.get("grace_blocks"), chain.current_block())
+        if left_s is not None and left_s < args.deadline_s:
+            print(f"[koth-reference] epoch {epoch} scores in {left_s:.0f}s, less than the "
+                  f"{args.deadline_s:.0f}s deadline — skipping rather than spending calls on a "
+                  f"record that would arrive too late", flush=True)
+            return
     models = [m.strip() for m in args.pool.split(",") if m.strip()]
 
     cfg = config.LiveConfig()

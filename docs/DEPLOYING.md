@@ -48,7 +48,7 @@ set -a && . ./.env && set +a && uv run python scripts/koth_live_smoke.py   # rea
 > **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`). Every command below
 > shows the live testnet target; mainnet (netuid 99, `--network finney`) remains the eventual
 > destination and is the code default, so **pass `--network test` explicitly** while running against
-> 526. Governance, the measured image (`v26`) and the per-epoch pool reference are published there.
+> 526. Governance, the measured image (`v27`) and the per-epoch pool reference are published there.
 
 
 The trust claim is only real with genuine hardware attestation, so a production subnet needs the
@@ -233,14 +233,14 @@ pointed at an attacker's hotkey and made to trust the attacker's image.
 GCP C3 TDX guest — the image boots dm-verity-locked, runs the metadata-injected agent with zero egress,
 and an enforcing validator accepts its proof while rejecting a stock CVM):
 
-**v26** (`recipe_commit af52c93`, harness `koth-harness-4`, governance record v6):
+**v27** (`recipe_commit a06cd1a`, harness `koth-harness-4`, governance record v7):
 
 | | |
 |---|---|
-| UKI sha256 | `6d2fb410b7753d0e8168d7ac52bac21236bf8502816ca3265e0ba593e1077058` |
-| verity roothash | `c57a0ee8bde14c6fab3db08084f911775bed5df47d5486e5fae57b50bdf805e8` |
+| UKI sha256 | `f9d650cc36bf6a589e98ad36db9d610d1ce1faeaab0a1b53ab70b9767e374426` |
+| verity roothash | `a05e4d5325ef6b6aa155b29a9b2aea7649390857aba7258d857d046d7ef0ba31` |
 | MRTD | `c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5` |
-| **RTMR1** | `65036a01d4879daa666ea5079345259dfb3a8b618335f8d1d1de9fcadc3c6a45be071cdd66a3bd70115a5b9a7b120b3e` |
+| **RTMR1** | `cf0db5f18e34e2e699a98b256df3fc614019f5a1f5b76493e2aadc77e75b5be3d3b7ab3f409d5619dc70255d60c51444` |
 | RTMR2 | `000…0` (zero under direct-UKI boot) |
 | RTMR3 | `dd9bc28fae67ef43c5e998679a58ecab02e3042df9d5afa00534a6386948b1954bf4c704641d4a263a0ba897b512a186` (derived) |
 | runtime measurement | `1449fadb4821cadef93f7eecc8c3b040e2cd244e01a2607ea531e5f7055c38d8` |
@@ -257,6 +257,11 @@ before judging any change of your own:
   derived RTMR3, and the rootfs change moved RTMR1 as usual. Evidence resets, and — the part that is
   easy to miss — **every miner must re-publish and re-commit**, because a routing artifact's
   `source_text` *is* the harness version, so the old commit no longer binds.
+* **v26→v27 moved only RTMR1 as well**, and for the same reason: the runtime now enforces the task
+  budget with a WATCHDOG instead of asking the provider client to honour a timeout. It turned out an
+  httpx read timeout never fires on a response that trickles, so three successive "bounded" versions
+  were not bounded and ~10% of miner-runs were lost to a single hung call. Enforcement changed;
+  the engine contract did not.
 * **v25→v26 moved only RTMR1 — a bug fix, not an engine change.** It made the runtime actually
   enforce the budget harness-4 already specified (the per-call bound leaked through the SDK's own
   retries). `HARNESS_VERSION` stayed, so `runtime_measurement` and RTMR3 stayed, so **evidence was
@@ -295,7 +300,7 @@ and a re-commit cycle, not just an image swap.
 ```bash
 huggingface-cli login          # or export HF_TOKEN
 python scripts/publish_runtime_image.py \
-  --version v25 --image /path/koth-runtime-v26.tar.gz --build-dir /root/koth-build-v25a \
+  --version v25 --image /path/koth-runtime-v27.tar.gz --build-dir /root/koth-build-v25a \
   --uki-sha256 <uki> --roothash <roothash> --mrtd <mrtd> --rtmr1 <rtmr1> \
   --pool "openai/gpt-4o-mini,anthropic/claude-opus-4.7"
 ```

@@ -267,14 +267,14 @@ Import the disk into your own cloud (GCP shown; Azure DCesv6 and bare metal work
 
 ```bash
 gsutil cp koth-runtime.tar.gz gs://YOUR-BUCKET/
-gcloud compute images create koth-runtime-v26 \
+gcloud compute images create koth-runtime-v27 \
   --source-uri=gs://YOUR-BUCKET/koth-runtime.tar.gz \
   --guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC
 
 gcloud compute instances create my-koth-miner \
   --zone=us-central1-a --machine-type=c3-standard-4 \
   --confidential-compute-type=TDX --maintenance-policy=TERMINATE \
-  --image=koth-runtime-v26 \
+  --image=koth-runtime-v27 \
   --network-interface=nic-type=GVNIC --boot-disk-size=50GB \
   --metadata="^@^koth-epoch=<E>@koth-nonce=<N>@koth-hotkey=<YOUR_SS58>@koth-pool=<ALLOW_LIST>" \
   --metadata-from-file=koth-secrets=secrets.env,\
@@ -287,15 +287,15 @@ runs with **zero network egress**; its only channel is the metered `call_model`.
 
 | the image, pinned | |
 |---|---|
-| GCP image / bucket version | `koth-runtime-v26` |
-| image sha256 | `4afb520c2d664c7d092c61ffedc161ab02209d9a174ab45dc105c16f456212a4` |
-| UKI sha256 | `6d2fb410b7753d0e8168d7ac52bac21236bf8502816ca3265e0ba593e1077058` |
-| verity roothash | `c57a0ee8bde14c6fab3db08084f911775bed5df47d5486e5fae57b50bdf805e8` |
-| recipe commit | `af52c93` |
+| GCP image / bucket version | `koth-runtime-v27` |
+| image sha256 | `c10a4b60dada223a4620d5566b0411de30a603f26ebe2e67741aa6a7b712bc1e` |
+| UKI sha256 | `f9d650cc36bf6a589e98ad36db9d610d1ce1faeaab0a1b53ab70b9767e374426` |
+| verity roothash | `a05e4d5325ef6b6aa155b29a9b2aea7649390857aba7258d857d046d7ef0ba31` |
+| recipe commit | `a06cd1a` |
 | MRTD | `c1ee9c16…` *(GCP TDVF — identical on every GCP TDX guest, a coarse check only)* |
-| **RTMR1** | `65036a01d4879daa666ea5079345259dfb3a8b618335f8d1d1de9fcadc3c6a45be071cdd66a3bd70115a5b9a7b120b3e` **← the per-image anchor** |
+| **RTMR1** | `cf0db5f18e34e2e699a98b256df3fc614019f5a1f5b76493e2aadc77e75b5be3d3b7ab3f409d5619dc70255d60c51444` **← the per-image anchor** |
 | RTMR3 | `dd9bc28fae67ef43c5e998679a58ecab02e3042df9d5afa00534a6386948b1954bf4c704641d4a263a0ba897b512a186` *(binds runtime+suite+pool — moves whenever the engine does)* |
-| on-chain governance | `cd2f827fcd172400546780438c950b0efe5dc99a003e3982ba899dc97ca45439` (record v6) |
+| on-chain governance | `96855d0fbe7e3fa3996964fffaf08671cdbac2a9ad9e99917a621561c149c130` (record v7) |
 
 The validator gates every proof on MRTD + RTMR1/2/3 against the owner's on-chain record. Change *any*
 byte of the rootfs and RTMR1 changes → `unapproved_runtime` → you earn nothing.
@@ -321,7 +321,7 @@ WorkingDirectory=/path/to/thirtyspokes
 EnvironmentFile=/path/to/thirtyspokes/.env
 ExecStart=/root/.local/bin/uv run --frozen orchestra-koth-gcp-miner \
   --netuid 526 --network test --wallet miner --hotkey default \
-  --image koth-runtime-v26 --zone us-central1-a --machine-type c3-standard-4 \
+  --image koth-runtime-v27 --zone us-central1-a --machine-type c3-standard-4 \
   --n-per-bench 2 --epochs 0 --min-blocks 80 --attempt-deadline 900 --max-attempts 1
 Restart=always
 RestartSec=30

@@ -309,3 +309,44 @@ def test_build_freshness_catches_a_container_running_stale_code(tmp_path, monkey
 
     monkeypatch.delenv("KOTH_BUILD_COMMIT")          # not containerised
     assert doctor.check_build_freshness()[0] == doctor.OK
+
+
+def test_a_bounded_call_is_bounded_in_total_not_per_attempt():
+    """The bug that survived the first fix and killed epoch 76746 on the supposedly-bounded engine.
+
+    `timeout` bounds ONE SDK attempt, not the call: with the client's max_retries=3 a single
+    create() can still take 4 x timeout, so the call looked bounded and was not. Five tasks finished
+    in 128s and the sixth never returned. Asserting that a timeout is *passed* — which the earlier
+    test did — cannot catch this; the assertion has to be on total elapsed time.
+    """
+    import time
+
+    from thirtyspokes.gateway.gateway import OpenRouterBackend
+
+    calls = {"n": 0, "opts": None}
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls["n"] += 1
+            time.sleep(float(kw["timeout"]))     # every attempt burns its whole timeout
+            raise RuntimeError("provider hung")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+        def with_options(self, **kw):
+            calls["opts"] = kw
+            return self
+
+    be = OpenRouterBackend.__new__(OpenRouterBackend)
+    be._client = FakeClient()
+    be._price_fn = lambda m: (0.0, 0.0)
+
+    t0 = time.monotonic()
+    text, tin, tout, cost = be.complete("m", [{"role": "user", "content": "q"}],
+                                        {"max_tokens": 8, "_timeout": 1.0})
+    elapsed = time.monotonic() - t0
+
+    assert calls["opts"] == {"max_retries": 0}, "the SDK's own retries must not multiply the bound"
+    assert elapsed < 3.0, f"a 1s budget took {elapsed:.1f}s — the call is not actually bounded"
+    assert text == "" and cost == 0.0, "an unanswerable rung degrades; it does not crash the epoch"

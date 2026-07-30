@@ -107,8 +107,16 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
         # times four.
         budget = p.pop("_timeout", None)
         deadline = (_mono() + float(budget)) if budget else None
+        client = self._client
         if budget:
             p["timeout"] = float(budget)
+            # AND TAKE THE SDK'S OWN RETRIES OUT OF THE PICTURE. `timeout` bounds ONE attempt, not the
+            # call: with the client's max_retries=3 a single create() can still take 4 x timeout, so
+            # a bounded-looking call was unbounded underneath. Measured on epoch 76746, WITH the
+            # budget live: five tasks in 128s, then the sixth never returned and the run died at the
+            # operator's 900s deadline. The retry loop below is deadline-aware, so retrying belongs
+            # there — where the remaining budget is actually known — and not inside the SDK.
+            client = self._client.with_options(max_retries=0)
         # `reasoning` is an OpenRouter body param, not a top-level kwarg, so it has to be merged
         # into extra_body. Without it a reasoning model spends its ENTIRE max_tokens budget thinking
         # and never emits an answer -- measured on SWE-bench Pro oracle prompts, where raising the
@@ -136,11 +144,15 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
             if deadline is not None:
                 left = deadline - _mono()
                 if left <= 0:
-                    last = last or TimeoutError("call budget exhausted")
-                    break
+                    # DEGRADE, do not break: `break` skips the for/else below and falls through to
+                    # `r.usage` with `r` unbound, turning an exhausted budget into a crash inside the
+                    # enclave — strictly worse than the hang it replaced.
+                    print(f"[pool] {model} exhausted its {budget:.0f}s budget — "
+                          f"treating as an unanswered rung", flush=True)
+                    return "", 0, 0, 0.0
                 p["timeout"] = left          # never let a retry outlive the task's budget
             try:
-                r = self._client.chat.completions.create(
+                r = client.chat.completions.create(
                     model=model, messages=messages, extra_body=body, **p)
                 break
             except Exception as e:      # noqa: BLE001 — any provider failure, incl. unparseable bodies

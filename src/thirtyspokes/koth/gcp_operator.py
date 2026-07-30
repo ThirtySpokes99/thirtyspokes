@@ -226,7 +226,7 @@ def main() -> None:  # pragma: no cover — real GCP/chain/HF operator
     # re-derives the slice and rejects any proof whose task set differs — `unexpected_task`, a DQ —
     # so an operator left at 8 against a validator at 16 silently disqualifies every epoch it runs.
     # Pinned by a test alongside the other three.
-    parser.add_argument("--n-per-bench", type=int, default=16)
+    parser.add_argument("--n-per-bench", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=0, help="0 runs continuously")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--min-blocks", type=int, default=50,

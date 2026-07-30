@@ -71,7 +71,7 @@ def is_routing_artifact(artifact: Artifact) -> bool:
 class KOTHMinerNeuron:
     def __init__(self, hotkey: str, backend: ModelBackend, platform: Platform,
                  suite: list[Benchmark], chain, store, artifact: Artifact, repo: str, *,
-                 n_per_bench: int = 16, epoch_blocks: int = EPOCH_BLOCKS, confine: bool = False,
+                 n_per_bench: int = 2, epoch_blocks: int = EPOCH_BLOCKS, confine: bool = False,
                  commit_proofs: bool = False, confine_timeout: float = 120.0):
         self.hotkey = hotkey                    # ss58 wallet hotkey on a real chain
         self.rt = KOTHRuntime(backend, platform, confine=confine,
@@ -185,11 +185,16 @@ def main() -> None:  # pragma: no cover — live daemon (needs bittensor + HF + 
     p.add_argument("--model", default="openai/gpt-4o-mini", help="reference router's pool model (if no --source)")
     p.add_argument("--pool", default="openai/gpt-4o-mini,anthropic/claude-opus-4.7",
                    help="owner-pinned model allow-list (comma-separated) — publish this from the subnet owner")
-    # MUST EQUAL THE VALIDATOR'S. The validator re-derives the slice from (nonce, epoch, bench) and
-    # rejects any proof whose task set differs — `unexpected_task`, a DQ. Raising one side only takes
-    # the whole subnet down silently, which is exactly what happened when the validator went 8 -> 16
-    # and this line did not: every miner on defaults was disqualified. Pinned by a test.
-    p.add_argument("--n-per-bench", type=int, default=16)
+    # MUST EQUAL THE VALIDATOR'S, AND MUST FIT INSIDE ONE EPOCH. Two independent constraints:
+    #   * a mismatch is `unexpected_task` for every miner (measured: the validator went 8 -> 16 and
+    #     this line did not, disqualifying everyone);
+    #   * a run that OVERRUNS its epoch is worthless, not merely late — the proof carries a stale
+    #     nonce and can never validate ("proof completed after its epoch expired"). MEASURED on
+    #     hardware: ~90s per pool call, 3 benchmarks, 100-block (~20 min) epochs, so 16 was
+    #     IMPOSSIBLE (48 tasks ~= 72 min) and 4 (12 tasks) fits with margin.
+    # Per-epoch size is NOT the statistical constraint: `accumulate` mode pools evidence across
+    # epochs, so the Wilson bound applies to the pooled count, not the slice.
+    p.add_argument("--n-per-bench", type=int, default=2)
     p.add_argument("--poll", type=float, default=12.0)
     p.add_argument("--confine", action="store_true",
                    help="run the agent in the no-egress netns confinement (production CVM)")

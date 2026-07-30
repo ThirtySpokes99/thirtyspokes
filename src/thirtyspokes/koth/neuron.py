@@ -374,13 +374,16 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
                    help="hotkey NAME inside the wallet (the one registered on the subnet — it signs "
                         "set_weights). A wallet can hold several; only 'default' was reachable before.")
     p.add_argument("--network", default="finney")
-    # 16, not 8. The reign scalar is a Wilson LOWER bound, so small slices are penalised hard —
-    # measured at n=8 the penalty was ~4x the entire measurable band, i.e. the scalar read noise.
-    # Accumulate mode pools across epochs so this is time-to-confidence rather than a hard floor,
-    # and 16 halves how long a new miner waits to be ranked on skill instead of on sample size.
-    # It is also the OWNER's per-epoch bill: the reference costs n_per_bench x |pool| calls, so 16
-    # over a 7-rung ladder is ~112 calls/epoch. Raising this raises that linearly.
-    p.add_argument("--n-per-bench", type=int, default=16)
+    # 2, and the ceiling is WALL CLOCK, not statistics. A miner's run must finish inside one epoch
+    # (100 blocks ~= 20 min) or its proof carries a stale nonce and can never validate. Measured on
+    # hardware at ~90s per pool call over 3 benchmarks: 16 -> 48 tasks ~= 72 min, IMPOSSIBLE; 12
+    # tasks straddled the boundary and landed only sometimes. 4 (12 tasks, ~1080s) was the
+    # first proposal here and the epoch-fit test REJECTED it: it needs ~90% of the epoch, which
+    # is exactly the coin-flip that was observed. 2 -> 6 tasks ~= 540s, inside a 60% budget.
+    # An earlier 8 -> 16 raise here argued statistical power and was wrong twice: unachievable, and
+    # unnecessary, because `accumulate` pools evidence ACROSS epochs — the Wilson bound applies to
+    # the pooled count, so per-epoch size never governed confidence.
+    p.add_argument("--n-per-bench", type=int, default=2)
     p.add_argument("--poll", type=float, default=12.0)
     p.add_argument("--insecure", action="store_true",
                    help="DEV/OFFLINE ONLY: accept the mock TEE + skip the measured-image gate "

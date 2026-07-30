@@ -42,5 +42,5 @@ echo "=== $(date -u +%FT%TZ) publishing pool reference ==="
 "$UV" run --frozen orchestra-koth-reference \
   --netuid "$NETUID" --network "$NETWORK" \
   --wallet "$OWNER_WALLET" --hotkey "$OWNER_HOTKEY1" \
-  --n-per-bench 16 \
+  --n-per-bench 2 \
   --deadline-s 600 --call-timeout 120

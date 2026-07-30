@@ -3603,6 +3603,26 @@ def test_miner_and_validator_agree_on_slice_size():
         f"the reference cron measures a different slice ({m.group(1) if m else '?'}) than the "
         f"validator scores ({val}) — the frontier would not describe the scored asks")
 
+    # ACHIEVABLE, not merely CONSISTENT. Agreement across five files is worth nothing if the agreed
+    # number cannot be executed: a miner's run must finish inside ONE epoch or its proof carries a
+    # stale nonce and can never validate ("proof completed after its epoch expired" — measured on
+    # testnet 526). An earlier version of this test asserted only consistency and would have passed
+    # happily on n_per_bench=16, a value at which mining is IMPOSSIBLE.
+    #
+    # Measured on GCP C3 TDX against the pinned 7-rung pool: ~90s per pool call. 100-block epochs at
+    # ~12s/block give ~1200s. 12 tasks landed with margin; 12 tasks also MISSED once when latency
+    # ran high, and 48 tasks (~72 min) never finished.
+    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    PER_CALL_S, BLOCK_S, SAFETY = 90.0, 12.0, 0.6      # use only 60% of the epoch
+    n_bench = len(real_suite())
+    budget_s = EPOCH_BLOCKS * BLOCK_S * SAFETY
+    need_s = val * n_bench * PER_CALL_S
+    assert need_s <= budget_s, (
+        f"n_per_bench={val} over {n_bench} benchmarks needs ~{need_s:.0f}s of pool calls but an "
+        f"epoch only affords ~{budget_s:.0f}s at {int(SAFETY*100)}% utilisation. Proofs would "
+        f"complete after their epoch expired and could never validate.")
+
 
 def test_routing_loop_through_the_real_daemons(monkeypatch):
     """END TO END on the path a live miner takes: KOTHMinerNeuron.run_once (router dispatch) ->

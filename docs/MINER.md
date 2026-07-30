@@ -295,7 +295,7 @@ runs with **zero network egress**; its only channel is the metered `call_model`.
 | MRTD | `c1ee9c16…` *(GCP TDVF — identical on every GCP TDX guest, a coarse check only)* |
 | **RTMR1** | `a7c57e409dd7e042610948389af9064c84c57775357ef77b1a600efd27dfd8d102cc8a1f56cdf043c6205a9fb1a5e159` **← the per-image anchor** |
 | RTMR3 | `51e9caafd38c47b9153af7b589449b59cc7d8ae8033d6042d76cd35c1d501dfd38ac1e3ac00775093e3e3464c679e562` *(binds runtime+suite+pool — moves whenever the engine does)* |
-| on-chain governance | `b024c4161a1bcf41529c8f4aa92658152901902ca78853ef4f335ec62d097771` |
+| on-chain governance | `68927912f6af4b82947a4eac5e86bed14cfab64939830cce04f43a22818d0956` (record v3) |
 
 The validator gates every proof on MRTD + RTMR1/2/3 against the owner's on-chain record. Change *any*
 byte of the rootfs and RTMR1 changes → `unapproved_runtime` → you earn nothing.

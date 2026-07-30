@@ -300,6 +300,40 @@ runs with **zero network egress**; its only channel is the metered `call_model`.
 The validator gates every proof on MRTD + RTMR1/2/3 against the owner's on-chain record. Change *any*
 byte of the rootfs and RTMR1 changes → `unapproved_runtime` → you earn nothing.
 
+### Run the operator under supervision
+
+An operator that is not running earns nothing, and nothing tells you: the chain simply shows no proof
+and the validator reports `no_proof`, which reads like a bad epoch rather than a dead process. Run it
+as a service, not from a shell.
+
+```ini
+# /etc/systemd/system/koth-miner.service
+[Unit]
+After=network-online.target
+Wants=network-online.target
+# Each start can create a CVM, so bound a crash-loop: after 5 failures in 10 minutes systemd gives
+# up and leaves the unit FAILED (loud) instead of billing you forever.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+[Service]
+WorkingDirectory=/path/to/thirtyspokes
+EnvironmentFile=/path/to/thirtyspokes/.env
+ExecStart=/root/.local/bin/uv run --frozen orchestra-koth-gcp-miner \
+  --netuid 526 --network test --wallet miner --hotkey default \
+  --image koth-runtime-v25 --zone us-central1-a --machine-type c3-standard-4 \
+  --n-per-bench 2 --epochs 0 --min-blocks 80 --attempt-deadline 900 --max-attempts 1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> `StartLimitBurst` / `StartLimitIntervalSec` must be in **`[Unit]`**. systemd accepts them in
+> `[Service]` with only a log warning and then ignores them — so the crash-loop guard reads as
+> present in your unit file while doing nothing at all.
+
 ### Mine continuously (one proof per boot, from OUTSIDE the VM)
 
 The owner's published image is **locked down — no sshd, no shell** (see above), so there is nothing

@@ -38,6 +38,7 @@ rebuilt measured image and a fresh owner approval on-chain. Two operational cons
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -148,7 +149,14 @@ def run_tests(code: str, cases: list[dict], *, image: str = SANDBOX_IMAGE) -> fl
         raise GradingUnavailable("no test cases for this task")
     if not code.strip():
         return 0.0                            # an empty submission is a genuine failure, not an error
-    with tempfile.TemporaryDirectory() as d:
+    # THE SANDBOX DIR MUST EXIST AT THE SAME PATH IN BOTH NAMESPACES. `docker run -v` is resolved by
+    # the DAEMON, so when the validator is itself containerised and talks to the host daemon through a
+    # mounted socket, a path inside this container does not exist on the host: the bind silently mounts
+    # nothing, /w/drv.py is absent, and grading fails. MEASURED on testnet 526 — the container had a
+    # working docker client (`docker version` reported the host server) and still could not grade a
+    # single code task. Point KOTH_GRADE_DIR at a directory bind-mounted at the IDENTICAL path on both
+    # sides (docker-compose.yml does this) and the mount resolves for the daemon and for us alike.
+    with tempfile.TemporaryDirectory(dir=os.environ.get("KOTH_GRADE_DIR") or None) as d:
         pathlib.Path(d, "sol.py").write_text(code)
         pathlib.Path(d, "tests.json").write_text(json.dumps(cases))
         pathlib.Path(d, "drv.py").write_text(_DRIVER)

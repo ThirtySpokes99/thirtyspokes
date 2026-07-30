@@ -17,6 +17,8 @@ services:
     # bounded to 20s, so this prevents an orchestrator SIGKILL in the middle of that recovery path.
     stop_grace_period: 30s
     environment:                            # explicit allow-list from .env; no ambient secrets
+      # must match the bind-mount below at the SAME path on both sides (see volumes)
+      KOTH_GRADE_DIR: /var/tmp/koth-grade
       # OPTIONAL: a grounding-mode validator does ZERO inference and needs no LLM key.
       # Only the opt-in --audit-mode probe uses this (and bills you for miner inference).
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -37,6 +39,10 @@ services:
       # added quietly — run the validator on a host you are willing to give it. The alternative is a
       # remote/rootless daemon via DOCKER_HOST, which the grader honours since it just shells out.
       - /var/run/docker.sock:/var/run/docker.sock
+      # SAME PATH ON BOTH SIDES, deliberately. The code grader bind-mounts its scratch dir into a
+      # throwaway sandbox container, and the host daemon resolves that path in the HOST namespace —
+      # so it has to be identical here and outside, or the mount silently binds nothing.
+      - /var/tmp/koth-grade:/var/tmp/koth-grade
       # opt-in secret memorization probe (see --probe-bank below):
       # - ${PROBE_BANK_FILE:-/dev/null}:/secrets/probe_bank.json:ro
     command:

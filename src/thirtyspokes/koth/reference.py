@@ -219,6 +219,38 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
     }
 
 
+def _loop(args, chain, current_epoch) -> None:
+    """Run once per epoch, waking AT the boundary.
+
+    Cron cannot do this: its ticks land at arbitrary offsets, so the run gets whatever window is
+    left, and one that finishes after validators score is worth exactly nothing (76758 missed by
+    about a minute). Starting at the boundary gives the full window every time, and the deadline is
+    then derived from the owner's own published grace rather than guessed.
+    """
+    import subprocess
+    import sys
+    import time
+
+    from .epoch import EPOCH_BLOCKS
+
+    last = None
+    while True:
+        epoch = current_epoch(chain)
+        if epoch == last:
+            time.sleep(12.0)
+            continue
+        gov = chain.owner_measurements() or {}
+        left = seconds_until_scored(epoch, gov.get("grace_blocks"), chain.current_block())
+        # Publishing and the validator's read both need room, so the run must END before the grace
+        # point, not at it.
+        deadline = max(120.0, (left - 120.0) if left else args.deadline_s)
+        argv = [a for a in sys.argv[1:] if a != "--loop"]
+        argv += ["--epoch", str(epoch), "--deadline-s", f"{deadline:.0f}"]
+        print(f"=== epoch {epoch}: {deadline:.0f}s until it must be published ===", flush=True)
+        subprocess.run([sys.argv[0], *argv], check=False)
+        last = epoch
+
+
 def seconds_until_scored(epoch: int, grace_blocks, current_block: int) -> float | None:
     """Wall-clock left before validators score `epoch`, or None if the owner published no grace.
 
@@ -371,10 +403,18 @@ def main() -> None:  # noqa: C901
     p.add_argument("--call-timeout", type=float, default=180.0,
                    help="per-request timeout to the provider")
     p.add_argument("--dry-run", action="store_true", help="build and print; do not publish")
+    p.add_argument("--loop", action="store_true",
+                   help="run once per epoch, starting AT the epoch boundary. Preferred over a cron "
+                        "tick: cron lands wherever it lands, so the run gets only the window that "
+                        "happens to be left, and a reference that arrives after validators score is "
+                        "worth nothing. Sizes its own deadline from the owner-published grace.")
     args = p.parse_args()
 
     from ..subnet.chain import BittensorChain
     chain = BittensorChain(args.netuid, args.wallet, network=args.network, hotkey=args.hotkey)
+    if args.loop:
+        _loop(args, chain, current_epoch)
+        return
     epoch = args.epoch if args.epoch is not None else current_epoch(chain)
     nonce = epoch_nonce(epoch, chain.beacon(epoch))
 

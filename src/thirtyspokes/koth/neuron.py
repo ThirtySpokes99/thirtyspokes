@@ -435,6 +435,10 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
     p.add_argument("--min-headroom-gap", type=float, default=0.05,
                    help="refuse to score frontier-relatively when the pool reference shows less "
                         "achievable headroom than this (saturated traffic -> the ratio is noise)")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="start even if the startup preflight finds a blocking problem "
+                        "(slice disagreement, ungradeable code benchmark, wrong governance). "
+                        "The problem does not go away; you just find it hours later.")
     p.add_argument("--grace-blocks", type=int, default=0,
                    help="F2: score an epoch only N blocks after it opens, so submissions settle and "
                         "decoupled validators agree on presence. Keep N < 100 (epoch length).")
@@ -447,6 +451,18 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
             f"[koth-validator] FATAL: --insecure is refused on mainnet ({args.network}). It accepts the "
             "mock TEE and skips the owner's measured-image gate, so miners could forge every score. Use "
             "it only for offline/dev bring-up on a non-mainnet network (e.g. --network test).")
+
+    # PREFLIGHT (koth/doctor.py). A validator that cannot grade the ranked benchmark, or disagrees
+    # with the miners about the slice, or measures a runtime the owner never approved, comes up
+    # looking perfectly healthy and scores zeros for hours — and every one of those symptoms points
+    # at the MINERS. Check it in seconds here instead. `--insecure` is offline bring-up: report but
+    # do not block, since there is no published governance and often no docker daemon there.
+    if not args.skip_preflight:
+        from . import doctor
+        checks = [doctor.check_slice_agreement(args.n_per_bench), doctor.check_slice_fits_epoch(args.n_per_bench),
+                  doctor.check_code_grading(),
+                  doctor.check_governance(args.netuid, args.network, args.wallet, args.hotkey)]
+        doctor.preflight_or_exit("koth-validator", checks, block=not args.insecure)
 
     chain = BittensorChain(args.netuid, args.wallet, args.network, hotkey=args.hotkey,
                            owner_ss58=args.owner_hotkey)     # None -> resolved from the chain

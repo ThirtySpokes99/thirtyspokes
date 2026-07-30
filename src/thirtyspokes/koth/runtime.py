@@ -205,7 +205,7 @@ class KOTHRuntime:
 
     def run_router(self, weights: bytes, *, hotkey: str, epoch: int, nonce: str,
                    suite: list[Benchmark], n_per_bench: int, pool: list[str], price_of,
-                   params: dict | None = None) -> tuple[Proof, list[dict]]:
+                   params: dict | None = None, on_task=None) -> tuple[Proof, list[dict]]:
         """THE FIXED-HARNESS PATH: evaluate a miner's routing MODEL (weights only, no miner code).
 
         Everything the miner does not control happens here: sample the nonce-derived slice, embed the
@@ -252,6 +252,10 @@ class KOTHRuntime:
                 t["benchmark"], t["task_id"], str(answer), proxy.total_cost_usd - c0,
                 chosen_rung=rung, rungs_used=tuple(used),
                 distribution=tuple(round(float(x), 6) for x in dist[i])))
+            # optional progress callback — the measured image writes it to the serial console so an
+            # operator can see depth accumulating instead of inferring it from a silent VM
+            if on_task is not None:
+                on_task(i + 1, len(tasks), rung, len(used), proxy.total_cost_usd)
         return self._attest(results, trace, hotkey=hotkey, epoch=epoch, nonce=nonce,
                             # The ENGINE is pinned, not miner code — so the "source" a router miner
                             # publishes IS the harness version string. Hashed the same way the

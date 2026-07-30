@@ -343,9 +343,16 @@ if is_routing_artifact(art):
                          "%s vs %s" % (sorted(pool_list), sorted(H.pool_models())))
     print("KOTH-MODE routing harness=%s rungs=%d" % (H.HARNESS_VERSION, len(H.pool_models())),
           flush=True)
+    # PER-TASK HEARTBEAT. The enclave used to emit nothing between boot and the final KOTH-RUN, so a
+    # run in progress was byte-identical to a hung one — misread as a hang three separate times, and
+    # when a real 49-minute epoch died there was no way to tell whether it had reached task 3 or 47.
+    # A serial line per task costs nothing and makes the difference visible.
+    def _tick(i, total, rung, used, spent):
+        print("KOTH-TASK %d/%d rung=%d rungs_used=%d cost=%.5f" % (i, total, rung, used, spent),
+              flush=True)
     proof, trace = rt.run_router(art.weights, hotkey=hotkey, epoch=epoch, nonce=nonce,
                                  suite=suite, n_per_bench=n_per_bench,
-                                 pool=H.pool_models(), price_of=H.price_of)
+                                 pool=H.pool_models(), price_of=H.price_of, on_task=_tick)
 else:
     print("KOTH-MODE free-agent (legacy)", flush=True)
     proof, trace = rt.run(art, hotkey=hotkey, epoch=epoch, nonce=nonce,

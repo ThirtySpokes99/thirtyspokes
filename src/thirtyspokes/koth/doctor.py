@@ -51,9 +51,15 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     return _r(OK, "slice fits epoch", d)
 
 
-def check_slice_agreement() -> tuple[str, str, str]:
+def check_slice_agreement(runtime_n: int | None = None) -> tuple[str, str, str]:
     """Miner, validator, operator and reference cron store ONE setting in four places. A mismatch is
-    `unexpected_task` — a DQ — for every miner, and each side looks individually correct."""
+    `unexpected_task` — a DQ — for every miner, and each side looks individually correct.
+
+    `runtime_n` is THIS process's effective value. It matters because the live mismatch was not a
+    source default at all: a validator was raised to 16 on the command line while the miners stayed
+    where they were, so every source default still agreed and every miner was disqualified anyway.
+    A daemon passes its own resolved setting; the standalone CLI checks defaults only.
+    """
     import inspect
     import pathlib
     import re
@@ -73,6 +79,8 @@ def check_slice_agreement() -> tuple[str, str, str]:
         m = re.search(pat, f.read_text())
         if m:
             vals[label] = int(m.group(1))
+    if runtime_n is not None:
+        vals["this process"] = runtime_n
     uniq = set(vals.values())
     d = ", ".join(f"{k}={v}" for k, v in vals.items())
     return _r(OK if len(uniq) == 1 else FAIL, "slice agreement", d)
@@ -143,6 +151,36 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tup
     return _r(OK, "governance", f"measurement {mine[:16]}… pinned, pool {len(pool)} rungs")
 
 
+def render(results: list[tuple[str, str, str]]) -> str:
+    width = max(len(r[1]) for r in results)
+    mark = {OK: "  ok ", WARN: " warn", FAIL: " FAIL"}
+    return "\n".join(f"[{mark[s]}] {n:<{width}}  {d}" for s, n, d in results)
+
+
+def preflight_or_exit(role: str, results: list[tuple[str, str, str]], *, block: bool = True) -> None:
+    """Run at daemon startup so a misconfigured deployment REFUSES TO START.
+
+    Every check here has already broken a live run, and each one failed the same expensive way: the
+    daemon came up, looked healthy, and scored nothing for hours while the symptom pointed at some
+    other component. Failing at startup turns a multi-hour misdiagnosis into one line of output.
+
+    `block=False` (dev/offline bring-up) prints the same report but proceeds — an offline run has no
+    published governance and often no docker, and refusing there would break the sim path.
+    """
+    print(f"[{role}] preflight\n{render(results)}", flush=True)
+    bad = [r for r in results if r[0] == FAIL]
+    if not bad:
+        return
+    if not block:
+        print(f"[{role}] {len(bad)} preflight problem(s) — continuing anyway (dev mode)", flush=True)
+        return
+    raise SystemExit(
+        f"[{role}] FATAL: {len(bad)} blocking preflight problem(s): "
+        + "; ".join(f"{n}: {d}" for _, n, d in bad)
+        + ". Each of these has silently broken a live run before. Fix, or pass --skip-preflight to "
+          "start anyway (it will not make the problem go away).")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="preflight a ThirtySpokes deployment (read-only)")
     p.add_argument("--netuid", type=int)
@@ -162,17 +200,15 @@ def main() -> None:
         m = re.search(r'"--n-per-bench", type=int, default=(\d+)', src)
         n = int(m.group(1)) if m else 2
 
-    results = [check_slice_agreement(), check_slice_fits_epoch(n), check_code_grading()]
+    results = [check_slice_agreement(args.n_per_bench), check_slice_fits_epoch(n),
+               check_code_grading()]
     if args.netuid and args.wallet:
         results.append(check_governance(args.netuid, args.network, args.wallet, args.hotkey))
     else:
         results.append(_r(WARN, "governance", "skipped — pass --netuid and --wallet to check"))
 
     print("ThirtySpokes preflight\n")
-    width = max(len(r[1]) for r in results)
-    for status, name, detail in results:
-        mark = {OK: "  ok ", WARN: " warn", FAIL: " FAIL"}[status]
-        print(f"[{mark}] {name:<{width}}  {detail}")
+    print(render(results))
     bad = [r for r in results if r[0] == FAIL]
     print()
     if bad:

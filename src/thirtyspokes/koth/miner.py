@@ -203,7 +203,22 @@ def main() -> None:  # pragma: no cover — live daemon (needs bittensor + HF + 
                         "the subnet's validators run --commit-window (otherwise nobody reads it). "
                         "Held back automatically until your artifact commit has revealed, since both "
                         "share one commitment slot and would otherwise destroy it.")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="start even if the startup preflight finds a blocking problem (a slice the "
+                        "validator will reject, or one too long to finish inside an epoch)")
     args = p.parse_args()
+
+    # PREFLIGHT (koth/doctor.py). The two faults that DQ'd every miner on the live bring-up are both
+    # miner-side settings: a slice the validator does not expect (`unexpected_task`), and a slice too
+    # large to finish inside an epoch — the latter is UNRECOVERABLE, because a proof that completes
+    # after its epoch expires carries a stale nonce. Both cost a full run to discover. Code grading
+    # and governance are checked validator-side, not here.
+    if not args.skip_preflight:
+        from . import doctor
+        doctor.preflight_or_exit(
+            "koth-miner",
+            [doctor.check_slice_agreement(args.n_per_bench), doctor.check_slice_fits_epoch(args.n_per_bench)],
+            block=True)   # both checks are local and offline-safe, so there is no dev exemption
 
     cfg = config.LiveConfig(); cfg.require_key()
     if args.routing_model:

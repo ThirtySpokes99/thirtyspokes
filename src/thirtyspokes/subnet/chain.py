@@ -76,6 +76,20 @@ class Chain(Protocol):
     def proof_commit(self, hotkey: str, epoch: int) -> tuple[str, int] | None: ...   # (digest, block)|None
 
 
+def _require_accepted(res, what: str) -> None:
+    """Raise unless the chain accepted the extrinsic.
+
+    bittensor's write helpers return `(ok, message)` (and have changed shape before), so a discarded
+    result makes a REJECTED write indistinguishable from a successful one. That is not hypothetical:
+    an artifact commit reported success, never appeared after its full 360-block reveal window, and
+    the failure was only visible by re-submitting and printing the return value. Silent-success on a
+    chain write means an operator debugs the wrong layer for hours.
+    """
+    ok, msg = res if isinstance(res, tuple) else (bool(res), "")
+    if not ok:
+        raise RuntimeError(f"{what} REJECTED by the chain: {msg or res!r}")
+
+
 @dataclass
 class MockChain:
     """In-memory chain for offline runs. Registration = assigning a uid+hotkey."""
@@ -282,8 +296,10 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
         the metagraph). Registration is usually done once out-of-band via `btcli`."""
         if self.wallet.hotkey.ss58_address in set(self.hotkeys().values()):
             return
-        self.subtensor.burned_register(wallet=self.wallet, netuid=self.netuid,
-                                       wait_for_inclusion=True, wait_for_finalization=True)
+        _require_accepted(
+            self.subtensor.burned_register(wallet=self.wallet, netuid=self.netuid,
+                                           wait_for_inclusion=True, wait_for_finalization=True),
+            "burned registration")
 
     def current_block(self) -> int:
         return int(self.subtensor.get_current_block())
@@ -462,8 +478,13 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
 
     def commit_governance(self, record_digest: str) -> None:
         from ..koth import governance
-        self.subtensor.set_commitment(wallet=self.wallet, netuid=self.netuid,
-                                      data=governance.commit_string(record_digest))
+        # CHECKED: a silently-rejected governance write leaves validators on the PREVIOUS approved
+        # measurement, so every miner running the new image is rejected as `unapproved_runtime` and
+        # the fault looks like it belongs to the miners.
+        _require_accepted(
+            self.subtensor.set_commitment(wallet=self.wallet, netuid=self.netuid,
+                                          data=governance.commit_string(record_digest)),
+            "governance commitment")
 
     def governance_digest(self) -> str | None:
         """The record hash the OWNER committed (plain commitment -> readable immediately)."""
@@ -561,7 +582,12 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
     # testnet that the plain-commitment map is independent of the reveal map (so a proof commit never
     # clobbers the artifact commit) and that the accessor returns the inclusion block.
     def commit_proof(self, hotkey: str, epoch: int, digest: str) -> None:
-        self.subtensor.set_commitment(wallet=self.wallet, netuid=self.netuid, data=f"{epoch}|{digest}")
+        # CHECKED: a silently-rejected proof commit DQs the miner as `no_proof_commit` every epoch
+        # under --commit-window, with nothing anywhere explaining why its work is not counting.
+        _require_accepted(
+            self.subtensor.set_commitment(wallet=self.wallet, netuid=self.netuid,
+                                          data=f"{epoch}|{digest}"),
+            "proof commitment")
 
     def proof_commit(self, hotkey: str, epoch: int) -> tuple[str, int] | None:
         # CommitmentOf[(netuid, hotkey)] -> {info: {fields: [Raw(bytes)]}, block}. Decode `<epoch>|<digest>`;

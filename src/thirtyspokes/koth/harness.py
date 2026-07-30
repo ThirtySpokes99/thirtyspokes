@@ -36,6 +36,8 @@ re-running anything.
 
 from __future__ import annotations
 
+import time
+
 import io
 
 import numpy as np
@@ -50,7 +52,18 @@ from .benchmarks import Benchmark
 # are quantised to EMBED_DECIMALS so three machines agree, and HARNESS_VERSION is now genuinely
 # folded into `runtime_measurement()` — it was documented as such but was not, so a harness change
 # would not have changed RTMR3 and miners could have been scored under an unapproved engine.
-HARNESS_VERSION = "koth-harness-2"
+# Bumped to 3: `run_cascade` now bounds escalation with TASK_BUDGET_S. That is an ENGINE change —
+# a head can be scored on a cascade that stopped early — so it must change the runtime measurement,
+# reset accumulated evidence, and require miners to re-commit against the new source hash. Leaving
+# the version alone would silently score miners under an engine they never agreed to, which is the
+# exact failure this constant exists to prevent.
+HARNESS_VERSION = "koth-harness-3"
+
+# Wall-clock a single task may spend BEFORE it is refused further escalation. 6 tasks x 150s = 900s
+# against a ~1200s epoch, leaving room for boot, attestation and proof emission. Part of the measured
+# harness: miner and validator must agree on it, and `doctor.check_slice_fits_epoch` derives the
+# preflight bound from it rather than from a guessed per-call latency.
+TASK_BUDGET_S = 150.0
 
 # The frozen encoder. Pinned by name because the embedding must be byte-identical in the miner's
 # enclave, in the owner's reference build, and in the trainer a miner runs at home; a different
@@ -219,17 +232,34 @@ def rung_order(pool: list[str], price_of) -> list[int]:
 
 
 def run_cascade(start_rung: int, prompt: str, bench: Benchmark, pool: list[str],
-                order: list[int], call_model, params: dict) -> tuple[str, list[int]]:
+                order: list[int], call_model, params: dict, *,
+                budget_s: float = TASK_BUDGET_S, now=time.monotonic) -> tuple[str, list[int]]:
     """Enter the ladder at `start_rung`, escalate while the verifier rejects, bank on accept.
 
     Mirrors `cascade.to_cascade_cache` exactly — invoke, verify, escalate, and take whatever the top
     rung produces — so a head trained offline against a precomputed cache behaves identically here.
     Returns the banked answer and the rungs actually invoked (the cost trail, which the proof
     records so a validator can price the run without re-executing it).
+
+    ESCALATION IS BUDGETED, THE FIRST CALL IS NOT. Without a bound, one task's worst case exceeds the
+    whole epoch: each `call_model` is an HTTP call with its own timeout and retries, and a task
+    entering low can climb several rungs. Measured live (epoch 76734): a miner finished five tasks in
+    131s, then spent ~950s on the sixth and lost the epoch entirely — and a proof that misses its
+    epoch is unrecoverable, not late, because its nonce is stale. The budget makes the epoch bound
+    structural: n_tasks x TASK_BUDGET_S is a number the preflight can check against the epoch.
+
+    Never skip the FIRST call, whatever the clock says — a task with no call has no answer, which
+    would turn a slow provider into a zero instead of a cheap answer. Truncation banks the best
+    answer obtained so far and is fully visible in `rungs_used`, so the validator prices exactly what
+    ran; it does not require a cascade to reach the top.
     """
     used: list[int] = []
     answer = ""
-    for pos in range(max(0, min(start_rung, len(order) - 1)), len(order)):
+    start = max(0, min(start_rung, len(order) - 1))
+    t0 = now()
+    for pos in range(start, len(order)):
+        if pos > start and now() - t0 > budget_s:
+            break                       # out of time: bank what the ladder has produced so far
         idx = order[pos]
         used.append(idx)
         answer = call_model(pool[idx], [{"role": "user", "content": prompt}], dict(params))

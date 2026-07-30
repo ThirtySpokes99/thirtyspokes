@@ -88,3 +88,50 @@ def test_publish_refuses_when_head_is_not_the_commit_that_built_the_image(tmp_pa
 
     # no build dir -> cannot verify, so warn rather than block (the pre-existing behaviour)
     mod._refuse_unless_head_built_this_image(None, dry_run=False)
+
+
+def test_cascade_stops_escalating_when_the_task_runs_out_of_time():
+    """One task's worst case used to exceed the whole epoch: every rung is an HTTP call with its own
+    timeout and retries, and a task entering low can climb several rungs. Measured live (epoch
+    76734): five tasks in 131s, then ~950s on the sixth, and the epoch was lost — a proof that misses
+    its epoch is unrecoverable, since its nonce is stale."""
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.benchmarks import real_suite
+
+    bench = next(b for b in real_suite() if b.name == "math")
+    REJECTED = "I cannot solve this."
+    assert not H.verifier_ok(REJECTED, bench), "precondition: this answer must make the ladder climb"
+
+    pool = H.pool_models()
+    order = H.rung_order(pool, H.price_of)
+    clock = {"t": 0.0}
+
+    def slow(model, messages, params):
+        clock["t"] += 200.0                      # each rung overruns the whole per-task budget
+        return REJECTED
+
+    answer, used = H.run_cascade(0, "q", bench, pool, order, slow, {},
+                                 budget_s=150.0, now=lambda: clock["t"])
+    assert len(used) == 1, f"escalation must stop once the budget is blown, got {len(used)} rungs"
+    assert answer == REJECTED, "a truncated cascade banks what it has — never an empty answer"
+
+    # unbudgeted, the same task climbs the WHOLE ladder: that is the epoch-killing behaviour
+    clock["t"] = 0.0
+    _, unbounded = H.run_cascade(0, "q", bench, pool, order, slow, {},
+                                 budget_s=float("inf"), now=lambda: clock["t"])
+    assert len(unbounded) == len(order)
+
+    # the FIRST call is never skipped, however far behind the clock already is
+    clock["t"] = 10_000.0
+    _, used2 = H.run_cascade(0, "q", bench, pool, order, slow, {},
+                             budget_s=150.0, now=lambda: clock["t"])
+    assert len(used2) == 1, "a task with no call has no answer — that is worse than a cheap one"
+
+
+def test_preflight_bound_comes_from_the_harness_budget_not_a_guess():
+    from thirtyspokes.koth import doctor
+    from thirtyspokes.koth.harness import TASK_BUDGET_S
+
+    status, _, detail = doctor.check_slice_fits_epoch(2)
+    assert f"{TASK_BUDGET_S:.0f}s budget" in detail
+    assert doctor.check_slice_fits_epoch(16)[0] == doctor.FAIL

@@ -37,17 +37,25 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     """
     from .benchmarks import real_suite
     from .epoch import EPOCH_BLOCKS
-    per_call_s, block_s = 90.0, 12.0            # measured on GCP C3 against the pinned pool
+    from .harness import TASK_BUDGET_S
+    # The harness refuses further escalation past TASK_BUDGET_S, so this is an actual CEILING, not
+    # the average-latency estimate it used to be. That estimate was the weaker claim: it passed at
+    # 45% of the window on the same day a single task ran ~950s and lost the epoch.
+    block_s = 12.0
     n_bench = len(real_suite())
-    need = n_per_bench * n_bench * per_call_s
+    need = n_per_bench * n_bench * TASK_BUDGET_S
     budget = EPOCH_BLOCKS * block_s
     frac = need / budget
-    d = (f"{n_per_bench} x {n_bench} benchmarks x ~{per_call_s:.0f}s = ~{need:.0f}s vs "
-         f"~{budget:.0f}s/epoch ({frac:.0%} of the window)")
+    d = (f"{n_per_bench} x {n_bench} benchmarks x {TASK_BUDGET_S:.0f}s budget = {need:.0f}s worst "
+         f"case vs ~{budget:.0f}s/epoch ({frac:.0%} of the window)")
+    # The WARN threshold moved 0.6 -> 0.85 WITH the semantics. It used to gate an average-latency
+    # estimate, where 60% of the window was genuinely risky; it now gates a hard ceiling the harness
+    # enforces, and a typical run lands far below it. Leaving it at 0.6 would have made the correct
+    # production slice warn on every start, which is how operators learn to ignore warnings.
     if frac > 1.0:
         return _r(FAIL, "slice fits epoch", d + " — NO valid proof can ever be produced")
-    if frac > 0.6:
-        return _r(WARN, "slice fits epoch", d + " — lands only when latency is good")
+    if frac > 0.85:
+        return _r(WARN, "slice fits epoch", d + " — no headroom for boot and attestation")
     return _r(OK, "slice fits epoch", d)
 
 

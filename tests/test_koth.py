@@ -3678,3 +3678,39 @@ def test_a_provider_failure_does_not_destroy_the_epoch():
     assert text == "" and cost == 0.0, "a failed rung must cost nothing and answer nothing"
     assert tin == 0 and tout == 0
     assert Boom.calls == 3, f"expected 3 attempts before degrading, got {Boom.calls}"
+
+
+def test_validator_daemon_survives_a_transient_chain_error():
+    """A validator is a long-lived daemon on a network that hiccups.
+
+    OBSERVED in production on testnet 526: the substrate node returned a body with no "result",
+    bittensor's `_get_block_number` did `response["result"]["number"]` on None, and the TypeError
+    propagated out of `run_forever`. The process EXITED; it only came back because Docker restarted
+    it, losing in-memory reign state each time. The correct response to an unreadable block is to
+    wait and ask again, not to die.
+    """
+    import threading
+    from thirtyspokes.koth.neuron import KOTHValidatorNeuron
+
+    class Exploding:
+        calls = 0
+
+        def _settle_epoch(self):
+            Exploding.calls += 1
+            if Exploding.calls <= 2:
+                raise TypeError("'NoneType' object is not subscriptable")
+            raise KeyboardInterrupt          # escape once we've proven it retried
+
+        last_scored_epoch = None
+
+    n = KOTHValidatorNeuron.__new__(KOTHValidatorNeuron)
+    n.val = Exploding()
+    n._stop = threading.Event()
+    n._flush_pending = lambda: True
+
+    try:
+        n.run_forever(poll_s=0.01)
+    except KeyboardInterrupt:
+        pass
+    assert Exploding.calls >= 3, (
+        f"the daemon stopped after {Exploding.calls} call(s) — a transient chain error still kills it")

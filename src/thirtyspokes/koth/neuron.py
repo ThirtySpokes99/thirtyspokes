@@ -181,21 +181,41 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
 
     def run_forever(self, poll_s: float = 5.0):
         restored = self.val.last_scored_epoch
-        last = (restored if restored is not None
-                else self.val._settle_epoch() - 1)         # first boot starts at latest settled epoch
-        while not self._stop.is_set():
-            if not self._flush_pending():
+        # The STARTUP settle is as exposed as the in-loop one: on a fresh boot with no persisted
+        # epoch this is the first chain read, and an RPC hiccup here killed the daemon before the
+        # retry loop below could ever protect it. Retry until the chain answers.
+        last = restored
+        while last is None and not self._stop.is_set():
+            try:
+                last = self.val._settle_epoch() - 1        # first boot: latest settled epoch
+            except Exception as exc:                       # noqa: BLE001 — chain/network flakiness
+                print(f"[koth-validator] chain unreadable at startup "
+                      f"({type(exc).__name__}: {str(exc)[:100]}) — retrying", flush=True)
                 self._stop.wait(poll_s)
-                continue
-            if self.val.last_scored_epoch is not None:
-                last = max(last, self.val.last_scored_epoch)
-            settled = self.val._settle_epoch()             # latest past-grace epoch; skip the live one
-            for e in range(last + 1, settled + 1):         # score each settled epoch once, in order
-                if self._stop.is_set():
-                    break
-                if not self._stage_epoch(e):
-                    break
-                last = e
+        while not self._stop.is_set():
+            # A TRANSIENT CHAIN RPC FAILURE MUST NOT KILL THE DAEMON. Observed in production: the
+            # substrate node returned a body with no "result", `_get_block_number` did
+            # `response["result"]["number"]` on None, and the TypeError propagated out of
+            # `run_forever` — the validator process EXITED and only came back because Docker
+            # restarted it. It had been crash-looping, losing in-memory reign state and re-reading
+            # from disk each time. A validator is a long-lived daemon on a network that hiccups; the
+            # correct response to an unreadable block is to wait and ask again.
+            try:
+                if not self._flush_pending():
+                    self._stop.wait(poll_s)
+                    continue
+                if self.val.last_scored_epoch is not None:
+                    last = max(last, self.val.last_scored_epoch)
+                settled = self.val._settle_epoch()         # latest past-grace epoch; skip the live one
+                for e in range(last + 1, settled + 1):     # score each settled epoch once, in order
+                    if self._stop.is_set():
+                        break
+                    if not self._stage_epoch(e):
+                        break
+                    last = e
+            except Exception as exc:                       # noqa: BLE001 — chain/network flakiness
+                print(f"[koth-validator] transient error ({type(exc).__name__}: {str(exc)[:120]}) "
+                      f"— retrying in {poll_s:.0f}s", flush=True)
             self._stop.wait(poll_s)
 
 

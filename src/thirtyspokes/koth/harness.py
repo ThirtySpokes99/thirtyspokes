@@ -57,7 +57,12 @@ from .benchmarks import Benchmark
 # reset accumulated evidence, and require miners to re-commit against the new source hash. Leaving
 # the version alone would silently score miners under an engine they never agreed to, which is the
 # exact failure this constant exists to prevent.
-HARNESS_VERSION = "koth-harness-3"
+#
+# Bumped to 4 for the same reason, one epoch later: harness-3's gate bounded only ESCALATION, and a
+# single in-flight call still cost epoch 76738 outright. The budget now bounds every call and is
+# SHARED across the run, so where a cascade stops is materially different from harness-3 — the same
+# head scores differently. Same contract: new measurement, evidence resets, miners re-commit.
+HARNESS_VERSION = "koth-harness-4"
 
 # HARD wall-clock for the WHOLE run, shared across tasks. It bounds escalation here AND every call
 # (the runtime arms `MeteringProxy.task_deadline` from what is left), and both halves are needed: the

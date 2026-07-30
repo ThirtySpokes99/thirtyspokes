@@ -1,5 +1,7 @@
 """Startup preflight: the deployment-shape checks that broke live runs (koth/doctor.py)."""
 
+import pathlib
+
 import pytest
 
 
@@ -350,3 +352,54 @@ def test_a_bounded_call_is_bounded_in_total_not_per_attempt():
     assert calls["opts"] == {"max_retries": 0}, "the SDK's own retries must not multiply the bound"
     assert elapsed < 3.0, f"a 1s budget took {elapsed:.1f}s — the call is not actually bounded"
     assert text == "" and cost == 0.0, "an unanswerable rung degrades; it does not crash the epoch"
+
+
+def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypatch):
+    """End-to-end proof of the bound, against the failure that killed four live epochs.
+
+    The unit tests cover one call; this drives the real `run_router` with a pool where EVERY rung
+    hangs, and asserts the run both stays bounded and still produces a complete proof. Scaled to
+    seconds so it is a genuine wall-clock test rather than a mock of one.
+
+    Written only after shipping two images that each 'fixed' this and did not: reasoning about the
+    mechanism is what produced those, and a timing assertion is what would have stopped them.
+    """
+    import time
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.miner import routing_artifact
+    from thirtyspokes.koth.runtime import KOTHRuntime, mock_vendor_platform
+
+    monkeypatch.setattr(H, "RUN_BUDGET_S", 6.0)
+    monkeypatch.setattr(H, "MIN_TASK_S", 1.0)
+    HANG = 20.0
+
+    class HangingPool:
+        calls = 0
+
+        def complete(self, model, messages, params):
+            HangingPool.calls += 1
+            budget = params.get("_timeout")
+            assert budget is not None, "the runtime must grant every call a wall-clock bound"
+            time.sleep(min(HANG, float(budget)))
+            return "", 0, 0, 0.0          # degrade exactly as OpenRouterBackend does
+
+    suite = real_suite()
+    # A real head, so the entry rungs are the ones a live miner would pick. Which rung it picks does
+    # not matter here — every rung hangs — but a synthetic head would make the test prove less.
+    weights = pathlib.Path("/root/koth-miner-work/weights.npz")
+    if not weights.exists():
+        pytest.skip("needs a trained head; the unit tests cover the bound without one")
+    art = routing_artifact(weights.read_bytes())
+
+    t0 = time.monotonic()
+    proof, _trace = KOTHRuntime(HangingPool(), mock_vendor_platform()).run_router(
+        art.weights, hotkey="5Test", epoch=1, nonce="n", suite=suite,
+        n_per_bench=1, pool=H.pool_models(), price_of=H.price_of)
+    elapsed = time.monotonic() - t0
+
+    assert len(proof.results) == len(suite), "a bounded run must still answer every task"
+    unbounded = len(suite) * HANG
+    assert elapsed < unbounded / 2, (
+        f"{elapsed:.1f}s is not meaningfully under the {unbounded:.0f}s an unbounded run would take")

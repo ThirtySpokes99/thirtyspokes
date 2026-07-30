@@ -233,23 +233,40 @@ pointed at an attacker's hotkey and made to trust the attacker's image.
 GCP C3 TDX guest — the image boots dm-verity-locked, runs the metadata-injected agent with zero egress,
 and an enforcing validator accepts its proof while rejecting a stock CVM):
 
-**v23** (`recipe_commit 923e3a4`, live on testnet 526 as governance record v2):
+**v24** (`recipe_commit 13cd150`, harness `koth-harness-3`, governance record v3):
 
 | | |
 |---|---|
-| UKI sha256 | `ea00013d9960beb99347d016adaa849eddbcc32457f4d5ebf1adccce04be90dc` |
-| verity roothash | `70153883f1f31678f167a14a2da011744db80a6e38a53cc7d8dbad0b2ee733c8` |
+| UKI sha256 | `9411cede09677cc15486aa2e1d9d4f042a75f117576ea042c9ac590b9faaa020` |
+| verity roothash | `404c64d27cc8384681cc7b886bb4c6a964d2cf41d6472716ca11eed3c81c5358` |
 | MRTD | `c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5` |
-| **RTMR1** | `552b2ba09414d292358bc57239a76cbbc9e239d2380115ad7117601d32586cbc67957194734ea075af38d470119293ab` |
+| **RTMR1** | `a7c57e409dd7e042610948389af9064c84c57775357ef77b1a600efd27dfd8d102cc8a1f56cdf043c6205a9fb1a5e159` |
 | RTMR2 | `000…0` (zero under direct-UKI boot) |
-| RTMR3 | `80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044` (derived) |
+| RTMR3 | `51e9caafd38c47b9153af7b589449b59cc7d8ae8033d6042d76cd35c1d501dfd38ac1e3ac00775093e3e3464c679e562` (derived) |
+| runtime measurement | `1fe875367b903477797aea1420d4539e3f724edce01ca8ba2b32b06e47590efc` |
 
-The v22→v23 rotation is a useful worked example of what each register means. v23 added one `print` per
-task to the enclave runner and nothing else: **RTMR1 changed** (any rootfs byte does that), while MRTD
-(GCP's TDVF, not ours), RTMR2 and RTMR3 (derived from runtime+suite+pool, all unchanged) stayed
-identical — and `runtime_measurement` stayed `c8c5d2ff…`, so accumulated miner evidence was *not*
-reset. If a change of yours moves RTMR3 or the runtime measurement, it is an engine change and every
-miner's evidence resets with it; that is the contract, not a bug to route around.
+Two consecutive rotations make the register semantics concrete, and they are worth reading together
+before judging any change of your own:
+
+* **v22→v23 moved ONE register.** It added a per-task `print` to the enclave runner and nothing else:
+  RTMR1 changed (any rootfs byte does that), while MRTD (GCP's TDVF, not ours), RTMR2 and RTMR3 stayed
+  identical, and `runtime_measurement` stayed `c8c5d2ff…`. Accumulated miner evidence was **not** reset,
+  and miners did **not** need to re-commit.
+* **v23→v24 moved three.** It bounded cascade escalation, which is an ENGINE change, so
+  `HARNESS_VERSION` bumped to `koth-harness-3`; that changed `runtime_measurement`, which changed the
+  derived RTMR3, and the rootfs change moved RTMR1 as usual. Evidence resets, and — the part that is
+  easy to miss — **every miner must re-publish and re-commit**, because a routing artifact's
+  `source_text` *is* the harness version, so the old commit no longer binds.
+
+If a change moves RTMR3 or the runtime measurement, it is an engine change: plan for reset evidence
+and a re-commit cycle, not just an image swap.
+
+> **Engine changes have no gap-free ordering.** Once the new commit REVEALS, miners on the old image
+> break (they fetch a revision whose `source_text` is the new harness and refuse it — the binding
+> working as designed); before it reveals, miners on the new image break for the mirror reason. So
+> publish governance and switch miners together, at the reveal, and expect to lose an epoch. Capture
+> the new image's RTMR1 *ahead* of the reveal by injecting the new artifact as VM metadata instead of
+> going through the chain — the image reads its artifact from metadata, so a capture needs no commit.
 
 > **Capturing RTMR1 from the measured image.** It ships no sshd, so the sysfs probe cannot be run
 > inside it. The image's own attested proof is the capture channel — the quote in `proof.quote`

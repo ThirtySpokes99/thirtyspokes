@@ -19,6 +19,10 @@ services:
     environment:                            # explicit allow-list from .env; no ambient secrets
       # must match the bind-mount below at the SAME path on both sides (see volumes)
       KOTH_GRADE_DIR: /var/tmp/koth-grade
+      # Lets the startup preflight read the CLI + cron slice defaults. The package inside the image
+      # lives in site-packages, so without the checkout mounted below the agreement check can only
+      # compare this process against itself — and it now says so instead of reporting a confident ok.
+      KOTH_REPO_ROOT: /repo
       # OPTIONAL: a grounding-mode validator does ZERO inference and needs no LLM key.
       # Only the opt-in --audit-mode probe uses this (and bills you for miner inference).
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -30,6 +34,7 @@ services:
     volumes:
       - ${HOME}/.bittensor:/root/.bittensor        # wallet — holds the hotkey that signs set_weights
       - validator-state:/state                     # reign + king baseline survive restarts
+      - .:/repo:ro                                 # read-only: preflight reads slice defaults only
       # THE CODE GRADER NEEDS THE HOST DOCKER DAEMON. `lcb.run_tests` runs each submitted program in
       # a throwaway `docker run --network none` container; without this socket it raises
       # GradingUnavailable and the RANKED benchmark cannot be scored at all.

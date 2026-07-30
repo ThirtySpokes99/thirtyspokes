@@ -135,3 +135,17 @@ def test_preflight_bound_comes_from_the_harness_budget_not_a_guess():
     status, _, detail = doctor.check_slice_fits_epoch(2)
     assert f"{TASK_BUDGET_S:.0f}s budget" in detail
     assert doctor.check_slice_fits_epoch(16)[0] == doctor.FAIL
+
+
+def test_slice_agreement_admits_when_it_cannot_see_the_other_sources(tmp_path, monkeypatch):
+    """A containerised validator has the package in site-packages, so the CLI defaults and the cron
+    are not on disk. The check used to report a confident `ok` after comparing the process against
+    itself — which reads as "all four components agree" when nothing was compared at all."""
+    from thirtyspokes.koth import doctor
+
+    monkeypatch.setenv("KOTH_REPO_ROOT", str(tmp_path))     # empty: no CLI/cron files to read
+    status, _n, detail = doctor.check_slice_agreement(2)
+    assert status == doctor.WARN and "against itself" in detail
+
+    # a real disagreement still FAILS, seen or unseen sources notwithstanding
+    assert doctor.check_slice_agreement(99)[0] == doctor.FAIL

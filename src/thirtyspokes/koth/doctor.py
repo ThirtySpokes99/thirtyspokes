@@ -74,7 +74,13 @@ def check_slice_agreement(runtime_n: int | None = None) -> tuple[str, str, str]:
 
     from .miner import KOTHMinerNeuron
     vals = {"miner class": inspect.signature(KOTHMinerNeuron.__init__).parameters["n_per_bench"].default}
-    here = pathlib.Path(__file__).resolve().parents[3]
+    # The repo is found relative to this file, which only holds when running from a checkout. A
+    # CONTAINERISED validator has the package under site-packages, so the CLI defaults and the cron
+    # are simply not there — and the check used to report a confident "ok" after comparing the
+    # process against itself, which is worse than admitting it cannot see them. KOTH_REPO_ROOT lets
+    # a container mount the checkout and get the real check.
+    here = pathlib.Path(os.environ.get("KOTH_REPO_ROOT")
+                        or pathlib.Path(__file__).resolve().parents[3])
     for label, rel, pat in [
         ("validator cli", "src/thirtyspokes/koth/neuron.py", r'"--n-per-bench", type=int, default=(\d+)'),
         ("miner cli", "src/thirtyspokes/koth/miner.py", r'"--n-per-bench", type=int, default=(\d+)'),
@@ -87,11 +93,18 @@ def check_slice_agreement(runtime_n: int | None = None) -> tuple[str, str, str]:
         m = re.search(pat, f.read_text())
         if m:
             vals[label] = int(m.group(1))
+    checked_sources = len(vals) - 1          # everything but the in-process miner class default
     if runtime_n is not None:
         vals["this process"] = runtime_n
     uniq = set(vals.values())
     d = ", ".join(f"{k}={v}" for k, v in vals.items())
-    return _r(OK if len(uniq) == 1 else FAIL, "slice agreement", d)
+    if len(uniq) != 1:
+        return _r(FAIL, "slice agreement", d)
+    if checked_sources == 0:
+        return _r(WARN, "slice agreement",
+                  d + f" — could not read the CLI/cron defaults under {here}, so this compared the "
+                      f"process against itself only (set KOTH_REPO_ROOT to check them)")
+    return _r(OK, "slice agreement", d)
 
 
 def check_code_grading() -> tuple[str, str, str]:

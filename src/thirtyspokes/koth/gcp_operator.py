@@ -133,6 +133,7 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
     files = (f"koth-secrets={secrets},koth-agent-source={source_b64},"
              f"koth-agent-weights={weights_b64}")
     serial = ""
+    shown = 0                 # heartbeat lines already echoed (serial is re-read from 0 each poll)
     try:
         created = _gcloud(
             zone, "compute", "instances", "create", name,
@@ -154,6 +155,14 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
             serial = got.stdout
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(serial, encoding="utf-8")
+            # Surface the enclave's per-task heartbeat. Without it a booted VM is silent until the
+            # whole suite finishes, so "still working" and "hung" look identical from out here — the
+            # reason three healthy runs were killed as hangs and a dead 49-minute epoch could not be
+            # placed. Only newly-arrived lines are printed; the serial buffer is re-read from 0.
+            ticks = [ln for ln in serial.splitlines() if ln.startswith("KOTH-TASK ")]
+            for ln in ticks[shown:]:
+                print(f"[{name}] {ln}", flush=True)
+            shown = max(shown, len(ticks))
             try:
                 return decode_payloads(serial)
             except (RuntimeError, binascii.Error, UnicodeError, json.JSONDecodeError):

@@ -52,18 +52,40 @@ from .benchmarks import Benchmark
 # are quantised to EMBED_DECIMALS so three machines agree, and HARNESS_VERSION is now genuinely
 # folded into `runtime_measurement()` — it was documented as such but was not, so a harness change
 # would not have changed RTMR3 and miners could have been scored under an unapproved engine.
-# Bumped to 3: `run_cascade` now bounds escalation with TASK_BUDGET_S. That is an ENGINE change —
+# Bumped to 3: `run_cascade` now runs under a bounded RUN_BUDGET_S. That is an ENGINE change —
 # a head can be scored on a cascade that stopped early — so it must change the runtime measurement,
 # reset accumulated evidence, and require miners to re-commit against the new source hash. Leaving
 # the version alone would silently score miners under an engine they never agreed to, which is the
 # exact failure this constant exists to prevent.
 HARNESS_VERSION = "koth-harness-3"
 
-# Wall-clock a single task may spend BEFORE it is refused further escalation. 6 tasks x 150s = 900s
-# against a ~1200s epoch, leaving room for boot, attestation and proof emission. Part of the measured
-# harness: miner and validator must agree on it, and `doctor.check_slice_fits_epoch` derives the
-# preflight bound from it rather than from a guessed per-call latency.
-TASK_BUDGET_S = 150.0
+# HARD wall-clock for the WHOLE run, shared across tasks. It bounds escalation here AND every call
+# (the runtime arms `MeteringProxy.task_deadline` from what is left), and both halves are needed: the
+# escalation gate cannot interrupt a call already in flight, and on epoch 76738 one such call hung
+# ~900s and cost the epoch with the gate in place.
+#
+# SHARED, NOT PER-TASK, because the observed cost is wildly uneven: on that same epoch five tasks took
+# 174s between them (5-30s each) while the single code task at rung 4 took ~360s. A flat per-task cap
+# tight enough to fit the window would guillotine exactly the task that legitimately needs the time,
+# turning a slow-but-correct answer into an empty one — indistinguishable from incapability. Sharing
+# lets the cheap tasks hand their slack to the expensive one.
+#
+# 780s against the validator's 85-block GRACE (~1020s — the deadline a proof must actually beat, and
+# tighter than the epoch) leaves ~40s boot, ~30s attest/emit and ~20s upload, plus margin. At a
+# 150s-per-task bound the same arithmetic landed 14 seconds late on 76738 and went unscored.
+#
+# Part of the measured harness: miner and validator must agree on it, and
+# `doctor.check_slice_fits_epoch` derives the preflight bound from it, not from a guessed latency.
+RUN_BUDGET_S = 780.0
+
+# ...but no task may starve the ones after it. Each may spend everything EXCEPT this much held in
+# reserve per remaining task, so one greedy task cannot leave the rest with no time to answer at all.
+MIN_TASK_S = 45.0
+
+
+def task_budget(remaining_s: float, tasks_left_after_this: int) -> float:
+    """How long this task may run: everything left, minus a floor reserved for those still to come."""
+    return max(MIN_TASK_S, remaining_s - MIN_TASK_S * max(0, tasks_left_after_this))
 
 # The frozen encoder. Pinned by name because the embedding must be byte-identical in the miner's
 # enclave, in the owner's reference build, and in the trainer a miner runs at home; a different
@@ -233,7 +255,7 @@ def rung_order(pool: list[str], price_of) -> list[int]:
 
 def run_cascade(start_rung: int, prompt: str, bench: Benchmark, pool: list[str],
                 order: list[int], call_model, params: dict, *,
-                budget_s: float = TASK_BUDGET_S, now=time.monotonic) -> tuple[str, list[int]]:
+                budget_s: float = RUN_BUDGET_S, now=time.monotonic) -> tuple[str, list[int]]:
     """Enter the ladder at `start_rung`, escalate while the verifier rejects, bank on accept.
 
     Mirrors `cascade.to_cascade_cache` exactly — invoke, verify, escalate, and take whatever the top
@@ -246,7 +268,7 @@ def run_cascade(start_rung: int, prompt: str, bench: Benchmark, pool: list[str],
     entering low can climb several rungs. Measured live (epoch 76734): a miner finished five tasks in
     131s, then spent ~950s on the sixth and lost the epoch entirely — and a proof that misses its
     epoch is unrecoverable, not late, because its nonce is stale. The budget makes the epoch bound
-    structural: n_tasks x TASK_BUDGET_S is a number the preflight can check against the epoch.
+    structural: RUN_BUDGET_S is a number the preflight can check against the validator's grace.
 
     Never skip the FIRST call, whatever the clock says — a task with no call has no answer, which
     would turn a slow provider into a zero instead of a cheap answer. Truncation banks the best

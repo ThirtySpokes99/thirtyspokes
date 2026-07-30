@@ -37,17 +37,30 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     """
     from .benchmarks import real_suite
     from .epoch import EPOCH_BLOCKS
-    from .harness import TASK_BUDGET_S
+    from .harness import MIN_TASK_S, RUN_BUDGET_S
     # The harness refuses further escalation past TASK_BUDGET_S, so this is an actual CEILING, not
     # the average-latency estimate it used to be. That estimate was the weaker claim: it passed at
     # 45% of the window on the same day a single task ran ~950s and lost the epoch.
+    # Measured against the whole epoch. A validator's --grace-blocks makes the REAL deadline tighter
+    # still (85 blocks ~= 1020s), which is what RUN_BUDGET_S is sized for — see harness.RUN_BUDGET_S.
     block_s = 12.0
     n_bench = len(real_suite())
-    need = n_per_bench * n_bench * TASK_BUDGET_S
+    overhead = 90.0                             # boot + attest/emit + upload
+    need = RUN_BUDGET_S + overhead
     budget = EPOCH_BLOCKS * block_s
     frac = need / budget
-    d = (f"{n_per_bench} x {n_bench} benchmarks x {TASK_BUDGET_S:.0f}s budget = {need:.0f}s worst "
-         f"case vs ~{budget:.0f}s/epoch ({frac:.0%} of the window)")
+    d = (f"{n_per_bench} x {n_bench} benchmarks under a shared {RUN_BUDGET_S:.0f}s run budget "
+         f"= {need:.0f}s worst case vs ~{budget:.0f}s/epoch ({frac:.0%} of the window)")
+    # THE FAILURE MODE MOVED WITH THE BUDGET. A shared run budget means an oversized slice no longer
+    # overruns the epoch — it starves: every task collapses to the MIN_TASK_S floor and answers get
+    # truncated wholesale, which grades as incapability rather than as a misconfiguration. So the
+    # question is no longer "does it fit" but "can every task still afford a real answer".
+    n_tasks = n_per_bench * n_bench
+    floor_need = n_tasks * MIN_TASK_S
+    if floor_need > RUN_BUDGET_S:
+        return _r(FAIL, "slice fits epoch",
+                  f"{n_tasks} tasks x {MIN_TASK_S:.0f}s floor = {floor_need:.0f}s exceeds the "
+                  f"{RUN_BUDGET_S:.0f}s run budget — every task would be truncated at the floor")
     # The WARN threshold moved 0.6 -> 0.85 WITH the semantics. It used to gate an average-latency
     # estimate, where 60% of the window was genuinely risky; it now gates a hard ceiling the harness
     # enforces, and a typical run lands far below it. Leaving it at 0.6 would have made the correct

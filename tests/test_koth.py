@@ -3798,6 +3798,7 @@ def test_doctor_catches_the_deployment_faults_that_broke_live_runs():
     # 1. a slice at which no proof can EVER be produced inside an epoch
     status, _name, detail = D.check_slice_fits_epoch(16)
     assert status == D.FAIL, f"doctor accepted an impossible slice: {detail}"
+    assert "truncated" in detail or "proof" in detail
     assert D.check_slice_fits_epoch(2)[0] == D.OK
 
     # 2. no docker client -> the RANKED benchmark cannot be graded at all

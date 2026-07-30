@@ -130,11 +130,10 @@ def test_cascade_stops_escalating_when_the_task_runs_out_of_time():
 
 def test_preflight_bound_comes_from_the_harness_budget_not_a_guess():
     from thirtyspokes.koth import doctor
-    from thirtyspokes.koth.harness import TASK_BUDGET_S
+    from thirtyspokes.koth.harness import RUN_BUDGET_S
 
     status, _, detail = doctor.check_slice_fits_epoch(2)
-    assert f"{TASK_BUDGET_S:.0f}s budget" in detail
-    assert doctor.check_slice_fits_epoch(16)[0] == doctor.FAIL
+    assert f"{RUN_BUDGET_S:.0f}s run budget" in detail and status == doctor.OK
 
 
 def test_slice_agreement_admits_when_it_cannot_see_the_other_sources(tmp_path, monkeypatch):
@@ -149,3 +148,54 @@ def test_slice_agreement_admits_when_it_cannot_see_the_other_sources(tmp_path, m
 
     # a real disagreement still FAILS, seen or unseen sources notwithstanding
     assert doctor.check_slice_agreement(99)[0] == doctor.FAIL
+
+
+def test_a_single_hung_call_cannot_outlive_the_task_budget():
+    """The escalation gate alone did NOT fix the epoch-killer, and epoch 76738 proved it: five tasks
+    in 174s, then one call hung ~900s and the run missed its epoch WITH the budget in place.
+
+    The gate checks the clock BEFORE issuing a call, so it cannot interrupt one already in flight —
+    and a logical call was bounded only by the client timeout (120s) x its retries (4) x this
+    backend's own retry loop (3), i.e. ~24 minutes, longer than an epoch. The bound has to reach the
+    call, so the runtime arms `MeteringProxy.task_deadline` and the backend honours it.
+    """
+    from thirtyspokes.tee.runtime import ALLOWED_PARAMS, MeteringProxy
+
+    seen = {}
+
+    class SlowBackend:
+        def complete(self, model, messages, params):
+            seen.update(params)
+            return "answer", 1, 1, 0.0
+
+    proxy = MeteringProxy(SlowBackend())
+    proxy.call_model("m", [{"role": "user", "content": "q"}], {"max_tokens": 8})
+    assert "_timeout" not in seen, "no deadline armed -> no bound imposed"
+
+    import time
+    proxy.task_deadline = time.monotonic() + 30.0
+    proxy.call_model("m", [{"role": "user", "content": "q"}], {"max_tokens": 8})
+    assert 0 < seen["_timeout"] <= 30.0, f"call must inherit the task's remaining budget: {seen}"
+
+    # a MINER must not be able to widen its own bound: the deadline is injected after the allow-list
+    assert "_timeout" not in ALLOWED_PARAMS and "timeout" not in ALLOWED_PARAMS
+    proxy.task_deadline = time.monotonic() + 5.0
+    proxy.call_model("m", [{"role": "user", "content": "q"}], {"_timeout": 9999, "timeout": 9999})
+    assert seen["_timeout"] <= 5.0, "agent-supplied timeout must never survive the filter"
+
+
+def test_run_budget_fits_the_validators_grace_window_not_just_the_epoch():
+    """A proof must beat the validator's GRACE (85 blocks ~1020s), which is tighter than the epoch.
+    At 150s/task the arithmetic landed 14 seconds late on 76738 and went unscored."""
+    from thirtyspokes.koth.harness import MIN_TASK_S, RUN_BUDGET_S, task_budget
+
+    overhead = 40 + 30 + 20          # boot, attest/emit, upload
+    assert RUN_BUDGET_S + overhead < 85 * 12, "worst-case run cannot beat the grace point"
+
+    # cheap tasks hand their slack to the expensive one — the whole reason the budget is shared
+    assert task_budget(780.0, 5) == 780.0 - 5 * MIN_TASK_S
+    assert task_budget(606.0, 0) == 606.0, "the last task may use everything that is left"
+
+    # ...but nobody can starve the tasks after it
+    assert task_budget(50.0, 5) == MIN_TASK_S
+    assert task_budget(-10.0, 3) == MIN_TASK_S, "an overrun still leaves later tasks able to answer"

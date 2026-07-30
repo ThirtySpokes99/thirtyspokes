@@ -231,6 +231,8 @@ class KOTHRuntime:
         trace: list[dict] = []
         results: list[BenchmarkResult] = []
         p = dict(params or {"max_tokens": 16384, "reasoning": {"effort": "low"}})
+        import time as _t0
+        run_deadline = _t0.monotonic() + H.RUN_BUDGET_S
         for i, t in enumerate(tasks):
             c0 = proxy.total_cost_usd
 
@@ -246,8 +248,15 @@ class KOTHRuntime:
                 return resp
 
             rung = int(dist[i].argmax())
+            # Arm this task's slice of the RUN budget. run_cascade stops ESCALATING past it; the
+            # armed deadline is what stops a single in-flight call from blowing through it, which is
+            # the half that actually killed epochs (76738: one call hung ~900s).
+            import time as _t
+            budget = H.task_budget(run_deadline - _t.monotonic(), len(tasks) - i - 1)
+            proxy.task_deadline = _t.monotonic() + budget
             answer, used = H.run_cascade(rung, t["prompt"], by_name[t["benchmark"]], pool, order,
-                                         rec_call, p)
+                                         rec_call, p, budget_s=budget)
+            proxy.task_deadline = None
             results.append(BenchmarkResult(
                 t["benchmark"], t["task_id"], str(answer), proxy.total_cost_usd - c0,
                 chosen_rung=rung, rungs_used=tuple(used),

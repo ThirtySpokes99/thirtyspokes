@@ -38,12 +38,22 @@ class MeteringProxy:
     backend: ModelBackend
     total_cost_usd: float = 0.0
     calls: list = field(default_factory=list)
+    # monotonic wall-clock this task may not outlive; armed by the measured runtime, never by the
+    # agent — it is deliberately NOT an ALLOWED_PARAM, so a miner cannot grant itself a longer one
+    task_deadline: float | None = None
 
     def call_model(self, model: str, messages: list, params: dict | None = None) -> str:
         import time  # noqa: PLC0415
         p = {k: v for k, v in (params or {}).items() if k in ALLOWED_PARAMS}
         p.setdefault("max_tokens", 1024)
         p.setdefault("temperature", 0.0)
+        # HARD CALL BOUND, INJECTED AFTER THE ALLOW-LIST FILTER. `task_deadline` is set by the
+        # measured runtime, never by the agent: it is deliberately not an ALLOWED_PARAM, so a miner
+        # cannot hand itself a longer one. Without it a single call runs to the client's own timeout
+        # x its retries x this backend's retry loop — up to ~24 minutes, which is longer than the
+        # epoch. Measured on 76738: five tasks in 174s, then one call hung ~900s and the epoch died.
+        if self.task_deadline is not None:
+            p["_timeout"] = max(1.0, self.task_deadline - time.monotonic())
         t0 = time.time()
         text, tin, tout, cost = self.backend.complete(model, messages, p)
         self.last_latency_s = round(time.time() - t0, 3)

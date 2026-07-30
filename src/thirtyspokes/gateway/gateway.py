@@ -8,6 +8,8 @@ produce no receipt and are therefore unscoreable — miners cannot bypass it.
 
 from __future__ import annotations
 
+from time import monotonic as _mono
+
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -99,6 +101,14 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
     def complete(self, model, messages, params):
         p = {"temperature": 0.0, **params}
         p.pop("finalize", None)     # gateway-internal flag, not a provider param
+        # `_timeout` is injected by the metering proxy (never by an agent) and is the wall-clock this
+        # call may consume IN TOTAL. It bounds the SDK request AND the retry loop below, because
+        # retrying a hung call is how a per-request timeout silently becomes a per-request timeout
+        # times four.
+        budget = p.pop("_timeout", None)
+        deadline = (_mono() + float(budget)) if budget else None
+        if budget:
+            p["timeout"] = float(budget)
         # `reasoning` is an OpenRouter body param, not a top-level kwarg, so it has to be merged
         # into extra_body. Without it a reasoning model spends its ENTIRE max_tokens budget thinking
         # and never emits an answer -- measured on SWE-bench Pro oracle prompts, where raising the
@@ -123,13 +133,19 @@ class OpenRouterBackend:  # pragma: no cover — live seam (needs OPENROUTER_API
         import time as _time
         last = None
         for attempt in range(3):
+            if deadline is not None:
+                left = deadline - _mono()
+                if left <= 0:
+                    last = last or TimeoutError("call budget exhausted")
+                    break
+                p["timeout"] = left          # never let a retry outlive the task's budget
             try:
                 r = self._client.chat.completions.create(
                     model=model, messages=messages, extra_body=body, **p)
                 break
             except Exception as e:      # noqa: BLE001 — any provider failure, incl. unparseable bodies
                 last = e
-                if attempt < 2:
+                if attempt < 2 and (deadline is None or deadline - _mono() > 2):
                     _time.sleep(1.5 * (attempt + 1))
         else:
             print(f"[pool] {model} failed after 3 attempts ({type(last).__name__}: "

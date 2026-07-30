@@ -352,6 +352,23 @@ def main() -> None:  # noqa: C901
     chain = BittensorChain(args.netuid, args.wallet, network=args.network, hotkey=args.hotkey)
     epoch = args.epoch if args.epoch is not None else current_epoch(chain)
     nonce = epoch_nonce(epoch, chain.beacon(epoch))
+
+    # DO NOT START A RUN THAT CANNOT LAND IN TIME. Validators score an epoch at the owner-published
+    # grace point; a reference arriving after it describes a slice already scored without it, so the
+    # calls are spent for nothing and the epoch silently falls back to absolute accuracy anyway.
+    # Observed on 76755. The grace point is published in governance precisely so both sides agree on
+    # the deadline — the owner's own tooling should honour the same number it asks miners to.
+    if args.epoch is None:
+        from .epoch import EPOCH_BLOCKS
+        gov = chain.owner_measurements() or {}
+        grace = gov.get("grace_blocks")
+        if grace:
+            left_s = ((epoch * EPOCH_BLOCKS + int(grace)) - chain.current_block()) * 12.0
+            if left_s < args.deadline_s:
+                print(f"[koth-reference] epoch {epoch} scores in {left_s:.0f}s, less than the "
+                      f"{args.deadline_s:.0f}s deadline — skipping rather than spending calls on a "
+                      f"record that would arrive too late", flush=True)
+                return
     models = [m.strip() for m in args.pool.split(",") if m.strip()]
 
     cfg = config.LiveConfig()

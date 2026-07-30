@@ -176,6 +176,17 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tup
         return _r(FAIL, "governance",
                   f"this build measures {mine[:16]}… but chain pins {on_chain[0][:16]}… — "
                   f"every proof from this code would be rejected as unapproved_runtime")
+    # The published grace point is the deadline a proof must beat; RUN_BUDGET_S is sized for it, so a
+    # mismatch means every honest miner's run is either wasted (too slow) or needlessly cramped.
+    grace = rec.get("grace_blocks")
+    if grace:
+        from .harness import RUN_BUDGET_S
+        need = RUN_BUDGET_S + 90.0              # boot + attest/emit + upload
+        if need > int(grace) * 12:
+            return _r(FAIL, "governance",
+                      f"run budget {RUN_BUDGET_S:.0f}s + overhead = {need:.0f}s cannot beat the "
+                      f"published grace of {grace} blocks ({int(grace) * 12}s) — every proof would "
+                      f"land after scoring, complete and valid and unscored")
     pool = list(rec.get("pool_allow_list") or [])
     from .harness import pool_models
     if pool and sorted(pool) != sorted(pool_models()):

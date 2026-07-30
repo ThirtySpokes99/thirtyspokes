@@ -22,7 +22,7 @@ from .runtime import SUITE_VERSION, runtime_measurement
 def build_record(*, mrtd, rtmr1: str, rtmr2: str, pool_allow_list,
                  tcb_accept=("UpToDate", "SWHardeningNeeded"),
                  suite_version: str = SUITE_VERSION, version: int = 1,
-                 probe_commit: str | None = None) -> dict:
+                 probe_commit: str | None = None, grace_blocks: int | None = None) -> dict:
     rm = runtime_measurement()
     rec = {
         "version": version,
@@ -36,6 +36,13 @@ def build_record(*, mrtd, rtmr1: str, rtmr2: str, pool_allow_list,
     }
     if probe_commit:                     # commit to the secret memorization probe (koth/heldout.py)
         rec["probe_commit"] = probe_commit
+    if grace_blocks:
+        # THE DEADLINE A PROOF MUST ACTUALLY BEAT, published so miners can stop guessing it. A
+        # validator scores an epoch `grace_blocks` after it opens; a proof that lands later is
+        # complete, valid, attested — and unscored. Measured on 76738: 14 seconds late, and from the
+        # miner's side indistinguishable from success, because its own run reported "uploaded".
+        # It is validator-side config, so the OWNER publishing it is what lets the network agree.
+        rec["grace_blocks"] = int(grace_blocks)
     return rec
 
 
@@ -48,6 +55,9 @@ def main() -> None:
     p.add_argument("--rtmr2", required=True, help="approved boot RTMR2 (initrd/cmdline), hex")
     p.add_argument("--pool", required=True, help="comma-separated pinned model allow-list")
     p.add_argument("--tcb-accept", default="UpToDate,SWHardeningNeeded")
+    p.add_argument("--grace-blocks", type=int,
+                   help="blocks after an epoch opens at which validators score it. Published so "
+                        "miners can size their run against the real deadline instead of guessing.")
     p.add_argument("--version", type=int, default=1)
     p.add_argument("--probe-bank", help="path to the secret memorization-probe bank JSON "
                                         "(koth/heldout.py); its commit hash is published on-chain")
@@ -64,7 +74,8 @@ def main() -> None:
         probe_commit = SecretProbeBank.from_file(args.probe_bank).commit()
     rec = build_record(mrtd=args.mrtd, rtmr1=args.rtmr1, rtmr2=args.rtmr2, pool_allow_list=pool,
                        tcb_accept=tuple(t.strip() for t in args.tcb_accept.split(",")),
-                       version=args.version, probe_commit=probe_commit)
+                       version=args.version, probe_commit=probe_commit,
+                       grace_blocks=args.grace_blocks)
     if args.netuid is None:
         print(json.dumps(rec, indent=2))
         return

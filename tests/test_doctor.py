@@ -199,3 +199,56 @@ def test_run_budget_fits_the_validators_grace_window_not_just_the_epoch():
     # ...but nobody can starve the tasks after it
     assert task_budget(50.0, 5) == MIN_TASK_S
     assert task_budget(-10.0, 3) == MIN_TASK_S, "an overrun still leaves later tasks able to answer"
+
+
+def test_the_operator_stops_a_run_that_cannot_beat_the_published_grace():
+    """A proof landing after the validators' grace point is complete, valid, attested — and unscored.
+    The miner cannot tell: its own run prints "uploaded". Measured on 76738, missed by 14 seconds.
+
+    So the owner publishes the grace point and the operator sizes each attempt against the time
+    actually left, abandoning a run that provably cannot be scored instead of burning a VM."""
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    from thirtyspokes.koth.gcp_operator import _attempt_deadline
+
+    epoch, grace = 100, 85
+    open_block = epoch * EPOCH_BLOCKS
+
+    # plenty of room -> the operator's own setting still governs
+    assert _attempt_deadline(900.0, grace, open_block, epoch) == 900.0
+    # late start -> capped at what is really left, minus the upload margin
+    assert _attempt_deadline(900.0, grace, open_block + 40, epoch) == 45 * 12.0 - 30.0
+    # past the grace point -> a floor, not a negative or absurd deadline
+    assert _attempt_deadline(900.0, grace, open_block + 90, epoch) == 60.0
+    # nothing published -> unchanged behaviour
+    assert _attempt_deadline(900.0, None, open_block + 40, epoch) == 900.0
+
+
+def test_governance_check_rejects_a_grace_the_run_budget_cannot_beat(monkeypatch):
+    """If the owner publishes a grace point the harness cannot beat, EVERY honest miner produces a
+    valid proof that lands too late — the most expensive kind of misconfiguration, because nothing
+    looks broken from either side."""
+    from thirtyspokes.koth import doctor
+    from thirtyspokes.koth.harness import pool_models
+    from thirtyspokes.koth.runtime import runtime_measurement
+
+    def fake_chain(record):
+        class C:
+            def __init__(self, *a, **k):
+                pass
+
+            def owner_measurements(self):
+                return record
+        return C
+
+    base = {"runtime_measurements": [runtime_measurement()], "pool_allow_list": list(pool_models())}
+
+    import thirtyspokes.subnet.chain as chain_mod
+    monkeypatch.setattr(chain_mod, "BittensorChain", fake_chain({**base, "grace_blocks": 20}))
+    status, _n, detail = doctor.check_governance(526, "test", "w", "hk")
+    assert status == doctor.FAIL and "grace" in detail
+
+    monkeypatch.setattr(chain_mod, "BittensorChain", fake_chain({**base, "grace_blocks": 85}))
+    assert doctor.check_governance(526, "test", "w", "hk")[0] == doctor.OK
+
+    monkeypatch.setattr(chain_mod, "BittensorChain", fake_chain(base))     # nothing published
+    assert doctor.check_governance(526, "test", "w", "hk")[0] == doctor.OK

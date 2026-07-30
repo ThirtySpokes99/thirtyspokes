@@ -180,6 +180,23 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
         _delete_instance(zone, name)
 
 
+def _attempt_deadline(configured: float, grace_blocks, current_block: int, epoch: int) -> float:
+    """How long this attempt may run, given the deadline the OWNER publishes.
+
+    A proof that lands after the validators' grace point is complete, valid, attested and unscored —
+    so time spent past it is pure waste, and the miner cannot tell: its own run prints "uploaded".
+    Measured on 76738, a proof missed by 14 seconds. When governance publishes `grace_blocks` the
+    attempt is capped at the time actually left before that point (less a margin for upload), so a
+    run that provably cannot be scored is abandoned early instead of burning a VM to completion.
+    """
+    if not grace_blocks:
+        return configured                       # nothing published: fall back to the operator's own
+    blocks_left = (epoch * EPOCH_BLOCKS + int(grace_blocks)) - current_block
+    upload_margin_s = 30.0
+    room = blocks_left * 12.0 - upload_margin_s
+    return max(60.0, min(configured, room))
+
+
 def _wait_for_epoch(chain: BittensorChain, last_epoch: int | None,
                     min_blocks: int, poll: float) -> tuple[int, str]:
     while True:
@@ -278,6 +295,7 @@ def main() -> None:  # pragma: no cover — real GCP/chain/HF operator
     repo, revision, artifact = _committed_artifact(chain, store, args.repo, args.revision)
     governance = chain.owner_measurements()
     pool = list((governance or {}).get("pool_allow_list") or [])
+    grace_blocks = (governance or {}).get("grace_blocks")
     if not pool:
         raise RuntimeError("owner governance has no pinned pool allow-list")
     hotkey = chain.hotkey_ss58()
@@ -318,7 +336,8 @@ def main() -> None:  # pragma: no cover — real GCP/chain/HF operator
                         name=name, epoch=epoch, nonce=nonce, hotkey=hotkey, pool=pool,
                         n_per_bench=args.n_per_bench, source_b64=source_b64,
                         weights_b64=weights_b64, secrets=secrets,
-                        deadline=args.attempt_deadline, poll=args.poll,
+                        deadline=_attempt_deadline(args.attempt_deadline, grace_blocks,
+                                                   chain.current_block(), epoch), poll=args.poll,
                         log_path=output / f"{name}.serial.log",
                     )
                     proof = Proof.from_json(proof_json)

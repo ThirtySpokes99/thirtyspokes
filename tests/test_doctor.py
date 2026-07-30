@@ -252,3 +252,33 @@ def test_governance_check_rejects_a_grace_the_run_budget_cannot_beat(monkeypatch
 
     monkeypatch.setattr(chain_mod, "BittensorChain", fake_chain(base))     # nothing published
     assert doctor.check_governance(526, "test", "w", "hk")[0] == doctor.OK
+
+
+def test_reference_cells_are_bounded_and_retried():
+    """One hung or failed cell used to cost the whole epoch's reference, not just its own row: a row
+    needs EVERY model, so with a small slice a single bad cell drops every row and nothing is
+    published. Validators then silently fall back to absolute accuracy — routing is not scored at
+    all, and nothing says so. Observed live on 76745: 13/14 cells, `nothing to publish`."""
+    import inspect
+
+    from thirtyspokes.koth import reference
+
+    src = inspect.getsource(reference.build)
+    assert "_timeout" in src, "each cell must carry a wall-clock bound to the provider call"
+    assert "cell_timeout_s" in src and "deadline_s * 0.6" in src, (
+        "the bound must leave room for a legitimately slow cell (~360s measured), or every slow row "
+        "fails every epoch — a permanent failure traded for a rare one")
+    assert "_attempts" in src, "a bounded cell is worth one retry inside the deadline"
+
+
+def test_validator_announces_when_it_is_not_scoring_routing():
+    """No pool reference means the scalar degrades to absolute accuracy — the subnet keeps paying and
+    the log keeps looking healthy while the thing it exists to measure goes unmeasured. That used to
+    be visible only as two ABSENT fields, which nobody notices."""
+    import inspect
+
+    from thirtyspokes.koth import neuron
+
+    src = inspect.getsource(neuron)
+    assert "reference=MISSING" in src, "a silent fallback must announce itself"
+    assert "NOT routing" in src

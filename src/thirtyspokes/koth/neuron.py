@@ -162,7 +162,14 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
             routable = ref.get("routable")
             print(f"[koth-validator] epoch {epoch}: scored={len(rep.scored)} dq={len(rep.dq)} "
                   f"king={king} uids={len(rep.weights_by_uid)}"
-                  + (f" routable={routable} gap={ref.get('achievable_gap')}" if ref else "")
+                  # SAY SO WHEN ROUTING IS NOT BEING SCORED. Without a pool reference the scalar
+                  # silently degrades to absolute accuracy — the subnet keeps paying, the log keeps
+                  # looking healthy, and the thing the subnet exists to measure is simply not
+                  # measured. It used to show up only as the ABSENCE of these two fields, which is
+                  # invisible unless you already know to look for it. Live on 76745: the owner's
+                  # reference lost every row to one hung cell and no line anywhere said so.
+                  + (f" routable={routable} gap={ref.get('achievable_gap')}" if ref
+                     else " reference=MISSING(scoring absolute accuracy, NOT routing)")
                   + (f" dq_reasons={sorted(set(rep.dq.values()))}" if rep.dq else ""), flush=True)
         except Exception as exc:  # noqa: BLE001 — public RPC failures are retried from a clean state
             self.val.restore(before)

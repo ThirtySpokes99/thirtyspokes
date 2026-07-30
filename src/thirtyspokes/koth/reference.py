@@ -129,13 +129,28 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
         for t in bench.sample(n_per_bench, bench_seed(nonce, epoch, bench.name)):
             tasks.append((bench, t))
 
+    # PER-CELL WALL-CLOCK. Without it one hung provider call consumes the whole deadline and the
+    # epoch's reference is LOST, not merely thinner: a row needs every model, so a single stuck cell
+    # kills its row, and with a small slice that is every row. Measured live on 76745 — 13 of 14
+    # cells done, one hung, `every row had a failed cell — nothing to publish`, and validators
+    # silently fell back to absolute accuracy with nothing announcing it.
+    #
+    # 60% of the deadline, NOT a third: a legitimate code cell has taken ~360s against a 600s
+    # deadline, so a tighter bound would systematically cut real work and fail those rows every
+    # epoch — trading a rare hang for a permanent one. This still stops a hung cell from consuming
+    # the whole budget, which is what leaves the remaining cells unrecorded.
+    # `deadline_s=None` means "no overall budget" (offline/tests): there is nothing to protect, so
+    # the cell stays unbounded rather than inventing a limit the caller did not ask for.
+    cell_timeout_s = max(60.0, deadline_s * 0.6) if deadline_s else None
     params = {"max_tokens": max_tokens}
+    if cell_timeout_s:
+        params["_timeout"] = cell_timeout_s
     if reasoning:
         params["reasoning"] = reasoning
 
     cells: dict = {}
 
-    def one(job):
+    def one(job, _attempts=2):
         i, (bench, t), model = job
         try:
             text, _tin, _tout, cost = backend.complete(
@@ -149,6 +164,9 @@ def build(suite: list[Benchmark], *, epoch: int, nonce: str, n_per_bench: int,
             from .harness import verifier_ok
             return i, model, float(bench.grade(text, t.gold)), float(cost), bool(verifier_ok(text, bench))
         except Exception:                       # noqa: BLE001 — a dead cell must not sink the epoch
+            if (_attempts > 1 and cell_timeout_s
+                    and time.monotonic() - started < deadline_s - cell_timeout_s):
+                return one(job, _attempts - 1)   # time left: a bounded cell is worth one retry
             return i, model, None, 0.0, False
 
     jobs = [(i, bt, m) for i, bt in enumerate(tasks) for m in models]

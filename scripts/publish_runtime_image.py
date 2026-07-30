@@ -106,6 +106,53 @@ def _refuse_unless_reproducible(dry_run: bool) -> str:
     return head
 
 
+def _refuse_unless_head_built_this_image(build_dir: str | None, dry_run: bool) -> None:
+    """Does HEAD actually describe the bytes in this image?
+
+    `_refuse_unless_reproducible` only catches an UNCOMMITTED tree. It says nothing about a tree that
+    moved on to further commits after the build — and that is the likelier mistake, because the build
+    takes long enough that work continues while it runs. Measured on v23: the image was built at
+    923e3a4, one more commit landed before publishing, and the manifest would have claimed a
+    recipe_commit that rebuilds into a DIFFERENT image (different rootfs -> different roothash ->
+    different RTMR1). A miner following the manifest would have been rejected `unapproved_runtime`
+    and concluded the owner was lying.
+
+    The build directory still holds the staged package that was baked in, so this is checkable rather
+    than a matter of remembering: compare every .py under the image's site-packages/thirtyspokes
+    against `git show HEAD:src/thirtyspokes/...`.
+    """
+    import subprocess
+    if not build_dir:
+        print("WARNING: --build-dir not given, so recipe_commit is UNVERIFIED. It is only a true "
+              "claim if HEAD is exactly the commit this image was built from.", flush=True)
+        return
+    roots = sorted(pathlib.Path(build_dir).glob(
+        "mkosi.extra/opt/koth/venv/lib/python3*/site-packages/thirtyspokes"))
+    if not roots:
+        raise SystemExit(f"REFUSING TO PUBLISH: no staged package under {build_dir} — "
+                         "pass the build directory that produced this image.")
+    root = roots[0]
+    drifted = []
+    for f in sorted(root.rglob("*.py")):
+        rel = f.relative_to(root)
+        r = subprocess.run(["git", "show", f"HEAD:src/thirtyspokes/{rel.as_posix()}"],
+                           capture_output=True)
+        if r.returncode != 0 or r.stdout != f.read_bytes():
+            drifted.append(str(rel))
+    if not drifted:
+        return
+    msg = (f"REFUSING TO PUBLISH: {len(drifted)} baked file(s) differ from HEAD, so recipe_commit "
+           f"would name a commit that rebuilds into a DIFFERENT image:\n  "
+           + "\n  ".join(drifted[:10])
+           + ("\n  ..." if len(drifted) > 10 else "")
+           + "\nEither rebuild at HEAD, or publish from a worktree pinned at the commit that built "
+             "this image (`git worktree add <dir> <commit>`).")
+    if dry_run:
+        print(msg, flush=True)
+        return
+    raise SystemExit(msg)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Publish the KOTH measured runtime image to HuggingFace")
     p.add_argument("--version", required=True, help="image version, e.g. v14")
@@ -117,9 +164,13 @@ def main() -> None:
     p.add_argument("--rtmr1", required=True)
     p.add_argument("--rtmr2", default=ZERO_RTMR)
     p.add_argument("--pool", required=True, help="comma-separated owner-pinned model allow-list")
+    p.add_argument("--build-dir", help="the build directory that produced this image (e.g. "
+                                       "/root/koth-build-prod). Used to prove HEAD is the commit "
+                                       "that built it — without it recipe_commit is unverified.")
     p.add_argument("--dry-run", action="store_true", help="print the manifest, upload nothing")
     args = p.parse_args()
     _refuse_unless_reproducible(args.dry_run)
+    _refuse_unless_head_built_this_image(args.build_dir, args.dry_run)
 
     pool = [m.strip() for m in args.pool.split(",") if m.strip()]
     man = build_manifest(version=args.version, image_path=args.image, uki_sha256=args.uki_sha256,

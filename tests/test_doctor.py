@@ -51,3 +51,40 @@ def test_operator_echoes_heartbeat_lines_as_the_console_actually_formats_them():
     assert len(ticks) == 2, "the console format must still be matched by the operator's filter"
     assert "KOTH-TASK " in inspect.getsource(gcp_operator._boot_once)
     assert 'startswith("KOTH-TASK' not in inspect.getsource(gcp_operator._boot_once)
+
+
+def _publish_script():
+    import importlib.util
+    import pathlib
+    path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "publish_runtime_image.py"
+    spec = importlib.util.spec_from_file_location("publish_runtime_image", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_publish_refuses_when_head_is_not_the_commit_that_built_the_image(tmp_path):
+    """A dirty-tree check does not catch a tree that moved ON to further commits after the build —
+    the likelier mistake, because builds take long enough that work continues while they run. Caught
+    live on v23: one commit landed between build and publish, and the manifest would have named a
+    recipe_commit that rebuilds into a different image (different rootfs -> RTMR1), so a miner
+    following it would be rejected `unapproved_runtime` and conclude the owner was lying."""
+    import subprocess
+
+    mod = _publish_script()
+    staged = tmp_path / "mkosi.extra/opt/koth/venv/lib/python3.12/site-packages/thirtyspokes/koth"
+    staged.mkdir(parents=True)
+    baked = staged / "epoch.py"
+    at_head = subprocess.run(["git", "show", "HEAD:src/thirtyspokes/koth/epoch.py"],
+                             capture_output=True).stdout
+
+    baked.write_bytes(at_head)                       # image matches HEAD -> publishable
+    mod._refuse_unless_head_built_this_image(str(tmp_path), dry_run=False)
+
+    baked.write_bytes(at_head + b"\n# built from a commit that is no longer HEAD\n")
+    with pytest.raises(SystemExit) as e:
+        mod._refuse_unless_head_built_this_image(str(tmp_path), dry_run=False)
+    assert "koth/epoch.py" in str(e.value) and "DIFFERENT image" in str(e.value)
+
+    # no build dir -> cannot verify, so warn rather than block (the pre-existing behaviour)
+    mod._refuse_unless_head_built_this_image(None, dry_run=False)

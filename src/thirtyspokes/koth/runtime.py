@@ -260,7 +260,22 @@ class KOTHRuntime:
                             # version here would make every router proof fail `verify_commit`.
                             source_hash=hash_source(H.HARNESS_VERSION),
                             weights_hash=hash_weights(weights), model_id="router",
-                            confined=False)
+                            # NO UNTRUSTED CODE RAN — a strictly stronger statement than "it ran
+                            # confined", which is what this flag exists to assert. On the free-agent
+                            # path the miner supplies Python and `confined` attests that it had no
+                            # network egress; here the miner supplies only WEIGHTS, loaded through
+                            # np.load(allow_pickle=False), and every line executed is the owner's
+                            # measured harness. There is nothing to confine.
+                            #
+                            # This was hardcoded False, and the consequence was total: `enforce=True`
+                            # rejects any proof with confined=False as `unconfined_agent`, so NO
+                            # routing proof could ever be scored in production. Observed on testnet
+                            # 526 only after a full mine/validate cycle.
+                            #
+                            # IF miner-authored code is ever executed on this path, this MUST become
+                            # the real confinement fact again — the claim is about what ran, not
+                            # about which function produced the proof.
+                            confined=True)
 
     def run(self, artifact: Artifact, *, hotkey: str, epoch: int, nonce: str,
             suite: list[Benchmark], n_per_bench: int) -> tuple[Proof, list[dict]]:

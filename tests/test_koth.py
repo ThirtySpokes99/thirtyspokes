@@ -3714,3 +3714,45 @@ def test_validator_daemon_survives_a_transient_chain_error():
         pass
     assert Exploding.calls >= 3, (
         f"the daemon stopped after {Exploding.calls} call(s) — a transient chain error still kills it")
+
+
+def test_a_routing_proof_survives_the_enforce_gate(env, monkeypatch):
+    """THE ROUTING PATH MUST BE SCOREABLE IN PRODUCTION. It was not.
+
+    `run_router` hardcoded `confined=False`, and `enforce=True` rejects any proof whose attested
+    `confined` flag is false (`unconfined_agent`). So every routing proof was unscoreable on a
+    fail-closed validator — the entire architecture, invisible until a full mine/validate cycle on
+    testnet 526 produced the DQ.
+
+    `confined` asserts that untrusted code could not reach the network. On this path the miner
+    supplies only weights (np.load, allow_pickle=False) and every executed line is the owner's
+    measured harness, so the property holds more strongly than confinement does. This test pins the
+    end state — a routing proof passing a fully-armed gate — rather than the flag's value, so it
+    stays honest if the mechanism changes.
+    """
+    import numpy as np
+
+    from thirtyspokes.koth import harness as H
+    from thirtyspokes.koth.attest import verify_attestation
+    from thirtyspokes.koth.runtime import KOTHRuntime, runtime_measurement
+    from thirtyspokes.koth.store import hash_source
+    from thirtyspokes.router import RouterHead
+
+    pool = ["cheap", "mid", "strong"]
+    monkeypatch.setattr(H, "encode",
+                        lambda ps: np.stack([np.full(H.EMBED_DIM, (len(p) % 5) / 5.0) for p in ps]))
+    n = RouterHead(H.EMBED_DIM, len(pool), 8).n_params
+    weights = H.save_head(np.random.default_rng(0).normal(0, 0.3, n), 8)
+
+    proof, _trace = KOTHRuntime(env.backend, env.platform).run_router(
+        weights, hotkey="hk", epoch=1, nonce="n1", suite=env.suite, n_per_bench=2,
+        pool=pool, price_of={"cheap": 1.0, "mid": 2.0, "strong": 3.0}.get,
+        params={"max_tokens": 16})
+
+    reason = verify_attestation(
+        proof, approved_measurements={runtime_measurement()},
+        platform_public_hex=env.platform.public_hex, expect_epoch=1, expect_nonce="n1",
+        expect_hotkey="hk", expect_source_hash=hash_source(H.HARNESS_VERSION),
+        expect_weights_hash=proof.weights_hash)
+    assert reason is None, f"a routing proof cannot pass the gate: {reason}"
+    assert proof.confined, "the proof does not attest that untrusted code was contained"

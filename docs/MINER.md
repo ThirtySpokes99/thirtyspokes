@@ -267,14 +267,14 @@ Import the disk into your own cloud (GCP shown; Azure DCesv6 and bare metal work
 
 ```bash
 gsutil cp koth-runtime.tar.gz gs://YOUR-BUCKET/
-gcloud compute images create koth-runtime-v20 \
+gcloud compute images create koth-runtime-v24 \
   --source-uri=gs://YOUR-BUCKET/koth-runtime.tar.gz \
   --guest-os-features=UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC
 
 gcloud compute instances create my-koth-miner \
   --zone=us-central1-a --machine-type=c3-standard-4 \
   --confidential-compute-type=TDX --maintenance-policy=TERMINATE \
-  --image=koth-runtime-v20 \
+  --image=koth-runtime-v24 \
   --network-interface=nic-type=GVNIC --boot-disk-size=50GB \
   --metadata="^@^koth-epoch=<E>@koth-nonce=<N>@koth-hotkey=<YOUR_SS58>@koth-pool=<ALLOW_LIST>" \
   --metadata-from-file=koth-secrets=secrets.env,\
@@ -287,14 +287,14 @@ runs with **zero network egress**; its only channel is the metered `call_model`.
 
 | the image, pinned | |
 |---|---|
-| GCP image / bucket version | `koth-runtime-v20` |
-| image sha256 | `cbf0936ddef265112591835b30215ca69ce643dcf92249bb139b7b1db90d9e26` |
-| UKI sha256 | `1b49dec7ae0098705b03318b6ff0cab44628e73b7fcb02fa550b25a5ce901a4d` |
-| verity roothash | `4d776060b394e58b551feda9b71e77738b43818301168104f8182458272a6dd4` |
-| recipe commit | `25f50c6816e565a4be62982552b3efcc9fec4f07` |
+| GCP image / bucket version | `koth-runtime-v24` |
+| image sha256 | `c29101cb266a5574ccc3853231b78f645052b0f03ede3db2636ec228cf5e1a62` |
+| UKI sha256 | `9411cede09677cc15486aa2e1d9d4f042a75f117576ea042c9ac590b9faaa020` |
+| verity roothash | `404c64d27cc8384681cc7b886bb4c6a964d2cf41d6472716ca11eed3c81c5358` |
+| recipe commit | `13cd1502d96435bc9815f9b7c22b0cbb23f747f5` |
 | MRTD | `c1ee9c16…` *(GCP TDVF — identical on every GCP TDX guest, a coarse check only)* |
-| **RTMR1** | `76947191ea7fde9f24fe498b17592f97ba0960cd95103ec77c876220be9cbf7d0d1e5c2da05a495f27bf953874425e6b` **← the per-image anchor** |
-| RTMR3 | `80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044` *(binds runtime+suite+pool)* |
+| **RTMR1** | `a7c57e409dd7e042610948389af9064c84c57775357ef77b1a600efd27dfd8d102cc8a1f56cdf043c6205a9fb1a5e159` **← the per-image anchor** |
+| RTMR3 | `51e9caafd38c47b9153af7b589449b59cc7d8ae8033d6042d76cd35c1d501dfd38ac1e3ac00775093e3e3464c679e562` *(binds runtime+suite+pool — moves whenever the engine does)* |
 | on-chain governance | `b024c4161a1bcf41529c8f4aa92658152901902ca78853ef4f335ec62d097771` |
 
 The validator gates every proof on MRTD + RTMR1/2/3 against the owner's on-chain record. Change *any*

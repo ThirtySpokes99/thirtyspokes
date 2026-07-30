@@ -48,7 +48,7 @@ set -a && . ./.env && set +a && uv run python scripts/koth_live_smoke.py   # rea
 > **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`). Every command below
 > shows the live testnet target; mainnet (netuid 99, `--network finney`) remains the eventual
 > destination and is the code default, so **pass `--network test` explicitly** while running against
-> 526. Governance, the measured image (`v15`) and the per-epoch pool reference are published there.
+> 526. Governance, the measured image (`v24`) and the per-epoch pool reference are published there.
 
 
 The trust claim is only real with genuine hardware attestation, so a production subnet needs the
@@ -284,7 +284,7 @@ and a re-commit cycle, not just an image swap.
 ```bash
 huggingface-cli login          # or export HF_TOKEN
 python scripts/publish_runtime_image.py \
-  --version v14 --image /path/koth-runtime-v14.tar.gz \
+  --version v24 --image /path/koth-runtime-v24.tar.gz --build-dir /root/koth-build-v24a \
   --uki-sha256 <uki> --roothash <roothash> --mrtd <mrtd> --rtmr1 <rtmr1> \
   --pool "openai/gpt-4o-mini,anthropic/claude-opus-4.7"
 ```

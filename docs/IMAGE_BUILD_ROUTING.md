@@ -295,7 +295,7 @@ Every link verified, none simulated:
 |---|---|
 | miner trains a head offline | `/root/koth-miner-work` (outside the repo), 48 tasks x 7 models, $1.32 |
 | publishes weights + commits on chain | `thirtyspokes/koth-miner-router{,-b}`, revealed commit |
-| boots the owner's measured image on TDX | `koth-runtime-v22`, RTMR1 `158ed9b1…` matching governance |
+| boots the owner's measured image on TDX | `koth-runtime-v24`, RTMR1 `a7c57e40…` matching governance |
 | head routes, harness executes the cascade | `KOTH-MODE routing harness=koth-harness-2 rungs=7` |
 | hardware-attested proof uploaded | `proofs/<epoch>.json`, real DCAP quote |
 | validator binds + verifies under `enforce=True` | no attestation-class DQ |

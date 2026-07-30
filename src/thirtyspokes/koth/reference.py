@@ -300,15 +300,28 @@ def chain_reader(chain, *, n_per_bench: int, owner_hotkey: str | None = None,
     def read(epoch: int, nonce: str):
         if epoch in cache:
             return cache[epoch]
-        out = None
+        out, why = None, ""
         try:
             owner = owner_hotkey or chain.owner_hotkey()
-            if owner:
+            if not owner:
+                why = "no owner hotkey resolved from the chain"
+            else:
                 rec = fetch(epoch, nonce, owner_ss58=owner, verify_sig=check, bucket=bucket)
                 if matches(rec, epoch=epoch, nonce=nonce, n_per_bench=n_per_bench):
                     out = rec
-        except Exception:                       # noqa: BLE001 — never break scoring on a fetch error
-            out = None
+                else:
+                    why = (f"record present but does not match the slice "
+                           f"(epoch {rec.get('epoch')} nonce {str(rec.get('nonce'))[:12]} "
+                           f"n_per_bench {rec.get('n_per_bench')} suite {rec.get('suite_version')})")
+        except Exception as e:                  # noqa: BLE001 — never break scoring on a fetch error
+            why = f"{type(e).__name__}: {str(e)[:100]}"
+        if out is None:
+            # DO NOT CACHE A MISS. The owner publishes DURING the epoch, so any lookup before that
+            # moment would otherwise poison this epoch permanently — the record lands minutes later
+            # and is never looked at again. Measured on 76756: published at 22:25, epoch scored at
+            # 22:27, and the validator still reported the reference missing.
+            print(f"[koth-validator] no usable pool reference for epoch {epoch}: {why}", flush=True)
+            return None
         cache[epoch] = out
         return out
 

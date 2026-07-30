@@ -436,3 +436,38 @@ def test_reference_skips_an_epoch_it_cannot_reach_in_time():
 
     # no published grace -> no opinion, the caller proceeds as before
     assert seconds_until_scored(epoch, None, open_block + 80) is None
+
+
+def test_a_missing_reference_is_not_cached_forever():
+    """The owner publishes DURING the epoch, so a lookup before that moment must not poison it.
+
+    Measured on 76756: the reference was published at 22:25, the epoch was scored at 22:27, and the
+    validator still reported `reference=MISSING` — it had cached the miss from an earlier poll and
+    never looked again."""
+    from thirtyspokes.koth import reference
+    from thirtyspokes.koth.runtime import SUITE_VERSION
+
+    published = {}
+    calls = {"n": 0}
+
+    def fake_fetch(epoch, nonce, **kw):
+        calls["n"] += 1
+        if epoch not in published:
+            raise FileNotFoundError("not published yet")
+        return published[epoch]
+
+    class Chain:
+        def owner_hotkey(self): return "5Owner"
+
+    monkey = reference.fetch
+    reference.fetch = fake_fetch
+    try:
+        read = reference.chain_reader(Chain(), n_per_bench=2, verify_sig=lambda *a, **k: True)
+        assert read(50, "n") is None, "not published yet"
+        published[50] = {"epoch": 50, "nonce": "n", "n_per_bench": 2,
+                         "suite_version": SUITE_VERSION, "scores": [[1.0]], "costs": [[0.1]]}
+        assert read(50, "n") is not None, "a later publish must be picked up, not cached away"
+        assert calls["n"] == 2, "the miss must not have been served from cache"
+        assert read(50, "n") is not None and calls["n"] == 2, "a HIT is still cached"
+    finally:
+        reference.fetch = monkey

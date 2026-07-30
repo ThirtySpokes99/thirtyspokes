@@ -28,6 +28,15 @@ services:
     volumes:
       - ${HOME}/.bittensor:/root/.bittensor        # wallet — holds the hotkey that signs set_weights
       - validator-state:/state                     # reign + king baseline survive restarts
+      # THE CODE GRADER NEEDS THE HOST DOCKER DAEMON. `lcb.run_tests` runs each submitted program in
+      # a throwaway `docker run --network none` container; without this socket it raises
+      # GradingUnavailable and the RANKED benchmark cannot be scored at all.
+      #
+      # SECURITY: mounting the socket grants this container root-equivalent control of the host
+      # daemon. That is a real privilege escalation and the reason it is called out here rather than
+      # added quietly — run the validator on a host you are willing to give it. The alternative is a
+      # remote/rootless daemon via DOCKER_HOST, which the grader honours since it just shells out.
+      - /var/run/docker.sock:/var/run/docker.sock
       # opt-in secret memorization probe (see --probe-bank below):
       # - ${PROBE_BANK_FILE:-/dev/null}:/secrets/probe_bank.json:ro
     command:

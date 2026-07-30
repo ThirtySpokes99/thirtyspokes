@@ -41,6 +41,10 @@ class MeteringProxy:
     # monotonic wall-clock this task may not outlive; armed by the measured runtime, never by the
     # agent — it is deliberately NOT an ALLOWED_PARAM, so a miner cannot grant itself a longer one
     task_deadline: float | None = None
+    # Bumped when the runtime abandons a task that outran its watchdog. A call still in flight may
+    # return long afterwards; its answer is already discarded, so its COST must not land in the
+    # attested totals either — otherwise the proof prices work no result was taken from.
+    generation: int = 0
 
     def call_model(self, model: str, messages: list, params: dict | None = None) -> str:
         import time  # noqa: PLC0415
@@ -55,7 +59,10 @@ class MeteringProxy:
         if self.task_deadline is not None:
             p["_timeout"] = max(1.0, self.task_deadline - time.monotonic())
         t0 = time.time()
+        gen = self.generation
         text, tin, tout, cost = self.backend.complete(model, messages, p)
+        if gen != self.generation:
+            return ""                       # abandoned mid-flight: unmetered, unrecorded, unused
         self.last_latency_s = round(time.time() - t0, 3)
         self.last_tokens = (tin, tout)
         self.total_cost_usd += float(cost)

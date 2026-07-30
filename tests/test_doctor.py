@@ -376,14 +376,20 @@ def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypat
     HANG = 20.0
 
     class HangingPool:
+        """IGNORES the granted bound, which is the whole point.
+
+        The first version of this test slept only what it was granted — proving the runtime *asks*
+        for a bound while assuming the compliance that epoch 76751 disproved: an httpx read timeout
+        does not fire on a response that trickles, so the call neither returned nor timed out. A
+        bound that depends on the thing being bounded is not a bound.
+        """
         calls = 0
 
         def complete(self, model, messages, params):
             HangingPool.calls += 1
-            budget = params.get("_timeout")
-            assert budget is not None, "the runtime must grant every call a wall-clock bound"
-            time.sleep(min(HANG, float(budget)))
-            return "", 0, 0, 0.0          # degrade exactly as OpenRouterBackend does
+            assert params.get("_timeout") is not None, "the runtime must still grant a bound"
+            time.sleep(HANG)              # ...and ignore it completely
+            return "", 0, 0, 0.0
 
     suite = real_suite()
     # A real head, so the entry rungs are the ones a live miner would pick. Which rung it picks does
@@ -400,6 +406,9 @@ def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypat
     elapsed = time.monotonic() - t0
 
     assert len(proof.results) == len(suite), "a bounded run must still answer every task"
+    # budget + the watchdog's per-task slack; fixed cost, negligible at production scale (6 tasks
+    # against a 780s budget) but dominant here, which is why it is stated rather than fudged.
+    ceiling = H.RUN_BUDGET_S + len(suite) * 5.0 + 15.0
     unbounded = len(suite) * HANG
-    assert elapsed < unbounded / 2, (
-        f"{elapsed:.1f}s is not meaningfully under the {unbounded:.0f}s an unbounded run would take")
+    assert elapsed < ceiling, f"UNBOUNDED: {elapsed:.1f}s against a {ceiling:.0f}s ceiling"
+    assert elapsed < unbounded, f"{elapsed:.1f}s is not under the {unbounded:.0f}s of an unbounded run"

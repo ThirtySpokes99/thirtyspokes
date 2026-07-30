@@ -46,7 +46,9 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     # still (85 blocks ~= 1020s), which is what RUN_BUDGET_S is sized for — see harness.RUN_BUDGET_S.
     block_s = 12.0
     n_bench = len(real_suite())
-    overhead = 90.0                             # boot + attest/emit + upload
+    # boot + attest/emit + upload, plus the watchdog's per-task slack (koth/runtime.py): the
+    # watchdog waits budget+5s before abandoning, so the worst case is the budget plus that slack.
+    overhead = 90.0 + n_per_bench * n_bench * 5.0
     need = RUN_BUDGET_S + overhead
     budget = EPOCH_BLOCKS * block_s
     frac = need / budget

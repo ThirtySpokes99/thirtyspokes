@@ -251,11 +251,38 @@ class KOTHRuntime:
             # Arm this task's slice of the RUN budget. run_cascade stops ESCALATING past it; the
             # armed deadline is what stops a single in-flight call from blowing through it, which is
             # the half that actually killed epochs (76738: one call hung ~900s).
+            import threading
             import time as _t
             budget = H.task_budget(run_deadline - _t.monotonic(), len(tasks) - i - 1)
             proxy.task_deadline = _t.monotonic() + budget
-            answer, used = H.run_cascade(rung, t["prompt"], by_name[t["benchmark"]], pool, order,
-                                         rec_call, p, budget_s=budget)
+
+            # A WATCHDOG, NOT A REQUEST. `task_deadline` asks the provider client to bound itself,
+            # and epoch 76751 showed it does not always comply: an httpx read timeout does not fire
+            # on a response that trickles, so the call neither returned nor timed out and the epoch
+            # died with five of six tasks done. A bound that depends on the thing being bounded is
+            # not a bound. This one is enforced from outside the call and holds whatever the cause —
+            # HTTP, DNS, TLS, a wedged socket.
+            #
+            # The worker is a DAEMON thread: an abandoned call may never return, and a non-daemon
+            # thread would block interpreter exit, hanging the very proof emission this protects.
+            box: dict = {}
+
+            def _cascade(_box=box, _rung=rung, _task=t, _budget=budget):
+                try:
+                    _box["r"] = H.run_cascade(_rung, _task["prompt"], by_name[_task["benchmark"]],
+                                              pool, order, rec_call, p, budget_s=_budget)
+                except Exception as exc:            # noqa: BLE001 — a dead task is not a dead epoch
+                    _box["e"] = exc
+
+            worker = threading.Thread(target=_cascade, daemon=True)
+            worker.start()
+            worker.join(timeout=budget + 5.0)       # slack for the cascade's own bookkeeping
+            if worker.is_alive():
+                proxy.generation += 1               # disown the in-flight call's cost and result
+                print(f"KOTH-WATCHDOG task {i + 1} abandoned after {budget:.0f}s", flush=True)
+                answer, used = "", []
+            else:
+                answer, used = box.get("r", ("", []))
             proxy.task_deadline = None
             results.append(BenchmarkResult(
                 t["benchmark"], t["task_id"], str(answer), proxy.total_cost_usd - c0,

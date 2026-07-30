@@ -3756,3 +3756,31 @@ def test_a_routing_proof_survives_the_enforce_gate(env, monkeypatch):
         expect_weights_hash=proof.weights_hash)
     assert reason is None, f"a routing proof cannot pass the gate: {reason}"
     assert proof.confined, "the proof does not attest that untrusted code was contained"
+
+
+def test_miner_operator_survives_a_transient_chain_error():
+    """The SAME resilience bug lived in two daemons; fixing one did not fix the other.
+
+    `_get_block_number` subscripts a None `response["result"]` when the substrate node returns a
+    partial body. It was guarded in the validator's `run_forever`, and the miner operator's
+    epoch-wait loop was left exposed — a continuous mining run on testnet 526 died to it hours after
+    the validator was fixed. Both daemons poll the same chain over the same network, so a fix that
+    covers one and not the other only moves where the outage happens.
+    """
+    from thirtyspokes.koth.gcp_operator import _wait_for_epoch
+
+    class Flaky:
+        calls = 0
+
+        def current_block(self):
+            Flaky.calls += 1
+            if Flaky.calls <= 2:
+                raise TypeError("'NoneType' object is not subscriptable")
+            return 100          # epoch 1, 100 blocks remaining
+
+        def beacon(self, epoch):
+            return "beacon"
+
+    epoch, nonce = _wait_for_epoch(Flaky(), last_epoch=0, min_blocks=10, poll=0.01)
+    assert epoch == 1 and nonce, "the operator did not recover from a transient chain error"
+    assert Flaky.calls == 3, f"expected 3 attempts, got {Flaky.calls}"

@@ -170,11 +170,21 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
 def _wait_for_epoch(chain: BittensorChain, last_epoch: int | None,
                     min_blocks: int, poll: float) -> tuple[int, str]:
     while True:
-        block = chain.current_block()
-        epoch = block // EPOCH_BLOCKS
-        remaining = EPOCH_BLOCKS - block % EPOCH_BLOCKS
-        if epoch != last_epoch and remaining >= min_blocks:
-            return epoch, epoch_nonce(epoch, chain.beacon(epoch))
+        # A TRANSIENT CHAIN RPC FAILURE MUST NOT KILL THE MINER. Same defect, same signature as the
+        # one fixed in the validator's run_forever, in a second place nobody checked: the substrate
+        # node returns a body with no "result", bittensor's `_get_block_number` subscripts None, and
+        # the TypeError escapes here — killing a continuous mining run outright. Observed on testnet
+        # 526 after the validator fix, which is why "I fixed that bug" was not the same as "that bug
+        # is fixed". A miner that cannot read a block should wait and ask again.
+        try:
+            block = chain.current_block()
+            epoch = block // EPOCH_BLOCKS
+            remaining = EPOCH_BLOCKS - block % EPOCH_BLOCKS
+            if epoch != last_epoch and remaining >= min_blocks:
+                return epoch, epoch_nonce(epoch, chain.beacon(epoch))
+        except Exception as exc:                # noqa: BLE001 — chain/network flakiness
+            print(f"[koth-gcp] chain unreadable ({type(exc).__name__}: {str(exc)[:100]}) "
+                  f"— retrying in {poll:.0f}s", flush=True)
         time.sleep(poll)
 
 

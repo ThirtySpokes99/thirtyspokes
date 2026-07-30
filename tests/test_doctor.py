@@ -282,3 +282,30 @@ def test_validator_announces_when_it_is_not_scoring_routing():
     src = inspect.getsource(neuron)
     assert "reference=MISSING" in src, "a silent fallback must announce itself"
     assert "NOT routing" in src
+
+
+def test_build_freshness_catches_a_container_running_stale_code(tmp_path, monkeypatch):
+    """`docker compose restart` reuses the existing image, so a fix can look deployed and not be.
+    It happened twice in one day — once caught only because the runtime measurement had changed, once
+    caught by noticing a log line was missing. When the change does not move the measurement, nothing
+    notices at all."""
+    from thirtyspokes.koth import doctor
+
+    git = tmp_path / ".git"
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "refs" / "heads" / "main").write_text("a" * 40 + "\n")
+    monkeypatch.setenv("KOTH_REPO_ROOT", str(tmp_path))
+
+    monkeypatch.setenv("KOTH_BUILD_COMMIT", "a" * 40)
+    assert doctor.check_build_freshness()[0] == doctor.OK
+
+    monkeypatch.setenv("KOTH_BUILD_COMMIT", "b" * 40)
+    status, _n, detail = doctor.check_build_freshness()
+    assert status == doctor.WARN and "does NOT rebuild" in detail
+
+    monkeypatch.setenv("KOTH_BUILD_COMMIT", "unknown")
+    assert doctor.check_build_freshness()[0] == doctor.WARN
+
+    monkeypatch.delenv("KOTH_BUILD_COMMIT")          # not containerised
+    assert doctor.check_build_freshness()[0] == doctor.OK

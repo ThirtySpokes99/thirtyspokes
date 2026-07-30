@@ -3,6 +3,13 @@
 # See docs/OPERATING.md §Validating.
 FROM python:3.12-slim
 
+# STAMP THE SOURCE COMMIT INTO THE IMAGE. `docker compose restart` reuses the existing image, so a
+# container can quietly run code older than the checkout — twice in one day a fix looked deployed and
+# was not, and the startup preflight only notices when the runtime MEASUREMENT changed. With this the
+# daemon prints what it is actually running and the preflight can compare it to the repo.
+ARG KOTH_BUILD_COMMIT=unknown
+ENV KOTH_BUILD_COMMIT=${KOTH_BUILD_COMMIT}
+
 # Native build deps for bittensor / cryptography / dcap-qvl.
 # If dcap-qvl has no prebuilt wheel for your platform, add the Rust toolchain before the install step:
 #   RUN curl -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"

@@ -9,7 +9,12 @@
 
 services:
   validator:
-    build: .
+    build:
+      context: .
+      args:
+        # `docker compose build` picks this up from the environment; the Makefile/README flow sets it.
+        # Unset simply means "unknown", which the preflight reports rather than pretending it matches.
+        KOTH_BUILD_COMMIT: ${KOTH_BUILD_COMMIT:-unknown}
     image: thirtyspokes-validator:latest
     container_name: thirtyspokes-validator
     restart: unless-stopped

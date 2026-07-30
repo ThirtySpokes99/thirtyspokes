@@ -467,7 +467,7 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
     if not args.skip_preflight:
         from . import doctor
         checks = [doctor.check_slice_agreement(args.n_per_bench), doctor.check_slice_fits_epoch(args.n_per_bench),
-                  doctor.check_code_grading(),
+                  doctor.check_code_grading(), doctor.check_build_freshness(),
                   doctor.check_governance(args.netuid, args.network, args.wallet, args.hotkey)]
         doctor.preflight_or_exit("koth-validator", checks, block=not args.insecure)
 

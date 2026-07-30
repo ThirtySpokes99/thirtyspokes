@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import shutil
 import subprocess
 
@@ -194,6 +195,39 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tup
                   f"on-chain pool ({len(pool)}) != harness ROUTING_POOL ({len(pool_models())}) — "
                   f"decisions would be scored against a ladder miners never saw")
     return _r(OK, "governance", f"measurement {mine[:16]}… pinned, pool {len(pool)} rungs")
+
+
+def check_build_freshness() -> tuple[str, str, str]:
+    """Is the code in this container the code in the checkout?
+
+    `docker compose restart` reuses the existing image, so a fix can look deployed and not be. It bit
+    twice in one day: the v25 cutover (caught only because the runtime measurement had changed) and
+    the reference-fallback marker (caught by noticing the log line was missing). Whenever the change
+    does NOT move the measurement, nothing notices at all.
+    """
+    built = os.environ.get("KOTH_BUILD_COMMIT")
+    if not built:
+        return _r(OK, "build freshness", "not containerised (running from the checkout)")
+    root = os.environ.get("KOTH_REPO_ROOT")
+    if not root:
+        return _r(WARN, "build freshness", f"image built from {built[:12]} — mount the checkout at "
+                                           f"KOTH_REPO_ROOT to compare it with HEAD")
+    head_file = pathlib.Path(root) / ".git" / "HEAD"
+    try:
+        ref = head_file.read_text().strip()
+        if ref.startswith("ref: "):
+            ref = (pathlib.Path(root) / ".git" / ref[5:]).read_text().strip()
+    except OSError as e:                # noqa: BLE001
+        return _r(WARN, "build freshness", f"cannot read HEAD under {root} ({type(e).__name__})")
+    if built == "unknown":
+        return _r(WARN, "build freshness",
+                  f"image carries no commit stamp; checkout is at {ref[:12]} — rebuild with "
+                  f"KOTH_BUILD_COMMIT=$(git rev-parse HEAD) to make staleness visible")
+    if built != ref:
+        return _r(WARN, "build freshness",
+                  f"image built from {built[:12]} but the checkout is at {ref[:12]} — `docker "
+                  f"compose restart` does NOT rebuild; use `up -d --build` if you meant to deploy")
+    return _r(OK, "build freshness", f"image matches the checkout at {ref[:12]}")
 
 
 def render(results: list[tuple[str, str, str]]) -> str:

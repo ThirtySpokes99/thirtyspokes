@@ -159,7 +159,11 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
             # whole suite finishes, so "still working" and "hung" look identical from out here — the
             # reason three healthy runs were killed as hangs and a dead 49-minute epoch could not be
             # placed. Only newly-arrived lines are printed; the serial buffer is re-read from 0.
-            ticks = [ln for ln in serial.splitlines() if ln.startswith("KOTH-TASK ")]
+            # SUBSTRING, not startswith: the serial console prefixes every line with a kernel
+            # timestamp and the emitting process, e.g.
+            #   "[   87.957190] python[427]: KOTH-TASK 1/6 rung=1 rungs_used=1 cost=0.00040"
+            # A prefix match silently echoed nothing while the enclave was printing perfectly.
+            ticks = [ln for ln in serial.splitlines() if "KOTH-TASK " in ln]
             for ln in ticks[shown:]:
                 print(f"[{name}] {ln}", flush=True)
             shown = max(shown, len(ticks))

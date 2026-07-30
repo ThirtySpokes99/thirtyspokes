@@ -233,13 +233,34 @@ pointed at an attacker's hotkey and made to trust the attacker's image.
 GCP C3 TDX guest — the image boots dm-verity-locked, runs the metadata-injected agent with zero egress,
 and an enforcing validator accepts its proof while rejecting a stock CVM):
 
+**v23** (`recipe_commit 923e3a4`, live on testnet 526 as governance record v2):
+
 | | |
 |---|---|
-| UKI sha256 | `4757aaabe0cfef16732da7db6c92043cde55552c379d6048b8c7149fa5daff63` |
-| verity roothash | `4af8c767a28675e05260b4b81d2a95d0dcb3469dd70f8b7e96b80e9bc30edad7` |
-| MRTD | `9bf86e6280ec4282b8b5822d8166410a456cdb720109aa799f0011fa63df1de3ee5e35e293fc410c061433163acb03a6` |
-| **RTMR1** | `6d8893eb9255aad4b52045250f6aaecefbf93163ebcc2b9e3149930314df6c0475c06d1883e77e5aba610f0fee42c796` |
+| UKI sha256 | `ea00013d9960beb99347d016adaa849eddbcc32457f4d5ebf1adccce04be90dc` |
+| verity roothash | `70153883f1f31678f167a14a2da011744db80a6e38a53cc7d8dbad0b2ee733c8` |
+| MRTD | `c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5` |
+| **RTMR1** | `552b2ba09414d292358bc57239a76cbbc9e239d2380115ad7117601d32586cbc67957194734ea075af38d470119293ab` |
 | RTMR2 | `000…0` (zero under direct-UKI boot) |
+| RTMR3 | `80f37f6209cb2457933332875c187528dd6984289f5d2848028dbb88072de99419af4e1f959d8c053e3617475994a044` (derived) |
+
+The v22→v23 rotation is a useful worked example of what each register means. v23 added one `print` per
+task to the enclave runner and nothing else: **RTMR1 changed** (any rootfs byte does that), while MRTD
+(GCP's TDVF, not ours), RTMR2 and RTMR3 (derived from runtime+suite+pool, all unchanged) stayed
+identical — and `runtime_measurement` stayed `c8c5d2ff…`, so accumulated miner evidence was *not*
+reset. If a change of yours moves RTMR3 or the runtime measurement, it is an engine change and every
+miner's evidence resets with it; that is the contract, not a bug to route around.
+
+> **Capturing RTMR1 from the measured image.** It ships no sshd, so the sysfs probe cannot be run
+> inside it. The image's own attested proof is the capture channel — the quote in `proof.quote`
+> `platform_sig` (`tdx:<base64>`) carries MRTD and all four RTMRs. Boot one epoch with the operator,
+> then parse the serial log it saved. Validate any such extractor against a boot of the *currently
+> pinned* image first: it must reproduce the on-chain record exactly before you trust it for a new one.
+
+> **Rotation is a hard cutover.** The record pins exactly ONE `rtmr1`, so the moment you publish, every
+> proof from the previous image is `unapproved_runtime`. Publish and restart your miners back to back,
+> and expect to lose the epoch in between. (Allowing a list of approved RTMR1s would make rotations
+> overlap; today it does not.)
 
 **Distribute the image on HuggingFace** so miners can boot it:
 

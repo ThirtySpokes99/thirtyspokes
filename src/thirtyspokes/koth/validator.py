@@ -803,6 +803,7 @@ class KOTHValidator:
         self._evidence.decay_all()
         weights = {b.name: b.weight for b in self.suite}
         scores: dict[str, float] = {}
+        missed: dict[str, str] = {}          # hotkey -> the miss reason we cleared, for diagnostics
         for hk, ev in evals.items():
             if ev.sh is None:
                 continue                                   # never bound -> stays hard-DQ'd
@@ -813,7 +814,14 @@ class KOTHValidator:
             if reason in _MISS_REASONS:
                 for b in self.suite:
                     acc.add(b.name, self.n_expected, 0.0, 0.0)   # miss = 0 correct (anti-withholding)
-                dq.pop(hk, None)                           # a miss is a candidate, not a hard DQ
+                # A miss is a CANDIDATE, not a hard DQ — it must be able to win back the crown by
+                # mining again. But dropping the reason outright made the miss invisible: the miner
+                # then re-failed on the accumulated floor and the operator saw `below_floor:mmlu`,
+                # which says "your answers are bad" when the truth is "we never received a proof".
+                # That cost hours of live debugging, chasing head quality and eligibility thresholds
+                # while the actual fault was upload timing. Keep the candidacy, keep the diagnosis.
+                missed[hk] = reason
+                dq.pop(hk, None)
             else:                                          # valid verdict this epoch
                 for b, bs in ev.verdict.per_bench.items():
                     acc.add(b, bs.n, bs.acc * bs.n, bs.cost_usd)
@@ -831,7 +839,9 @@ class KOTHValidator:
                 continue
             bad = next((b.name for b in self.suite if acc.bench_acc(b.name) < self.f_min), None)
             if bad is not None:
-                dq[hk] = f"below_floor:{bad}"
+                # name the ROOT cause when this epoch was a miss, not just the symptom it produced
+                dq[hk] = (f"below_floor:{bad}(no valid proof this epoch: {missed[hk]})"
+                          if hk in missed else f"below_floor:{bad}")
                 continue
             # THE ROUTER SCALAR, on the accumulated evidence. No cost tiebreak is subtracted from
             # it: the frontier already prices cost (both baselines are evaluated at the miner's own

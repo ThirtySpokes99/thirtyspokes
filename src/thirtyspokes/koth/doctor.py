@@ -1,0 +1,186 @@
+"""Preflight a deployment before it runs — `orchestra-koth-doctor`.
+
+WHY THIS EXISTS. Bringing the subnet up live surfaced nine bugs, and the expensive ones were not
+logic errors: they were DEPLOYMENT SHAPE. The validator container had no docker client, so the ranked
+benchmark could not be graded. The sandbox bind-mount resolved in the host namespace, so it still
+could not be graded once the client was there. The slice size was set to a value at which no miner
+could finish inside an epoch. Miner and validator disagreed on that slice, disqualifying everyone.
+The published image did not match the measurements pinned on chain.
+
+Every one of those is checkable in seconds and each cost hours to find, because the symptom always
+appeared somewhere else: a grading failure looked like a bad miner, a slice mismatch looked like
+cheating, an unreadable image looked like an unapproved runtime. Each check below exists because
+something upstream lied about the cause.
+
+Read-only and cheap: no inference, no chain writes, no VMs. Run it before the daemons.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+
+OK, WARN, FAIL = "ok", "warn", "FAIL"
+
+
+def _r(status: str, name: str, detail: str) -> tuple[str, str, str]:
+    return (status, name, detail)
+
+
+def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
+    """The constraint that made mining IMPOSSIBLE and took two wasted TDX runs to find.
+
+    A proof completed after its epoch expires carries a stale nonce and can never validate — it is
+    unrecoverable, not merely late. So slice x benchmarks x per-call latency must fit one epoch.
+    """
+    from .benchmarks import real_suite
+    from .epoch import EPOCH_BLOCKS
+    per_call_s, block_s = 90.0, 12.0            # measured on GCP C3 against the pinned pool
+    n_bench = len(real_suite())
+    need = n_per_bench * n_bench * per_call_s
+    budget = EPOCH_BLOCKS * block_s
+    frac = need / budget
+    d = (f"{n_per_bench} x {n_bench} benchmarks x ~{per_call_s:.0f}s = ~{need:.0f}s vs "
+         f"~{budget:.0f}s/epoch ({frac:.0%} of the window)")
+    if frac > 1.0:
+        return _r(FAIL, "slice fits epoch", d + " — NO valid proof can ever be produced")
+    if frac > 0.6:
+        return _r(WARN, "slice fits epoch", d + " — lands only when latency is good")
+    return _r(OK, "slice fits epoch", d)
+
+
+def check_slice_agreement() -> tuple[str, str, str]:
+    """Miner, validator, operator and reference cron store ONE setting in four places. A mismatch is
+    `unexpected_task` — a DQ — for every miner, and each side looks individually correct."""
+    import inspect
+    import pathlib
+    import re
+
+    from .miner import KOTHMinerNeuron
+    vals = {"miner class": inspect.signature(KOTHMinerNeuron.__init__).parameters["n_per_bench"].default}
+    here = pathlib.Path(__file__).resolve().parents[3]
+    for label, rel, pat in [
+        ("validator cli", "src/thirtyspokes/koth/neuron.py", r'"--n-per-bench", type=int, default=(\d+)'),
+        ("miner cli", "src/thirtyspokes/koth/miner.py", r'"--n-per-bench", type=int, default=(\d+)'),
+        ("operator cli", "src/thirtyspokes/koth/gcp_operator.py", r'"--n-per-bench", type=int, default=(\d+)'),
+        ("reference cron", "scripts/koth-reference-cron.sh", r"--n-per-bench (\d+)"),
+    ]:
+        f = here / rel
+        if not f.exists():
+            continue
+        m = re.search(pat, f.read_text())
+        if m:
+            vals[label] = int(m.group(1))
+    uniq = set(vals.values())
+    d = ", ".join(f"{k}={v}" for k, v in vals.items())
+    return _r(OK if len(uniq) == 1 else FAIL, "slice agreement", d)
+
+
+def check_code_grading() -> tuple[str, str, str]:
+    """The ranked benchmark is code, graded by running it in a throwaway container. Two independent
+    ways this silently fails, both hit live:
+      * no docker CLI — `docker.io` ships the DAEMON, the client is `docker-cli` (a *Recommends*
+        that --no-install-recommends drops), so the package installs and leaves no binary;
+      * the scratch dir is bind-mounted by PATH, resolved by the DAEMON. Containerised validators
+        talking to the host daemon mount a path that does not exist there, binding nothing.
+    """
+    if shutil.which("docker") is None:
+        return _r(FAIL, "code grading", "no `docker` client on PATH — install docker-cli, not docker.io")
+    try:
+        v = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"],
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return _r(FAIL, "code grading", f"docker client cannot reach a daemon: {v.stderr.strip()[:80]}")
+        server = v.stdout.strip()
+    except Exception as e:      # noqa: BLE001
+        return _r(FAIL, "code grading", f"docker unusable: {type(e).__name__}")
+
+    # the mount must resolve in BOTH namespaces — prove it rather than assume it
+    import tempfile
+    base = os.environ.get("KOTH_GRADE_DIR") or None
+    try:
+        with tempfile.TemporaryDirectory(dir=base) as d:
+            open(os.path.join(d, "probe.txt"), "w").write("koth")
+            r = subprocess.run(["docker", "run", "--rm", "--network", "none",
+                                "-v", f"{d}:/w:ro", "python:3.11-slim", "cat", "/w/probe.txt"],
+                               capture_output=True, text=True, timeout=180)
+        if r.stdout.strip() != "koth":
+            return _r(FAIL, "code grading",
+                      f"daemon {server} reachable but the sandbox mount resolves elsewhere "
+                      f"(set KOTH_GRADE_DIR to a path bind-mounted identically on both sides)")
+    except Exception as e:      # noqa: BLE001
+        return _r(FAIL, "code grading", f"sandbox probe failed: {type(e).__name__}: {str(e)[:60]}")
+    return _r(OK, "code grading", f"daemon {server}, sandbox mount resolves"
+                                  + (f" via KOTH_GRADE_DIR={base}" if base else ""))
+
+
+def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tuple[str, str, str]:
+    """Does the measurement THIS code computes match what the owner pinned on chain? A mismatch means
+    every honest miner is rejected as `unapproved_runtime`, and the symptom points at the miner."""
+    from .runtime import runtime_measurement
+    try:
+        from ..subnet.chain import BittensorChain
+        c = BittensorChain(netuid, wallet, network, hotkey=hotkey)
+        rec = c.owner_measurements() or {}
+    except Exception as e:      # noqa: BLE001
+        return _r(WARN, "governance", f"chain unreadable ({type(e).__name__}) — cannot verify")
+    on_chain = list(rec.get("runtime_measurements") or [])
+    mine = runtime_measurement()
+    if not on_chain:
+        return _r(FAIL, "governance", "no approved-measurement record published")
+    if mine not in on_chain:
+        return _r(FAIL, "governance",
+                  f"this build measures {mine[:16]}… but chain pins {on_chain[0][:16]}… — "
+                  f"every proof from this code would be rejected as unapproved_runtime")
+    pool = list(rec.get("pool_allow_list") or [])
+    from .harness import pool_models
+    if pool and sorted(pool) != sorted(pool_models()):
+        return _r(FAIL, "governance",
+                  f"on-chain pool ({len(pool)}) != harness ROUTING_POOL ({len(pool_models())}) — "
+                  f"decisions would be scored against a ladder miners never saw")
+    return _r(OK, "governance", f"measurement {mine[:16]}… pinned, pool {len(pool)} rungs")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="preflight a ThirtySpokes deployment (read-only)")
+    p.add_argument("--netuid", type=int)
+    p.add_argument("--network", default=os.environ.get("NETWORK", "finney"))
+    p.add_argument("--wallet", default=os.environ.get("VALIDATOR_WALLET", ""))
+    p.add_argument("--hotkey", default=os.environ.get("VALIDATOR_HOTKEY", "default"))
+    p.add_argument("--n-per-bench", type=int, default=None,
+                   help="slice to check (default: the validator CLI's own default)")
+    args = p.parse_args()
+
+    import inspect
+    import re
+    import pathlib
+    n = args.n_per_bench
+    if n is None:
+        src = (pathlib.Path(__file__).resolve().parents[0] / "neuron.py").read_text()
+        m = re.search(r'"--n-per-bench", type=int, default=(\d+)', src)
+        n = int(m.group(1)) if m else 2
+
+    results = [check_slice_agreement(), check_slice_fits_epoch(n), check_code_grading()]
+    if args.netuid and args.wallet:
+        results.append(check_governance(args.netuid, args.network, args.wallet, args.hotkey))
+    else:
+        results.append(_r(WARN, "governance", "skipped — pass --netuid and --wallet to check"))
+
+    print("ThirtySpokes preflight\n")
+    width = max(len(r[1]) for r in results)
+    for status, name, detail in results:
+        mark = {OK: "  ok ", WARN: " warn", FAIL: " FAIL"}[status]
+        print(f"[{mark}] {name:<{width}}  {detail}")
+    bad = [r for r in results if r[0] == FAIL]
+    print()
+    if bad:
+        print(f"{len(bad)} BLOCKING problem(s). Each of these has silently broken a live run before, "
+              f"and the symptom appeared somewhere else.")
+        raise SystemExit(1)
+    print("No blocking problems. Warnings above are worth reading before a long run.")
+
+
+if __name__ == "__main__":
+    main()

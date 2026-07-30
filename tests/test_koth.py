@@ -3784,3 +3784,30 @@ def test_miner_operator_survives_a_transient_chain_error():
     epoch, nonce = _wait_for_epoch(Flaky(), last_epoch=0, min_blocks=10, poll=0.01)
     assert epoch == 1 and nonce, "the operator did not recover from a transient chain error"
     assert Flaky.calls == 3, f"expected 3 attempts, got {Flaky.calls}"
+
+
+def test_doctor_catches_the_deployment_faults_that_broke_live_runs():
+    """The preflight must FAIL on the exact shapes that silently broke testnet 526, or it is theatre.
+
+    Each of these cost hours live because the symptom surfaced somewhere else: an impossible slice
+    looked like miner timeouts, a missing docker client looked like bad miners, a slice mismatch
+    looked like cheating. A check that only passes on a healthy system proves nothing.
+    """
+    import thirtyspokes.koth.doctor as D
+
+    # 1. a slice at which no proof can EVER be produced inside an epoch
+    status, _name, detail = D.check_slice_fits_epoch(16)
+    assert status == D.FAIL, f"doctor accepted an impossible slice: {detail}"
+    assert D.check_slice_fits_epoch(2)[0] == D.OK
+
+    # 2. no docker client -> the RANKED benchmark cannot be graded at all
+    real_which = D.shutil.which
+    try:
+        D.shutil.which = lambda _x: None
+        status, _n, detail = D.check_code_grading()
+        assert status == D.FAIL and "docker-cli" in detail, detail
+    finally:
+        D.shutil.which = real_which
+
+    # 3. all five slice sites must agree; the live default must be self-consistent
+    assert D.check_slice_agreement()[0] == D.OK

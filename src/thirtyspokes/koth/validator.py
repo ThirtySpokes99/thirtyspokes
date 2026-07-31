@@ -645,7 +645,17 @@ class KOTHValidator:
         calls = Counter(r.get("task_id") for r in trace)
         assigned = [t.task_id for b in self.suite
                     for t in b.sample(self.n_per_bench, bench_seed(nonce, epoch, b.name))]
-        if any(calls.get(tid, 0) < 1 for tid in assigned):
+        # ANSWERING without calling is fraud; FAILING without calling is not. The rule used to
+        # require a call on every task, which disqualified the whole proof when the runtime's
+        # watchdog abandoned one — an honest miner whose provider stalled lost the entire epoch, so
+        # the watchdog bought it nothing. Measured on 76768: five tasks answered, the sixth abandoned
+        # after 738s, proof uploaded, and then rejected outright.
+        #
+        # The property worth keeping is narrow: a task that produced an ANSWER must have paid for it.
+        # An empty answer with no call scores zero on that task like any wrong answer, and cannot be
+        # gamed — dropping a task to save cost loses more accuracy than the cost tiebreak can return.
+        answered = {r.task_id: (r.answer or "").strip() for r in proof.results}
+        if any(calls.get(tid, 0) < 1 and answered.get(tid) for tid in assigned):
             return E(dq="no_pool_call")
         # 4. cheap public-artifact audit (bound: we scanned the artifact we downloaded). Source
         #    catches a literal table; weights catch the same table moved into the opaque blob, which

@@ -586,3 +586,27 @@ def test_the_reign_is_order_independent_so_two_validators_cannot_disagree():
     assert len(set(results)) == 1, (
         f"the reign depends on candidate ORDER: {len(set(results))} distinct outcomes across "
         f"permutations of the same facts — two validators would pay different miners")
+
+
+def test_an_abandoned_task_is_a_wrong_answer_not_fraud():
+    """The watchdog's whole purpose is to turn a stalled provider into a lost TASK instead of a lost
+    EPOCH. That failed on 76768: the runtime abandoned task 6 after 738s and uploaded a proof, and
+    the validator rejected the entire proof as `no_pool_call` because that task had no metered call.
+    The miner did everything right and still earned nothing.
+
+    Answering without calling is fraud. Failing without calling is not.
+    """
+    import inspect
+
+    from thirtyspokes.koth import validator as V
+
+    src = inspect.getsource(V)
+    assert "answered.get(tid)" in src, "the rule must key on whether an ANSWER was produced"
+
+    # the guard still bites when an answer appears with no call behind it
+    calls = {"t1": 1, "t2": 0}
+    answered = {"t1": "42", "t2": "1729"}          # t2 answered with no call -> fraud
+    assert any(calls.get(t, 0) < 1 and answered.get(t) for t in ("t1", "t2"))
+
+    answered_empty = {"t1": "42", "t2": ""}        # t2 abandoned, no answer -> honest
+    assert not any(calls.get(t, 0) < 1 and answered_empty.get(t) for t in ("t1", "t2"))

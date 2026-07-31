@@ -174,8 +174,21 @@ def main() -> None:  # pragma: no cover — CLI over live/offline seams
         with open(args.out, "w") as f:
             json.dump(oc, f)
         spent = float(np.asarray(oc["costs"]).sum())
-        print(f"wrote {args.out}: {len(oc['task_ids'])} tasks x {len(oc['models'])} models, "
-              f"${spent:.4f} spent")
+        n = len(oc["task_ids"])
+        print(f"wrote {args.out}: {n} tasks x {len(oc['models'])} models, ${spent:.4f} spent")
+        # SAY WHAT THIS CACHE CAN RESOLVE, BEFORE any head is fitted to it. A miner otherwise
+        # discovers only after paying for a TDX epoch that the difference they were chasing was
+        # smaller than the error bar. Measured on a 48-ask cache: edge over always-cheapest 0.0005
+        # against a sampling error of +/-0.204.
+        held = max(1, int(n * 0.3))
+        res = _wilson_half_width(0.75, held)
+        print(f"  held-out at train time: ~{held} asks -> it can resolve a difference of about "
+              f"{res:.3f}; anything smaller will read as noise")
+        if res > 0.05:
+            need = int(0.75 * 0.25 * (1.96 / 0.05) ** 2 / 0.3)
+            print(f"  ^ to resolve ~0.05 you would need roughly {need} tasks "
+                  f"(--n-per-bench {max(1, need // max(1, len(real_suite())))}). Decide whether the "
+                  f"edge you are chasing is bigger than the bar you can measure.")
         return
 
     with open(args.outcomes) as f:

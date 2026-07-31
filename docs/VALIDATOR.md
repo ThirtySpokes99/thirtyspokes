@@ -75,6 +75,28 @@ rotation takes effect without a restart).
 
 ## Setup + run
 
+**Run the preflight before the daemon.** Every check in it exists because that exact shape silently
+broke a live run, and each cost hours because the symptom always surfaced somewhere else — a grading
+failure looked like bad miners, a slice mismatch looked like cheating, an unreadable image looked
+like an unapproved runtime. It is read-only, needs no chain writes and takes seconds.
+
+```bash
+orchestra-koth-doctor --netuid 526 --network test --wallet validator
+```
+
+It refuses to start the daemon on a blocking problem (`--skip-preflight` overrides, and does not make
+the problem go away). On a fresh server, three of its checks are the ones that bite:
+
+- **`docker` must be the CLIENT.** `apt install docker.io` ships the *daemon*; the client is
+  `docker-cli`, a `Recommends` that `--no-install-recommends` drops — so the package installs
+  cleanly and leaves no `/usr/bin/docker`, and the ranked code benchmark cannot be graded at all.
+- **The sandbox mount must resolve in the DAEMON's namespace.** The grader bind-mounts a scratch
+  directory by path, and the path is resolved by whatever daemon you talk to. A containerised
+  validator using the host daemon mounts a path that does not exist there and binds nothing. Set
+  `KOTH_GRADE_DIR` to a directory mounted identically on both sides.
+- **Mount the checkout at `KOTH_REPO_ROOT`** if you run in a container, or the slice-agreement check
+  can only compare the process against itself and will say so.
+
 ```bash
 uv pip install -e ".[chain,eval,tee]"     # bittensor + huggingface_hub + datasets + dcap-qvl
 # NO LLM key needed: the default grounding mode does ZERO inference — it verifies the miner's
@@ -86,6 +108,19 @@ btcli subnet register --netuid 526 --wallet.name validator --subtensor.network t
 # you need stake + a vpermit to set weights
 orchestra-koth-validator --netuid 526 --network test --wallet validator
 ```
+
+**Do not set `--grace-blocks`.** It defaults to the value the OWNER publishes on chain, and that is
+deliberate: miners size their runs against the published number, so a validator holding its own copy
+drifts from it. Measured here — a compose file defaulted to 50 while governance published 85, every
+`up --force-recreate` silently reverted a hand-set value, and the validator scored seven minutes
+early, disqualifying proofs that met the published deadline as `no_proof` while the log blamed the
+miners. A validator that scores EARLIER than the published grace is now refused at startup.
+
+**One standings publisher.** `--standings-repo` feeds the public dashboard; if a subnet already has a
+validator publishing it, leave the flag off rather than racing it.
+
+**Use a state path of your own** (`--state`). The reign, king baseline and accumulator live there,
+and sharing one file between validators makes them one validator with extra steps.
 It defaults to mainnet (`--network finney`), starts **secure by default**, and refuses to start until
 the owner's measured-image governance is published on-chain.
 
@@ -146,6 +181,23 @@ sign. Every failure path (no reference published, unreachable bucket, bad signat
 another slice) falls back to the absolute scalar rather than stalling: a reference outage is the
 owner's problem and must never cost a miner its epoch. Watch `diagnostics.pool_reference` in
 `standings.json` — `routable: false` means this epoch's traffic was too saturated to score routing on.
+
+## Hardware
+
+Measured on two live validators (one containerised, one on the host):
+
+| | |
+|---|---|
+| CPU | ~0.05% steady — grounding mode runs **zero inference**; it verifies quotes and grades |
+| RAM | 400–600 MB resident, **plus 1 GB per concurrent code grade** (`docker run --memory 1g`) |
+| Disk | ~8 GB — validator image 1.4 GB, HF benchmark cache ~6 GB, grader base 189 MB, state 32 KB |
+| Network | proof/trace JSON from HF + chain RPC every 12s; ~176 MB over several hours |
+| GPU / CVM | **none** — confidential compute is the MINER's requirement, not yours |
+
+**2 vCPU / 4 GB RAM / 40 GB SSD** is comfortable. The constraint that actually scales is grading
+concurrency, and it scales with the number of MINERS, not with your hardware: each code grade is a
+1 GB container, and every miner's ranked tasks must be graded inside one grace window. At a handful
+of miners this is trivially serial; at fifty it is the first thing that will not fit.
 
 ## What you need
 

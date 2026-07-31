@@ -97,6 +97,7 @@ def check_slice_agreement(runtime_n: int | None = None) -> tuple[str, str, str]:
     # a container mount the checkout and get the real check.
     here = pathlib.Path(os.environ.get("KOTH_REPO_ROOT")
                         or pathlib.Path(__file__).resolve().parents[3])
+    checked_sources = 0                      # sources OTHER than this process's own defaults
     for label, rel, pat in [
         ("validator cli", "src/thirtyspokes/koth/neuron.py", r'"--n-per-bench", type=int, default=(\d+)'),
         ("miner cli", "src/thirtyspokes/koth/miner.py", r'"--n-per-bench", type=int, default=(\d+)'),
@@ -109,7 +110,21 @@ def check_slice_agreement(runtime_n: int | None = None) -> tuple[str, str, str]:
         m = re.search(pat, f.read_text())
         if m:
             vals[label] = int(m.group(1))
-    checked_sources = len(vals) - 1          # everything but the in-process miner class default
+            checked_sources += 1
+
+    # ALSO READ WHAT IS ACTUALLY DEPLOYED. This check listed `scripts/koth-reference-cron.sh` and
+    # kept passing after the reference moved to a systemd unit — validating a file nothing runs,
+    # while the live setting sat somewhere it never looked. A check that quietly stops covering the
+    # thing it names is worse than no check, so it now reads the units too when they are present.
+    unit_dir = pathlib.Path(os.environ.get("KOTH_UNIT_DIR", "/etc/systemd/system"))
+    for unit in sorted(unit_dir.glob("koth-*.service")):
+        try:
+            m = re.search(r"--n-per-bench[= ](\d+)", unit.read_text())
+        except OSError:
+            continue
+        if m:
+            vals[f"unit {unit.stem}"] = int(m.group(1))
+            checked_sources += 1
     if runtime_n is not None:
         vals["this process"] = runtime_n
     uniq = set(vals.values())

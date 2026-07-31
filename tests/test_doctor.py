@@ -145,11 +145,18 @@ def test_slice_agreement_admits_when_it_cannot_see_the_other_sources(tmp_path, m
     from thirtyspokes.koth import doctor
 
     monkeypatch.setenv("KOTH_REPO_ROOT", str(tmp_path))     # empty: no CLI/cron files to read
+    monkeypatch.setenv("KOTH_UNIT_DIR", str(tmp_path))      # and no deployed units either
     status, _n, detail = doctor.check_slice_agreement(2)
     assert status == doctor.WARN and "against itself" in detail
 
     # a real disagreement still FAILS, seen or unseen sources notwithstanding
     assert doctor.check_slice_agreement(99)[0] == doctor.FAIL
+
+    # and a DEPLOYED unit counts as a source: the check listed a cron script and kept passing after
+    # the reference moved to systemd, validating a file nothing runs
+    (tmp_path / "koth-reference.service").write_text("ExecStart=x --n-per-bench 2 --loop\n")
+    ok, _n2, d2 = doctor.check_slice_agreement(2)
+    assert ok == doctor.OK and "unit koth-reference=2" in d2
 
 
 def test_a_single_hung_call_cannot_outlive_the_task_budget():

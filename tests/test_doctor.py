@@ -688,3 +688,20 @@ def test_build_freshness_reads_packed_refs(tmp_path, monkeypatch):
     # neither loose nor packed -> say so rather than claim a pass
     (git / "packed-refs").unlink()
     assert doctor.check_build_freshness()[0] == doctor.WARN
+
+
+def test_an_abandoned_task_does_not_fail_grounding_either():
+    """The second half of the same bug. Narrowing `no_pool_call` (76768) left `ungrounded` catching
+    the identical proof by another route on 76816: a watchdog-abandoned task has an empty answer, its
+    token is None, no response matches None, and it reads as 'answered without the pool'.
+
+    An empty answer is not an answer. It scores zero like any wrong one; it is not fraud."""
+    from thirtyspokes.koth.verify import _grounded_one
+
+    # abandoned: no answer, no calls -> honest failure on both paths
+    assert _grounded_one("", [], "code", agent_authored_prompts=False) == (True, "ok")
+    assert _grounded_one("   ", [], "number", agent_authored_prompts=True) == (True, "ok")
+
+    # a REAL answer with no pool call behind it is still ungrounded — the rule keeps its teeth
+    calls = [{"prompt": "q", "response": "unrelated"}]
+    assert _grounded_one("42", calls, "number", agent_authored_prompts=False) == (False, "ungrounded")

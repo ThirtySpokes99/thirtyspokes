@@ -296,6 +296,14 @@ def _grounded_one(answer, calls: list[dict], kind: str,
                 an echo chamber, which is exactly how a memorizer defeats plain grounding.
     Ungrounded— it never appears at all: the agent answered without the pool.
     """
+    # AN EMPTY ANSWER IS NOT AN ANSWER. The runtime's watchdog abandons a task that outruns its
+    # budget, leaving no answer and no calls; that is an honest failure and scores zero like any
+    # wrong answer. Treating it as provenance fraud disqualifies the WHOLE proof, so a miner whose
+    # provider stalled on one task loses the entire epoch — which is exactly what the watchdog exists
+    # to prevent. Measured twice: 76768 via `no_pool_call`, then 76816 via `ungrounded` after only
+    # the first rule was narrowed.
+    if not (answer or "").strip():
+        return True, "ok"
     tok = answer_token(answer, kind)
     # Only meaningful where the agent WRITES the prompts. On the routing path it does not: the
     # harness sends the owner's task text verbatim and the miner supplies nothing but a rung index,

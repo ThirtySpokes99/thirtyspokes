@@ -287,7 +287,8 @@ def answer_token(text, kind: str):
 _PROVENANCE_KINDS = frozenset({"number", "patch"})
 
 
-def _grounded_one(answer, calls: list[dict], kind: str) -> tuple[bool, str]:
+def _grounded_one(answer, calls: list[dict], kind: str,
+                  agent_authored_prompts: bool = True) -> tuple[bool, str]:
     """Provenance of ONE scored answer, walking that task's calls in order.
 
     Grounded  — the token first appears in a RESPONSE: the pool produced it.
@@ -296,7 +297,14 @@ def _grounded_one(answer, calls: list[dict], kind: str) -> tuple[bool, str]:
     Ungrounded— it never appears at all: the agent answered without the pool.
     """
     tok = answer_token(answer, kind)
-    check_prompts = kind in _PROVENANCE_KINDS
+    # Only meaningful where the agent WRITES the prompts. On the routing path it does not: the
+    # harness sends the owner's task text verbatim and the miner supplies nothing but a rung index,
+    # so a token appearing in a prompt says only that the QUESTION contained that number.
+    #
+    # Epoch 76799 is what this cost: gsm8k-798's answer is 20 and its question mentions 20, so all
+    # four miners — including an independent one — were disqualified as `laundered` in the same
+    # epoch, the emissions burned, and the log accused every one of them of cheating.
+    check_prompts = agent_authored_prompts and kind in _PROVENANCE_KINDS
     for e in calls:                                   # trace is in call order
         if check_prompts and answer_token(e.get("prompt", ""), kind) == tok:
             return False, "laundered"
@@ -307,7 +315,7 @@ def _grounded_one(answer, calls: list[dict], kind: str) -> tuple[bool, str]:
 
 
 def grounding_check(proof: Proof, trace: list[dict], suite: list[Benchmark], *,
-                    max_ungrounded: float = 0.15) -> tuple[bool, str]:
+                    max_ungrounded: float = 0.15, agent_authored_prompts: bool = True) -> tuple[bool, str]:
     """Each scored answer must DERIVE FROM the pool — not merely appear next to it.
 
     Reads only the proof + the hash-attested trace: no re-execution, no secret bank, no private
@@ -334,7 +342,8 @@ def grounding_check(proof: Proof, trace: list[dict], suite: list[Benchmark], *,
     for r in proof.results:
         total += 1
         ok, why = _grounded_one(r.answer, calls_by_task.get(r.task_id, []),
-                                kind.get(r.benchmark, "number"))
+                                kind.get(r.benchmark, "number"),
+                                agent_authored_prompts=agent_authored_prompts)
         if not ok:
             if why == "laundered":
                 laundered += 1

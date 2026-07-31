@@ -610,3 +610,28 @@ def test_an_abandoned_task_is_a_wrong_answer_not_fraud():
 
     answered_empty = {"t1": "42", "t2": ""}        # t2 abandoned, no answer -> honest
     assert not any(calls.get(t, 0) < 1 and answered_empty.get(t) for t in ("t1", "t2"))
+
+
+def test_a_question_containing_its_own_answer_is_not_laundering():
+    """Epoch 76799 disqualified ALL FOUR miners — three of mine and one independent — as `laundered`
+    in the same epoch, burned the emissions, and the log accused every one of them of cheating.
+
+    gsm8k-798's answer is 20 and its question mentions 20. `extract_number` takes the last number,
+    found it in the prompt, and concluded the agent had fed the pool an answer it already held. On
+    the ROUTING path that inference is impossible: the harness sends the owner's task text verbatim
+    and the miner supplies only a rung index, so it never authors a prompt at all.
+    """
+    from thirtyspokes.koth.verify import _grounded_one
+
+    calls = [{"prompt": "Billy earns $20 more than Sally. How much...?", "response": "The answer is 20"}]
+
+    # free-agent path: the agent DID write that prompt, so prompt-provenance still applies
+    assert _grounded_one("20", calls, "number", agent_authored_prompts=True) == (False, "laundered")
+
+    # routing path: the prompt is the owner's question, so this is just a question containing its
+    # own answer — and the token does appear in the response, which is what grounding means
+    assert _grounded_one("20", calls, "number", agent_authored_prompts=False) == (True, "ok")
+
+    # answering without the pool is still caught on BOTH paths — the fix narrows one rule, not all
+    no_pool = [{"prompt": "Billy earns $20 more than Sally.", "response": "I am not sure."}]
+    assert _grounded_one("20", no_pool, "number", agent_authored_prompts=False) == (False, "ungrounded")

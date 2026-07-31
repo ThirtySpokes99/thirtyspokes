@@ -679,7 +679,13 @@ class KOTHValidator:
                 return E(dq=f"audit_error:{type(e).__name__}")
             audit = (claimed, fresh, n_c, n_f)
         else:
-            ok_g, why_g = grounding_check(proof, trace, self.suite)
+            # A ROUTING proof's prompts are the owner's task text, sent verbatim by the harness —
+            # the miner cannot author one, so prompt-provenance ("laundered") cannot indicate
+            # misbehaviour and only fires when a question happens to contain its own answer.
+            from .harness import HARNESS_VERSION
+            routing = proof.source_hash == hash_source(HARNESS_VERSION)
+            ok_g, why_g = grounding_check(proof, trace, self.suite,
+                                          agent_authored_prompts=not routing)
             if not ok_g:
                 return E(dq=why_g)
             # copy-dedup fingerprint (no re-execution either way). On the ROUTER path the answers are

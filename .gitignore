@@ -24,3 +24,8 @@ wallets/
 
 # OS
 .DS_Store
+
+# validator runtime state: contains hotkeys and scores, never belongs in git
+koth_validator_state.json
+*_validator_state.json
+state.json

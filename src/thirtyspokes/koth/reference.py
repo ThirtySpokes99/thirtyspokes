@@ -247,7 +247,16 @@ def _loop(args, chain, current_epoch) -> None:
         argv = [a for a in sys.argv[1:] if a != "--loop"]
         argv += ["--epoch", str(epoch), "--deadline-s", f"{deadline:.0f}"]
         print(f"=== epoch {epoch}: {deadline:.0f}s until it must be published ===", flush=True)
-        subprocess.run([sys.argv[0], *argv], check=False)
+        # BOUND THE CHILD. Its own --deadline-s governs the measurement, but a wedge anywhere else in
+        # it (a hung upload, a stuck chain RPC) would park this loop forever — and systemd would see
+        # a live process and never restart it, so every later epoch silently loses its reference.
+        # That is precisely the failure class this loop was written to fix, so it must not reintroduce
+        # it one level up.
+        try:
+            subprocess.run([sys.argv[0], *argv], check=False, timeout=deadline + 180.0)
+        except subprocess.TimeoutExpired:
+            print(f"[koth-reference] epoch {epoch} run exceeded {deadline + 180.0:.0f}s and was "
+                  f"abandoned; moving to the next epoch", flush=True)
         last = epoch
 
 

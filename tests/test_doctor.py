@@ -504,3 +504,17 @@ def test_every_created_vm_carries_a_cloud_enforced_lifetime():
     # ...and it must not be able to cut a legitimate run short: the operator's own attempt deadline
     # is 900s, so the cloud bound has to sit comfortably above it
     assert gcp_operator.MAX_VM_MINUTES * 60 > 900 * 1.5
+
+
+def test_the_reference_loop_bounds_its_own_child():
+    """The loop exists to stop a run outliving its epoch. If the child can wedge the LOOP, every
+    later epoch silently loses its reference — and systemd sees a live process, so nothing restarts.
+    Reintroducing the bug one level up is the easiest mistake to make here."""
+    import inspect
+
+    from thirtyspokes.koth import reference
+
+    src = inspect.getsource(reference._loop)
+    assert "timeout=deadline" in src, "the child run must be bounded"
+    assert "TimeoutExpired" in src and "moving to the next epoch" in src, (
+        "a wedged child must cost one epoch, not every epoch after it")

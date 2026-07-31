@@ -66,6 +66,18 @@ def build_outcomes(suite, n_per_bench: int, backend, *, seed: int = 0,
             "costs": C.tolist(), "verifier_ok": V.tolist()}
 
 
+def _wilson_half_width(p: float, n: int, z: float = 1.96) -> float:
+    """Half-width of the 95% Wilson interval — how much the held-out figure could move on sampling
+    alone. Reported so a miner can see that a 48-ask cache says almost nothing."""
+    if n <= 0:
+        return 1.0
+    p = min(max(p, 0.0), 1.0)
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return float(min(1.0, max(half, abs(centre - p) + half)))
+
+
 def train_head(outcomes: dict, *, hidden: int = H.DEFAULT_HIDDEN, lam: float = 0.5,
                seed: int = 0, iters: int = 600, holdout: float = 0.3) -> tuple[bytes, dict]:
     """Fit a head to the best ladder entry point per ask, and report HELD-OUT decision quality.
@@ -118,6 +130,15 @@ def train_head(outcomes: dict, *, hidden: int = H.DEFAULT_HIDDEN, lam: float = 0
         "always_cheapest": float(obj[te, 0].mean()),
         "router": float(got.mean()),
         "oracle": float(best.mean()),
+        # HOW MUCH THIS NUMBER IS WORTH. Every figure above is measured on `n_holdout` asks drawn
+        # from whatever cache you built, while you will be scored on fresh nonce-drawn asks from the
+        # full pool. Two things then bite, and neither is visible in the numbers themselves:
+        #   * SAMPLING — a small holdout gives a wide interval. This is that width (Wilson, 95%).
+        #   * REPRESENTATIVENESS — a small cache can be systematically easier than the live pool.
+        #     Measured on a real 48-ask cache: held-out accuracy read 1.00/1.00/1.00 while the same
+        #     head delivered 0.63/0.75/0.75 live. That gap is NOT overfitting (held-out beat
+        #     in-sample); the cache was simply easier than the pool it was sampled from.
+        "holdout_ci95": float(_wilson_half_width(float(got.mean()), len(te))),
     }
     return H.save_head(theta, hidden), stats
 
@@ -169,6 +190,15 @@ def main() -> None:  # pragma: no cover — CLI over live/offline seams
     print(f"  regret vs oracle  {stats['regret_vs_oracle']:.4f}")
     print(f"  router {stats['router']:+.4f}  vs always-cheapest {stats['always_cheapest']:+.4f}"
           f"  vs oracle {stats['oracle']:+.4f}")
+    ci = stats["holdout_ci95"]
+    print(f"  sampling error    +/-{ci:.4f} on {stats['n_holdout']} held-out asks (95%)")
+    if ci > abs(stats["router"] - stats["always_cheapest"]):
+        print("  ^ WIDER THAN YOUR EDGE over always-cheapest: this cache cannot tell whether the "
+              "head helps. Collect more asks before spending a TDX epoch on it.")
+    if stats["n_holdout"] < 100:
+        print(f"  ^ and a {stats['n_train'] + stats['n_holdout']}-ask cache may simply be EASIER "
+              "than the live pool. Measured once: held-out read 1.00/1.00/1.00 while the same head "
+              "delivered 0.63/0.75/0.75 live — not overfitting, just an unrepresentative sample.")
     if stats["router"] <= stats["always_cheapest"]:
         print("  WARNING: your head does not beat always entering at the cheapest rung. Shipping it "
               "would spend more for no gain — retrain, or check that your outcomes have a real "

@@ -10,6 +10,7 @@ validator needs to read commitments + set weights.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -300,6 +301,19 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
             self.subtensor.burned_register(wallet=self.wallet, netuid=self.netuid,
                                            wait_for_inclusion=True, wait_for_finalization=True),
             "burned registration")
+        # VERIFY THE EFFECT, NOT THE RETURN VALUE. Measured: registering with a password-protected
+        # coldkey printed `DecryptionError("Wrong password")` and STILL returned truthy, so the
+        # check above passed and the caller believed a hotkey was registered that was not. A uid is
+        # the only thing that actually says it worked, and everything downstream — commits, proofs,
+        # weights — silently does nothing without one.
+        for _ in range(10):
+            if any(h == hotkey for h in self.hotkeys().values()):
+                return
+            time.sleep(3.0)
+        raise RuntimeError(
+            f"burned_register reported success but {hotkey[:16]}… has no uid on netuid "
+            f"{self.netuid}. A password-protected coldkey is the usual cause: the SDK logs the "
+            f"decryption failure and returns success anyway.")
 
     def current_block(self) -> int:
         return int(self.subtensor.get_current_block())

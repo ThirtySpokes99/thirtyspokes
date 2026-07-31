@@ -664,3 +664,27 @@ def test_the_attempt_deadline_cannot_truncate_a_run_that_was_about_to_succeed():
     from thirtyspokes.koth.epoch import EPOCH_BLOCKS
     room = _attempt_deadline(value, 85, 100 * EPOCH_BLOCKS, 100)
     assert room < value, "the published grace should bind before the static ceiling"
+
+
+def test_build_freshness_reads_packed_refs(tmp_path, monkeypatch):
+    """A repack — `git gc`, or a history rewrite — moves refs out of refs/heads/ into packed-refs.
+    Reading only the loose path then fails, so the check went blind exactly when history changed,
+    which is when it matters most. Observed after purging a file from this repo's history."""
+    from thirtyspokes.koth import doctor
+
+    sha = "c" * 40
+    git = tmp_path / ".git"
+    git.mkdir()
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "packed-refs").write_text(f"# pack-refs with: peeled fully-peeled sorted\n{sha} refs/heads/main\n")
+    monkeypatch.setenv("KOTH_REPO_ROOT", str(tmp_path))
+
+    monkeypatch.setenv("KOTH_BUILD_COMMIT", sha)
+    assert doctor.check_build_freshness()[0] == doctor.OK, "packed refs must resolve"
+
+    monkeypatch.setenv("KOTH_BUILD_COMMIT", "d" * 40)
+    assert doctor.check_build_freshness()[0] == doctor.WARN, "a stale image must still be caught"
+
+    # neither loose nor packed -> say so rather than claim a pass
+    (git / "packed-refs").unlink()
+    assert doctor.check_build_freshness()[0] == doctor.WARN

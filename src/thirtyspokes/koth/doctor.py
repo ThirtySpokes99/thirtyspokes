@@ -243,11 +243,24 @@ def check_build_freshness() -> tuple[str, str, str]:
     if not root:
         return _r(WARN, "build freshness", f"image built from {built[:12]} — mount the checkout at "
                                            f"KOTH_REPO_ROOT to compare it with HEAD")
-    head_file = pathlib.Path(root) / ".git" / "HEAD"
+    git = pathlib.Path(root) / ".git"
     try:
-        ref = head_file.read_text().strip()
+        ref = (git / "HEAD").read_text().strip()
         if ref.startswith("ref: "):
-            ref = (pathlib.Path(root) / ".git" / ref[5:]).read_text().strip()
+            name = ref[5:]
+            loose = git / name
+            if loose.exists():
+                ref = loose.read_text().strip()
+            else:
+                # PACKED REFS. A repack — or any `git gc`, or a history rewrite — moves refs out of
+                # refs/heads/ into packed-refs, and reading only the loose path then fails. The check
+                # went blind exactly when history changed, which is when it matters most.
+                packed = (git / "packed-refs").read_text() if (git / "packed-refs").exists() else ""
+                ref = next((ln.split()[0] for ln in packed.splitlines()
+                            if not ln.startswith(("#", "^")) and ln.rstrip().endswith(" " + name)), "")
+                if not ref:
+                    return _r(WARN, "build freshness",
+                              f"{name} is neither loose nor in packed-refs under {root}")
     except OSError as e:                # noqa: BLE001
         return _r(WARN, "build freshness", f"cannot read HEAD under {root} ({type(e).__name__})")
     if built == "unknown":

@@ -43,8 +43,18 @@ and when a cheap answer should not be believed.
 Training is free and takes seconds — the head is ~6K parameters. What costs money is the **training
 data**: what every pool model would have produced on each task.
 
+**Size the cache before you trust anything it tells you.** The live slice is drawn fresh from ~1000
+asks per benchmark each epoch; a cache is a sample of that, and a small one is both noisy AND
+systematically easier. Measured on a real 48-ask cache: the head's HELD-OUT accuracy read
+1.00/1.00/1.00 while the same head delivered 0.63/0.75/0.75 live — that is not overfitting (held-out
+beat in-sample), the cache was just not representative. On that same cache the head's edge over
+always-cheapest was 0.0005 against a sampling error of ±0.204: the data could not tell whether the
+head helped at all. `train_head` now prints that interval and says so; if it warns, collect more asks
+rather than spending a TDX epoch to find out.
+
 ```bash
 # 1. Run the pinned pool over suite tasks. YOU pay for this; the data is yours and reusable.
+#    --n-per-bench 40 gives 120 asks; treat that as a floor, not a target.
 uv run orchestra-koth-train build --n-per-bench 40 --out outcomes.json
 
 # 2. Fit a head. Scored HELD OUT, and against the baseline that matters.

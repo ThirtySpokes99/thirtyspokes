@@ -635,3 +635,32 @@ def test_a_question_containing_its_own_answer_is_not_laundering():
     # answering without the pool is still caught on BOTH paths — the fix narrows one rule, not all
     no_pool = [{"prompt": "Billy earns $20 more than Sally.", "response": "I am not sure."}]
     assert _grounded_one("20", no_pool, "number", agent_authored_prompts=False) == (False, "ungrounded")
+
+
+def test_the_attempt_deadline_cannot_truncate_a_run_that_was_about_to_succeed():
+    """Epoch 76806: the watchdog abandoned task 6 at its budget, the run COMPLETED at 856s kernel
+    time, and the operator killed it at its 900s deadline before collecting the proof.
+
+    The watchdog made this visible rather than causing it — before, such runs died as hangs, so a
+    full-budget run was never seen finishing. The deadline has to clear the harness worst case with
+    room for GCP provisioning (which precedes the kernel clock, so it is invisible in serial
+    timestamps) and the operator's poll granularity."""
+    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.gcp_operator import _attempt_deadline
+    from thirtyspokes.koth.harness import RUN_BUDGET_S
+
+    import inspect
+    src = inspect.getsource(_attempt_deadline)
+    assert "grace" in src, "the published grace must govern when available"
+
+    tasks = 2 * len(real_suite())
+    worst = RUN_BUDGET_S + tasks * 5 + 40 + 30 + 15      # budget, slack, boot, emit, poll
+    import thirtyspokes.koth.gcp_operator as G
+    default = [a for a in inspect.getsource(G.main).split("\n") if "--attempt-deadline" in a][0]
+    value = float(default.split("default=")[1].split(",")[0])
+    assert value > worst, f"default {value}s does not clear the {worst:.0f}s harness worst case"
+
+    # and the grace-derived cap must still be the binding constraint early in an epoch
+    from thirtyspokes.koth.epoch import EPOCH_BLOCKS
+    room = _attempt_deadline(value, 85, 100 * EPOCH_BLOCKS, 100)
+    assert room < value, "the published grace should bind before the static ceiling"

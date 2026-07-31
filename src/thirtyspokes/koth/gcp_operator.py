@@ -307,11 +307,12 @@ def main() -> None:  # pragma: no cover — real GCP/chain/HF operator
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--min-blocks", type=int, default=50,
                         help="do not start an epoch with fewer blocks remaining")
-    parser.add_argument("--attempt-deadline", type=float, default=900,
-                        help="abandon a VM after this long. Keep it UNDER the validators' grace "
-                             "(--grace-blocks x 12s): a run that finishes after the grace point is "
-                             "unscorable, so waiting longer only burns the VM. Sized for the "
-                             "harness RUN_BUDGET_S plus boot and upload.")
+    parser.add_argument("--attempt-deadline", type=float, default=1050,
+                        help="hard cap on one attempt. Normally the PUBLISHED GRACE governs instead "
+                             "(see _attempt_deadline), which is the number that actually matters; "
+                             "this is only the ceiling when governance publishes none. Keep it above "
+                             "the harness worst case or it truncates runs that were about to "
+                             "succeed: RUN_BUDGET_S + watchdog slack + boot + emit + poll latency.")
     parser.add_argument("--poll", type=float, default=15)
     parser.add_argument("--output", default="logs/koth-gcp-operator")
     parser.add_argument("--strict", action="store_true",

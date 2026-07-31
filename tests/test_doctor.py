@@ -471,3 +471,19 @@ def test_a_missing_reference_is_not_cached_forever():
         assert read(50, "n") is not None and calls["n"] == 2, "a HIT is still cached"
     finally:
         reference.fetch = monkey
+
+
+def test_the_operator_reaps_vms_a_crash_left_behind():
+    """A SIGKILLed operator cannot run its `finally`, so its CVM keeps billing. The per-attempt
+    cleanup only removes the SAME name, so once the epoch advances the orphan is never touched.
+    A fault-injection restart found two of them still running seven hours later."""
+    import inspect
+
+    from thirtyspokes.koth import gcp_operator
+
+    src = inspect.getsource(gcp_operator.reap_orphans)
+    assert "instances" in src and "list" in src, "must enumerate, not guess names"
+    # scoped to THIS miner's own hash prefix, so it can never delete another operator's VM
+    assert "^koth-{prefix}-" in src or "name~^koth-" in src
+    # and it must be called at startup, where it can see orphans from earlier epochs
+    assert "reap_orphans(args.zone, prefix)" in inspect.getsource(gcp_operator.main)

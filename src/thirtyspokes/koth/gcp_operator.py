@@ -197,6 +197,31 @@ def _attempt_deadline(configured: float, grace_blocks, current_block: int, epoch
     return max(60.0, min(configured, room))
 
 
+def reap_orphans(zone: str, prefix: str) -> list[str]:
+    """Delete CVMs this miner leaked, and return what was reaped.
+
+    `_boot_once` deletes its VM in a `finally`, which does not run when the operator is SIGKILLed —
+    a restart, a crash, an OOM. The per-attempt cleanup only removes the SAME name (same epoch and
+    attempt), so once the epoch advances an orphan is never touched again and bills forever.
+    Measured: a fault-injection restart test found two instances from seven hours earlier, still
+    RUNNING, doing nothing, invisible because nothing watches for them.
+
+    The name prefix is a hash of this miner's own hotkey, so everything matched here is this
+    operator's own leftover — never another miner's, and never the current run, which does not exist
+    yet when this is called.
+    """
+    listed = _gcloud(zone, "compute", "instances", "list",
+                     f"--filter=name~^koth-{prefix}-", "--format=value(name)")
+    names = [n for n in listed.stdout.split() if n] if listed.returncode == 0 else []
+    for n in names:
+        try:
+            _delete_instance(zone, n)
+        except RuntimeError as exc:
+            if "was not found" not in str(exc):
+                print(f"[koth-gcp] could not reap {n}: {exc}", flush=True)
+    return names
+
+
 def _wait_for_epoch(chain: BittensorChain, last_epoch: int | None,
                     min_blocks: int, poll: float) -> tuple[int, str]:
     while True:
@@ -300,6 +325,13 @@ def main() -> None:  # pragma: no cover — real GCP/chain/HF operator
         raise RuntimeError("owner governance has no pinned pool allow-list")
     hotkey = chain.hotkey_ss58()
     prefix = hashlib.sha256(hotkey.encode()).hexdigest()[:8]
+    # Reap before starting: a previous instance of this operator may have been killed mid-run, and
+    # its VM is still billing. Doing it here (not per attempt) is what makes it reach orphans from
+    # epochs that have already passed.
+    reaped = reap_orphans(args.zone, prefix)
+    if reaped:
+        print(f"[koth-gcp] reaped {len(reaped)} orphaned VM(s) from a previous run: "
+              f"{', '.join(reaped)}", flush=True)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     print(f"[koth-gcp] hotkey={hotkey} repo={repo}@{revision} image={args.image} "

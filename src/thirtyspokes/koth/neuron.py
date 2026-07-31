@@ -446,7 +446,7 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
                    help="start even if the startup preflight finds a blocking problem "
                         "(slice disagreement, ungradeable code benchmark, wrong governance). "
                         "The problem does not go away; you just find it hours later.")
-    p.add_argument("--grace-blocks", type=int, default=0,
+    p.add_argument("--grace-blocks", type=int, default=None,
                    help="F2: score an epoch only N blocks after it opens, so submissions settle and "
                         "decoupled validators agree on presence. Keep N < 100 (epoch length).")
     args = p.parse_args()
@@ -458,6 +458,23 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
             f"[koth-validator] FATAL: --insecure is refused on mainnet ({args.network}). It accepts the "
             "mock TEE and skips the owner's measured-image gate, so miners could forge every score. Use "
             "it only for offline/dev bring-up on a non-mainnet network (e.g. --network test).")
+
+    # ONE SOURCE FOR THE GRACE POINT. The owner publishes it, miners size their runs against it, and
+    # a validator that keeps its own copy WILL drift from it: compose here defaulted to 50 while
+    # governance said 85, so every `compose up --force-recreate` silently reverted a hand-set 85 and
+    # the validator scored seven minutes early, disqualifying proofs that met the published deadline.
+    # Unset now means "use what the owner published", so there is nothing to keep in sync. An
+    # explicit value still wins, and the preflight checks it against the published one.
+    if args.grace_blocks is None:
+        try:
+            _gov = BittensorChain(args.netuid, args.wallet, args.network,
+                                  hotkey=args.hotkey).owner_measurements() or {}
+            args.grace_blocks = int(_gov.get("grace_blocks") or 0)
+            print(f"[koth-validator] grace: using the published {args.grace_blocks} blocks", flush=True)
+        except Exception as exc:      # noqa: BLE001 — an unreadable chain must not block startup
+            args.grace_blocks = 0
+            print(f"[koth-validator] grace: chain unreadable ({type(exc).__name__}), scoring at the "
+                  f"epoch boundary", flush=True)
 
     # PREFLIGHT (koth/doctor.py). A validator that cannot grade the ranked benchmark, or disagrees
     # with the miners about the slice, or measures a runtime the owner never approved, comes up

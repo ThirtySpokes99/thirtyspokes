@@ -66,7 +66,11 @@ services:
       # router scalar: the owner's pool reference for epoch N is published a few minutes into
       # N, so scoring N the instant it opens finds no reference and silently falls back to the
       # absolute scalar -- forever. Must stay < epoch_blocks (100).
-      - --grace-blocks=${GRACE_BLOCKS:-50}
+      # NO --grace-blocks HERE, DELIBERATELY. The validator adopts the grace point the OWNER
+      # publishes on chain, so there is no second copy to drift out of sync. This line used to read
+      # ${GRACE_BLOCKS:-50} while governance published 85, and every `compose up --force-recreate`
+      # silently reverted a hand-set 85 back to 50 — scoring seven minutes early and disqualifying
+      # proofs that met the published deadline. Add the flag back only to override deliberately.
       # --- optional (uncomment to enable) -----------------------------------------------------------
       # anti-grind (F7) + grace (F2) windows — opt-in; calibrate first (docs/VALIDATOR.md):
       # - --commit-window=${COMMIT_WINDOW:-8}

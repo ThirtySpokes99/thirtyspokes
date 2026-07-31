@@ -518,3 +518,30 @@ def test_the_reference_loop_bounds_its_own_child():
     assert "timeout=deadline" in src, "the child run must be bounded"
     assert "TimeoutExpired" in src and "moving to the next epoch" in src, (
         "a wedged child must cost one epoch, not every epoch after it")
+
+
+def test_a_validator_scoring_earlier_than_the_published_grace_is_refused(monkeypatch):
+    """Miners size their runs against the grace the owner publishes. A validator scoring EARLIER
+    misses proofs that met that contract exactly and disqualifies honest miners as `no_proof` — the
+    miner did everything right and the log blames the miner."""
+    from thirtyspokes.koth import doctor
+    from thirtyspokes.koth.harness import pool_models
+    from thirtyspokes.koth.runtime import runtime_measurement
+
+    rec = {"runtime_measurements": [runtime_measurement()], "pool_allow_list": list(pool_models()),
+           "grace_blocks": 85}
+
+    class C:
+        def __init__(self, *a, **k): pass
+        def owner_measurements(self): return rec
+
+    import thirtyspokes.subnet.chain as chain_mod
+    monkeypatch.setattr(chain_mod, "BittensorChain", C)
+
+    assert doctor.check_governance(526, "test", "w", "hk", grace_blocks=85)[0] == doctor.OK
+    status, _n, detail = doctor.check_governance(526, "test", "w", "hk", grace_blocks=50)
+    assert status == doctor.FAIL and "no_proof" in detail
+    # later than published is only a warning: it waits longer, it does not miss anything
+    assert doctor.check_governance(526, "test", "w", "hk", grace_blocks=95)[0] == doctor.WARN
+    # and with no grace passed (e.g. the standalone CLI) the check is unchanged
+    assert doctor.check_governance(526, "test", "w", "hk")[0] == doctor.OK

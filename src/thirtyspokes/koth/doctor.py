@@ -161,7 +161,8 @@ def check_code_grading() -> tuple[str, str, str]:
                                   + (f" via KOTH_GRADE_DIR={base}" if base else ""))
 
 
-def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tuple[str, str, str]:
+def check_governance(netuid: int, network: str, wallet: str, hotkey: str,
+                     grace_blocks: int | None = None) -> tuple[str, str, str]:
     """Does the measurement THIS code computes match what the owner pinned on chain? A mismatch means
     every honest miner is rejected as `unapproved_runtime`, and the symptom points at the miner."""
     from .runtime import runtime_measurement
@@ -182,6 +183,19 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str) -> tup
     # The published grace point is the deadline a proof must beat; RUN_BUDGET_S is sized for it, so a
     # mismatch means every honest miner's run is either wasted (too slow) or needlessly cramped.
     grace = rec.get("grace_blocks")
+    # THE VALIDATOR'S OWN GRACE MUST NOT BE TIGHTER THAN THE PUBLISHED ONE. Miners size their runs
+    # against the number the owner publishes; a validator scoring EARLIER than that misses proofs
+    # that arrived exactly on the contract and disqualifies honest miners as `no_proof`. Scoring
+    # later is harmless — it only waits longer — so that is a warning, not a failure.
+    if grace and grace_blocks is not None and int(grace_blocks) != int(grace):
+        if int(grace_blocks) < int(grace):
+            return _r(FAIL, "governance",
+                      f"this validator scores at {grace_blocks} blocks but the owner publishes "
+                      f"{grace} — it would miss proofs that met the published deadline and DQ "
+                      f"honest miners as no_proof")
+        return _r(WARN, "governance",
+                  f"this validator scores at {grace_blocks} blocks, later than the published "
+                  f"{grace}; harmless, but it disagrees with what miners are told")
     if grace:
         from .harness import RUN_BUDGET_S
         need = RUN_BUDGET_S + 90.0              # boot + attest/emit + upload

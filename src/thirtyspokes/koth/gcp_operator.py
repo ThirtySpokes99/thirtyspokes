@@ -35,6 +35,10 @@ _CHUNK = re.compile(
 )
 _EARLY_FAILURES = ("KOTH-ERROR", "SandboxError", "Traceback (most recent call last)")
 
+# Hard cloud-side lifetime for any CVM this operator creates. Generous against a real run so it never
+# cuts one short; it exists purely so an ABANDONED instance cannot outlive its usefulness.
+MAX_VM_MINUTES = 30
+
 
 def _decode_chunks(serial: str, kind: str) -> str:
     candidates: dict[int, list[tuple[str, str | None]]] = {}
@@ -140,6 +144,13 @@ def _boot_once(*, zone: str, image: str, machine_type: str, name: str, epoch: in
             f"--machine-type={machine_type}", "--confidential-compute-type=TDX",
             "--maintenance-policy=TERMINATE", f"--image={image}",
             "--network-interface=nic-type=GVNIC", "--boot-disk-size=50GB",
+            # A BOUND THE CLOUD ENFORCES, because every miner-side cleanup has a hole: the `finally`
+            # below does not run on SIGKILL, and the startup reaper only helps if the operator comes
+            # back at all — a dead host, a disabled unit, or an uninstalled miner leaves the VM
+            # billing forever. Measured: two instances ran seven hours after the operator that made
+            # them was killed. 30 minutes is well past a legitimate run (the attempt deadline is 900s
+            # plus boot), so this can only ever catch an abandoned one.
+            f"--max-run-duration={MAX_VM_MINUTES}m", "--instance-termination-action=DELETE",
             f"--metadata={metadata}", f"--metadata-from-file={files}", timeout=180,
         )
         if created.returncode != 0:

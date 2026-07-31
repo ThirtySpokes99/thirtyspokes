@@ -487,3 +487,20 @@ def test_the_operator_reaps_vms_a_crash_left_behind():
     assert "^koth-{prefix}-" in src or "name~^koth-" in src
     # and it must be called at startup, where it can see orphans from earlier epochs
     assert "reap_orphans(args.zone, prefix)" in inspect.getsource(gcp_operator.main)
+
+
+def test_every_created_vm_carries_a_cloud_enforced_lifetime():
+    """Miner-side cleanup has a hole no miner-side code can close: `finally` does not run on SIGKILL,
+    and the startup reaper only helps if the operator comes back. A dead host or an uninstalled miner
+    leaves the CVM billing forever — two ran for seven hours after the operator that made them died.
+
+    The cloud bound is the only layer that survives the miner disappearing entirely."""
+    import inspect
+
+    from thirtyspokes.koth import gcp_operator
+
+    src = inspect.getsource(gcp_operator._boot_once)
+    assert "--max-run-duration" in src and "instance-termination-action=DELETE" in src
+    # ...and it must not be able to cut a legitimate run short: the operator's own attempt deadline
+    # is 900s, so the cloud bound has to sit comfortably above it
+    assert gcp_operator.MAX_VM_MINUTES * 60 > 900 * 1.5

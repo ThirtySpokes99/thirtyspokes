@@ -552,3 +552,37 @@ def test_a_validator_scoring_earlier_than_the_published_grace_is_refused(monkeyp
     assert doctor.check_governance(526, "test", "w", "hk", grace_blocks=95)[0] == doctor.WARN
     # and with no grace passed (e.g. the standalone CLI) the check is unchanged
     assert doctor.check_governance(526, "test", "w", "hk")[0] == doctor.OK
+
+
+def test_the_reign_is_order_independent_so_two_validators_cannot_disagree():
+    """Two validators only pay the same miner if they rank identically from the same facts.
+
+    They receive candidates in whatever order their own chain reads and downloads produced, so any
+    reliance on input order — a sort keyed on score alone, a set iteration — would make the winner
+    depend on which validator scored. That divergence would be silent: each validator's own log looks
+    correct, and miners are simply paid differently depending on who counted.
+
+    Observed agreeing live on epochs 76765-76767; this pins it as an invariant rather than luck.
+    """
+    import itertools
+
+    from thirtyspokes.reign import Reign, Submission
+
+    # deliberately includes an exact score TIE, which is where input order would leak through
+    subs = [
+        Submission(miner_id="a", hotkey="hkA", commit_block=100, score=0.50),
+        Submission(miner_id="b", hotkey="hkB", commit_block=90, score=0.50),
+        Submission(miner_id="c", hotkey="hkC", commit_block=120, score=0.75),
+        Submission(miner_id="d", hotkey="hkD", commit_block=80, score=0.10),
+    ]
+    live = {s.miner_id for s in subs}
+
+    results = []
+    for perm in itertools.permutations(subs):
+        r = Reign()
+        out = r.update(list(perm), deregistered=set(), live=live)
+        results.append((tuple(out.slots), tuple(sorted(out.weights.items())), out.coronation))
+
+    assert len(set(results)) == 1, (
+        f"the reign depends on candidate ORDER: {len(set(results))} distinct outcomes across "
+        f"permutations of the same facts — two validators would pay different miners")

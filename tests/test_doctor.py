@@ -782,3 +782,21 @@ def test_the_preflight_always_terminates_even_when_the_chain_does_not(monkeypatc
 
     # and a healthy read still passes its value through
     assert doctor._bounded(lambda: 42) == (42, None)
+
+
+def test_an_unknown_network_name_blocks_instead_of_quietly_disabling_every_chain_check():
+    """`NETWORK=mainnet` in a live `.env` — and mainnet is called `finney`.
+
+    Worse than a hard failure: an unknown name fails DNS inside `Subtensor(...)`, both chain checks
+    catch it and downgrade to "cannot check", warnings never block, and the preflight prints "no
+    blocking problems" having verified neither governance nor the reference.
+    """
+    from thirtyspokes.koth import doctor
+
+    status, _n, detail = doctor.check_network_name("mainnet")
+    assert status == doctor.FAIL
+    assert "finney" in detail, "must say what the right name is, not just that this one is wrong"
+
+    assert doctor.check_network_name("finney")[0] == doctor.OK
+    assert doctor.check_network_name("test")[0] == doctor.OK
+    assert doctor.check_network_name("wss://my.endpoint")[0] == doctor.FAIL

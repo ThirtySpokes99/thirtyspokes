@@ -328,6 +328,28 @@ def check_reference_freshness(netuid: int, network: str, wallet: str, hotkey: st
     return _r(OK, "reference", f"epoch {latest} published, chain at {now}")
 
 
+#: Bittensor's own names for the chains. "mainnet" is NOT one of them — the SDK treats an unknown
+#: value as a hostname and dies resolving it.
+KNOWN_NETWORKS = ("finney", "test", "local", "archive", "subvortex")
+
+
+def check_network_name(network: str) -> tuple[str, str, str]:
+    """Is `--network` a name the SDK knows? Mainnet is `finney`; `mainnet` is not a network.
+
+    This check exists because getting it wrong is WORSE than a hard failure here. An unknown name
+    fails DNS inside `Subtensor(...)`, both chain checks below catch the exception and downgrade to
+    "chain unreadable — cannot check", and warnings never block. The preflight then prints "no
+    blocking problems" having verified neither governance nor the reference — the two things it is
+    most needed for. Found in a live `.env` as `NETWORK=mainnet`, which `main()` uses as the default.
+    """
+    if network in KNOWN_NETWORKS:
+        return _r(OK, "network", network)
+    hint = " — mainnet is called `finney`" if network.lower() in ("mainnet", "main") else ""
+    return _r(FAIL, "network",
+              f"{network!r} is not a bittensor network{hint}. Every chain check would report "
+              f"'unreadable' and pass as a warning, so this preflight would verify nothing.")
+
+
 def check_build_freshness() -> tuple[str, str, str]:
     """Is the code in this container the code in the checkout?
 
@@ -424,7 +446,7 @@ def main() -> None:
         n = int(m.group(1)) if m else 2
 
     results = [check_slice_agreement(args.n_per_bench), check_slice_fits_epoch(n),
-               check_code_grading()]
+               check_code_grading(), check_network_name(args.network)]
     if args.netuid and args.wallet:
         results.append(check_governance(args.netuid, args.network, args.wallet, args.hotkey))
         results.append(check_reference_freshness(args.netuid, args.network, args.wallet,

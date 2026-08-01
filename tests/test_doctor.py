@@ -705,3 +705,80 @@ def test_an_abandoned_task_does_not_fail_grounding_either():
     # a REAL answer with no pool call behind it is still ungrounded — the rule keeps its teeth
     calls = [{"prompt": "q", "response": "unrelated"}]
     assert _grounded_one("42", calls, "number", agent_authored_prompts=False) == (False, "ungrounded")
+
+
+def test_a_stalled_reference_builder_is_a_blocking_fault(monkeypatch):
+    """The outage that changes what the subnet pays for without stopping anything.
+
+    `_load_reference` degrades to the legacy `Q_lcb - cost` scalar on purpose, so when the owner's
+    builder stops the validator keeps scoring and keeps setting weights — on a different quantity.
+    The epoch line does say `reference=MISSING`, but mainnet still ran 48 epochs that way: a field in
+    a running process's log is not a gate. This makes it one.
+
+    Checking the BUCKET rather than the process is the point: a wedged builder is still `active`.
+    """
+    from thirtyspokes.koth import doctor
+
+    class _Sub:
+        def __init__(self, block): self._b = block
+        def get_current_block(self): return self._b
+
+    class _Chain:
+        block = 8749100
+        def __init__(self, *a, **k): self.subtensor = _Sub(_Chain.block)
+
+    published = {"epochs": [87442, 87443]}
+
+    class _Api:
+        def __init__(self, *a, **k): pass
+        def list_bucket_tree(self, *a, **k):
+            return [type("E", (), {"path": f"reference/{e}-abc.json"})()
+                    for e in published["epochs"]]
+
+    import thirtyspokes.subnet.chain as chainmod
+    import huggingface_hub
+    monkeypatch.setattr(chainmod, "BittensorChain", _Chain)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _Api)
+
+    # chain at epoch 87491, newest record 87443 -> 48 epochs behind: the real mainnet outage
+    status, name, msg = doctor.check_reference_freshness(99, "finney", "w", "h")
+    assert status == doctor.FAIL, "a 48-epoch-stale reference must block, not warn"
+    assert "87443" in msg and "legacy" in msg, f"must name the record and the consequence: {msg}"
+
+    # current epoch still being built is normal, not a fault
+    published["epochs"] = [87490, 87491]
+    assert doctor.check_reference_freshness(99, "finney", "w", "h")[0] == doctor.OK
+
+    # never published at all is the same failure, and must not read as "fine, nothing to compare"
+    published["epochs"] = []
+    assert doctor.check_reference_freshness(99, "finney", "w", "h")[0] == doctor.FAIL
+
+
+def test_the_preflight_always_terminates_even_when_the_chain_does_not(monkeypatch):
+    """A preflight that hangs is worse than the fault it looks for — it blocks the daemon.
+
+    Measured live: the same `BittensorChain(...)` construction took 3s on a good endpoint and >9
+    minutes on a bad one, because the SDK's own retry ladder runs before any timeout we configure is
+    reachable. Both chain-reading checks must give up and say so.
+    """
+    import time
+
+    from thirtyspokes.koth import doctor
+
+    monkeypatch.setattr(doctor, "CHAIN_READ_TIMEOUT_S", 0.3)
+
+    def _never_answers():
+        time.sleep(30)
+        return "unreachable"
+
+    t0 = time.time()
+    val, err = doctor._bounded(_never_answers, timeout=0.3)
+    assert val is None and isinstance(err, TimeoutError)
+    assert time.time() - t0 < 5, "the bound did not hold"
+
+    # an exception inside the thread is reported, not raised on a thread nobody is joining
+    val, err = doctor._bounded(lambda: 1 / 0)
+    assert val is None and isinstance(err, ZeroDivisionError)
+
+    # and a healthy read still passes its value through
+    assert doctor._bounded(lambda: 42) == (42, None)

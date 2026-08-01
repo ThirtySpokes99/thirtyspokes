@@ -86,6 +86,29 @@ orchestra-koth-reference --netuid 526 --network test --wallet owner \
   --deadline-s 900 --call-timeout 180
 ```
 
+**Run it as a supervised service, and check that it is still publishing.** If this stops, nothing
+breaks and nothing stops: `_load_reference` degrades on purpose, every miner falls through to the
+legacy quality/cost scalar, and validators keep scoring and setting weights on a different quantity
+than you intend. The epoch line does say `reference=MISSING(scoring absolute accuracy, NOT routing)`
+— but that is a field in a running process's log, and mainnet still ran 48 epochs that way before
+anyone read the bucket. `orchestra-koth-doctor --netuid <N> --wallet <w>` now fails on a stale
+reference, so make it a startup gate rather than something you have to notice:
+```ini
+# /etc/systemd/system/koth-reference.service — `--loop` publishes once per epoch and waits
+[Service]
+EnvironmentFile=/path/to/thirtyspokes/.env
+ExecStart=/root/.local/bin/uv run --frozen orchestra-koth-reference \
+  --netuid 99 --network finney --wallet owner --hotkey <owner-hotkey> \
+  --n-per-bench 8 --call-timeout 180 --loop
+Restart=always
+RestartSec=30
+[Install]
+WantedBy=multi-user.target
+```
+`Restart=always` covers a crash; it does **not** cover a wedged run (a provider call has held a job
+for 35+ minutes here on 3.5s of CPU) — which is why the doctor check reads the bucket rather than
+the unit state.
+
 **Keep `--deadline-s` inside your epoch.** A reference that outruns its epoch describes a slice nobody
 is scored on any more, so it is dead on arrival — and provider calls can hang well past their own
 timeout (observed during this build-out: one request sat with the connection ESTABLISHED and no

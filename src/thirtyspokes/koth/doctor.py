@@ -22,12 +22,44 @@ import os
 import pathlib
 import shutil
 import subprocess
+import threading
 
 OK, WARN, FAIL = "ok", "warn", "FAIL"
+
+# A preflight must always terminate. Every chain read here is bounded by this and degrades to a
+# warning, because "the chain is slow" is not a deployment fault and must not hold up the daemon.
+CHAIN_READ_TIMEOUT_S = 45.0
 
 
 def _r(status: str, name: str, detail: str) -> tuple[str, str, str]:
     return (status, name, detail)
+
+
+def _bounded(fn, timeout: float = CHAIN_READ_TIMEOUT_S):
+    """Run `fn` on a daemon thread and give up on it. Returns `(value, error_or_None)`.
+
+    Used for every chain read here. `join(timeout=...)` is the only bound that actually holds: the
+    SDK can sit in its own retry ladder inside `Subtensor(...)` before any timeout we configure is
+    reachable, so wrapping the call is the only way a preflight is guaranteed to finish. The thread
+    is left running rather than killed — it is a daemon, it holds no locks we need, and the process
+    is about to either start the daemon or exit.
+    """
+    box: dict = {}
+
+    def _run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:      # noqa: BLE001 — reported, never raised on a dead thread
+            box["e"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if "v" in box:
+        return box["v"], None
+    if "e" in box:
+        return None, box["e"]
+    return None, TimeoutError(f"no answer in {timeout:.0f}s")
 
 
 def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
@@ -181,12 +213,17 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str,
     """Does the measurement THIS code computes match what the owner pinned on chain? A mismatch means
     every honest miner is rejected as `unapproved_runtime`, and the symptom points at the miner."""
     from .runtime import runtime_measurement
-    try:
+
+    def _read():
         from ..subnet.chain import BittensorChain
         c = BittensorChain(netuid, wallet, network, hotkey=hotkey)
-        rec = c.owner_measurements() or {}
-    except Exception as e:      # noqa: BLE001
-        return _r(WARN, "governance", f"chain unreadable ({type(e).__name__}) — cannot verify")
+        return c.owner_measurements() or {}
+
+    # Bounded for the same reason as the reference check: this reads the chain too, and an
+    # unbounded preflight blocks the daemon it exists to protect.
+    rec, err = _bounded(_read)
+    if err is not None:
+        return _r(WARN, "governance", f"chain unreadable ({type(err).__name__}) — cannot verify")
     on_chain = list(rec.get("runtime_measurements") or [])
     mine = runtime_measurement()
     if not on_chain:
@@ -226,6 +263,69 @@ def check_governance(netuid: int, network: str, wallet: str, hotkey: str,
                   f"on-chain pool ({len(pool)}) != harness ROUTING_POOL ({len(pool_models())}) — "
                   f"decisions would be scored against a ladder miners never saw")
     return _r(OK, "governance", f"measurement {mine[:16]}… pinned, pool {len(pool)} rungs")
+
+
+def check_reference_freshness(netuid: int, network: str, wallet: str, hotkey: str,
+                              bucket: str | None = None) -> tuple[str, str, str]:
+    """Is the owner still publishing a pool reference for the CURRENT epoch?
+
+    `_load_reference` is deliberately forgiving ("a reference outage is an owner problem, it must
+    degrade rather than stall the subnet"), so when the record stops arriving `headroom_lcb` returns
+    None and every miner falls through to the legacy `Q_lcb - cost` scalar. The validator keeps
+    running, keeps scoring, keeps setting weights — on a different quantity than anyone intends.
+
+    The epoch line DOES say so (`neuron.py` prints `reference=MISSING(scoring absolute accuracy, NOT
+    routing)`), so this is not a missing signal; it is a signal that only exists inside one process's
+    log stream, where it reads as one field among many and only while someone is watching. Mainnet
+    ran 48 epochs that way. A preflight turns it into a startup gate instead of a thing you notice.
+
+    Checks the BUCKET, not the process, for two reasons: a wedged builder is still `active` (a
+    provider call hanging past its own timeout has held a run for 35+ minutes here), and the bucket
+    is readable from anywhere — so this works from a machine that runs neither daemon.
+
+    BOUNDED, because a preflight that hangs is worse than the fault it looks for: it blocks the
+    daemon it is supposed to protect. Building a `Subtensor` can take the SDK's long retry path
+    (`chain._configure_rpc`: five 60-second waits) before any of our own timeouts apply — measured
+    here at 3s on a good endpoint and >9 minutes on a bad one, for the same call. A slow chain is a
+    reason to say "cannot check", never a reason to wait.
+    """
+    from . import imagestore
+
+    def _epoch_now():
+        from ..subnet.chain import BittensorChain
+        from .epoch import EPOCH_BLOCKS
+        c = BittensorChain(netuid, wallet, network, hotkey=hotkey)
+        return int(c.subtensor.get_current_block()) // EPOCH_BLOCKS
+
+    now, err = _bounded(_epoch_now)
+    if err is not None:
+        return _r(WARN, "reference", f"chain unreadable ({type(err).__name__}) — cannot check")
+
+    try:
+        import re
+
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.environ.get("OWNER_HF_TOKEN") or os.environ.get("HF_TOKEN"))
+        entries = api.list_bucket_tree(bucket or imagestore.default_bucket(), "reference",
+                                       recursive=True)
+        epochs = {int(m.group(1)) for e in entries
+                  for m in [re.search(r"reference/(\d+)-", getattr(e, "path", str(e)))] if m}
+    except Exception as e:      # noqa: BLE001 — an unreadable bucket is not proof of an outage
+        return _r(WARN, "reference", f"bucket unreadable ({type(e).__name__}) — cannot check")
+
+    if not epochs:
+        return _r(FAIL, "reference",
+                  "no pool reference has ever been published — every miner is scored on the legacy "
+                  "quality/cost scalar, not on routing")
+    latest = max(epochs)
+    # One epoch of slack: the current epoch's record is legitimately still being built.
+    behind = now - latest
+    if behind > 1:
+        return _r(FAIL, "reference",
+                  f"newest reference is epoch {latest}, chain is at {now} ({behind} epochs behind) — "
+                  f"the router scalar is dead and miners are silently being ranked on the legacy "
+                  f"quality/cost scalar instead")
+    return _r(OK, "reference", f"epoch {latest} published, chain at {now}")
 
 
 def check_build_freshness() -> tuple[str, str, str]:
@@ -327,8 +427,11 @@ def main() -> None:
                check_code_grading()]
     if args.netuid and args.wallet:
         results.append(check_governance(args.netuid, args.network, args.wallet, args.hotkey))
+        results.append(check_reference_freshness(args.netuid, args.network, args.wallet,
+                                                 args.hotkey))
     else:
         results.append(_r(WARN, "governance", "skipped — pass --netuid and --wallet to check"))
+        results.append(_r(WARN, "reference", "skipped — pass --netuid and --wallet to check"))
 
     print("ThirtySpokes preflight\n")
     print(render(results))

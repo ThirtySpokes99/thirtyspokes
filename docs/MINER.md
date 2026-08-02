@@ -5,11 +5,18 @@ an owner-pinned pool of models. You ship weights; the subnet owns the engine tha
 cost-budgeted quality.** For *how the mechanism works* see [`DESIGN.md`](DESIGN.md); to stand up a
 subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
-> **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`); mainnet is netuid 99
-> on `finney` and remains the eventual destination. This line previously read "live on mainnet —
-> netuid 99" while DEPLOYING.md and VALIDATOR.md both said testnet 526; the operational target
-> (`.env`, the reference cron, the published governance) is **526**. Validators run **fail-closed**: to earn anything you must
-> run the owner's measured runtime image on a confidential VM. A mock TEE or stock CVM earns **nothing**.
+> **Live on Bittensor MAINNET — netuid 99 (`finney`, the code default).** Governance record **v7**
+> (`96855d0f…` — the same digest pinned in the image table below) was published on-chain on
+> **2026-08-01** and confirmed live: the deployed runtime measurement matches this repo, the subnet is
+> full (256/256 registered), and non-owner miners are earning. Testnet **526** (`--network test`)
+> remains available for offline/dev bring-up, and several command examples below still show it —
+> **substitute `--netuid 99 --network finney` to mine mainnet.**
+>
+> *(This caveat has flip-flopped in earlier revisions; the on-chain fact as of 2026-08-01 is netuid 99.
+> DEPLOYING.md and VALIDATOR.md still carry the pre-launch "testnet 526" framing and lag this.)*
+>
+> Validators run **fail-closed**: to earn anything you must run the owner's measured runtime image on a
+> confidential VM. A mock TEE or stock CVM earns **nothing**.
 
 ## What you build
 
@@ -83,34 +90,39 @@ the method.
 
 ## What secures this — the trust boundary (read this)
 
-Your agent runs in **your own** confidential VM, and that VM samples and runs the benchmark — so the
+Your routing head runs inside a confidential VM that samples and runs the benchmark — so the
 subnet does **not** trust your machine, it trusts the owner-published **measured runtime image**:
 
 - You boot the owner's published, locked-down image ([`DEPLOYING.md`](DEPLOYING.md) §Measured image)
-  on a TDX/SEV-SNP CVM. It loads *your* public `source.py` + `weights.bin` as the untrusted agent,
-  hashes exactly those bytes into the attestation, meters your cost, and runs your agent with **zero
-  network egress** (its only channel is the metered `call_model`).
-- **What you compete on is the agent** (fully public); **what is fixed and measured is the runtime.**
+  on a TDX/SEV-SNP CVM. It loads *your* public `weights.npz` via `np.load(allow_pickle=False)` — never
+  pickle, so **no miner code executes anywhere** — hashes exactly those bytes into the attestation,
+  runs the fixed harness, and meters your cost. The harness's only outbound channel is the metered
+  `call_model`.
+- **What you compete on is the head** (fully public); **what is fixed and measured is the runtime** —
+  encoder, head architecture, ladder, verifier and task sampling, all bound into the image.
 - Validators run **fail-closed**: a modified runtime, a stock CVM, or the mock TEE is **rejected, not
   scored** (`mock_quote_rejected` / `unapproved_runtime`). There is no "trust me" path — the measured
   image is the only way in.
 
-This is *why* static public benchmarks are safe: the score is bound to your public artifact running
-under an audited runtime, so any cheat is visible in your source or caught by the validator. See
-[`DESIGN.md`](DESIGN.md) §1 (trust model) + §6 (why benchmarks are safe).
+This is *why* a static public benchmark is safe here: a routing head **cannot emit an answer** — it
+picks which pinned model answers, and the harness returns that model's response verbatim — so answer
+memorisation is impossible by construction (`koth/harness.py`). See [`DESIGN.md`](DESIGN.md) §1 (trust
+model) + §6 (why benchmarks are safe).
 
 > The mock TEE exists only for **offline development** (the local simulator). Mainnet validators reject
 > its proofs, and the validator daemon refuses to disable its gate on mainnet — so don't tune against it.
 
 ## The rules (enforced by the runtime)
 
-- **Pinned pool only.** Call *only* the owner's allow-listed models — anything else → `UnpinnedModelError`.
-- **≥1 pool call per scored task.** Answering "for free" from your own weights → `no_pool_call`.
-- **Your answer must come from the pool.** Each scored answer must match a response your agent got from
-  a pool model — the **grounding check** (proof-inspection only, no re-execution). Ignoring the pool and
-  answering from your weights (a lookup table / self-contained model) → `ungrounded`. Relaying,
-  cascading, ensembling, and verifying are all fine.
+- **Pinned pool only.** Your head's action space *is* the owner's allow-list — it cannot choose a
+  model outside it, so `UnpinnedModelError` is structurally unreachable for a routing head.
 - **You pay your own inference** (your OpenRouter key). Cost is metered from the real bill.
+
+> **Retired for routing heads.** The old free-agent rules — `no_pool_call`, the `ungrounded` grounding
+> check, source/weight scans — **do not apply to a routing head** (`koth/harness.py`): a head cannot
+> emit an answer, so answering "from your own weights" is impossible by construction, and the harness
+> always calls a pinned model and returns its response verbatim. Those checks survive only on the
+> legacy `--source`/`--weights` free-agent path, which this subnet no longer competes on.
 
 ## What you're scored on
 
@@ -220,15 +232,19 @@ uv pip install -e ".[chain,eval,tee]"     # tee extra = full DCAP verification o
 export OPENROUTER_API_KEY=...             # you pay your own inference
 huggingface-cli login                     # to publish your public bundle
 btcli wallet new_coldkey && btcli wallet new_hotkey
-btcli subnet register --netuid 526 --wallet.name miner --subtensor.network test
+# MAINNET (live): netuid 99 is FULL (256/256) — registration recycles TAO and evicts the
+# lowest-immunity neuron, so expect a real, non-trivial recycle cost.
+btcli subnet register --netuid 99 --wallet.name miner --subtensor.network finney
+# dev only: btcli subnet register --netuid 526 --wallet.name miner --subtensor.network test
 ```
 
 Your published bundle is your `weights.npz` plus the harness version string as its "source" — the
 miner writes both for you. Point the daemon at your head:
 
 ```bash
-orchestra-koth-miner --netuid 526 --network test --wallet miner --hotkey default \
+orchestra-koth-miner --netuid 99 --network finney --wallet miner --hotkey default \
   --repo YOU/koth-miner --routing-model weights.npz
+# dev only: --netuid 526 --network test
 ```
 
 `--routing-model` validates the head against the pinned pool **at startup** rather than mid-epoch,
@@ -288,11 +304,18 @@ gcloud compute instances create my-koth-miner \
   --network-interface=nic-type=GVNIC --boot-disk-size=50GB \
   --metadata="^@^koth-epoch=<E>@koth-nonce=<N>@koth-hotkey=<YOUR_SS58>@koth-pool=<ALLOW_LIST>" \
   --metadata-from-file=koth-secrets=secrets.env,\
-koth-agent-source=<(base64 -w0 my_router.py),koth-agent-weights=<(base64 -w0 my_weights.bin)
+koth-agent-source=<(printf koth-harness-4 | base64 -w0),koth-agent-weights=<(base64 -w0 weights.npz)
 ```
 
-The image is **locked down**: dm-verity read-only rootfs, no sshd, no shell. Your agent and your
-OpenRouter key are injected at boot via CVM metadata — never baked into the public image. The agent
+> The metadata keys are `koth-agent-source` + `koth-agent-weights` (`koth/gcp_operator.py`), but for a
+> routing head their **values** differ from the free-agent path: `source` is the **harness version
+> string** (not a `my_router.py`), and `weights` is your **`weights.npz`** (not a `my_weights.bin`) —
+> the miner publishes exactly this pair (see "Submit + run" above). Prefer the shipped operator
+> (`orchestra-koth-gcp-miner`), which derives both from chain and fills the metadata for you; the manual
+> `gcloud` form is illustrative and easy to get wrong.
+
+The image is **locked down**: dm-verity read-only rootfs, no sshd, no shell. Your head and your
+OpenRouter key are injected at boot via CVM metadata — never baked into the public image. The harness
 runs with **zero network egress**; its only channel is the metered `call_model`.
 
 | the image, pinned | |
@@ -330,7 +353,7 @@ StartLimitIntervalSec=600
 WorkingDirectory=/path/to/thirtyspokes
 EnvironmentFile=/path/to/thirtyspokes/.env
 ExecStart=/root/.local/bin/uv run --frozen orchestra-koth-gcp-miner \
-  --netuid 526 --network test --wallet miner --hotkey default \
+  --netuid 99 --network finney --wallet miner --hotkey default \
   --image koth-runtime-v27 --zone us-central1-a --machine-type c3-standard-4 \
   --n-per-bench 2 --epochs 0 --min-blocks 80 --attempt-deadline 900 --max-attempts 1
 Restart=always
@@ -358,8 +381,9 @@ owner-pinned pool from chain:
 ```bash
 export OPENROUTER_API_KEY=... MINER_HF_TOKEN=...
 orchestra-koth-gcp-miner \
-  --netuid 526 --network test --wallet miner --hotkey default \
+  --netuid 99 --network finney --wallet miner --hotkey default \
   --image THE_OWNER_APPROVED_GCP_IMAGE --repo YOU/koth-miner
+# dev only: --netuid 526 --network test
 ```
 
 For each epoch it waits for a usable block window, derives the block-hash nonce, creates a fresh

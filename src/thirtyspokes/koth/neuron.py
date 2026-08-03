@@ -30,6 +30,16 @@ from .validator import KOTHValidator
 # whole security model off, so the validator daemon REFUSES it on these networks.
 MAINNET_NETWORKS = frozenset({"finney", "mainnet"})
 
+# RE-SUBMIT AN UNCHANGED SLATE THIS OFTEN. Weights used to be written only when the DISTRIBUTION
+# changed, and the KingChain is built to hold one — eps hysteresis and incumbency exist precisely so
+# the crown does not turn over on noise. So a healthy subnet is the case that breaks it: measured on
+# netuid 99, the validator scored 20+ consecutive epochs correctly while `last_update` aged 2234
+# blocks without a single submission. Past the subnet's `activity_cutoff` (5000 there) Yuma stops
+# counting the validator entirely, so a perfectly-behaved validator disappears from consensus for
+# being too stable. 180 blocks sits above the 100-block `weights_rate_limit` (a refresh is never
+# rejected for arriving too soon) and far below any cutoff worth supporting.
+WEIGHT_REFRESH_BLOCKS = 180
+
 
 def validator_hf_token(environ=None) -> str | None:
     """Credential used only by the validator's publishing side.
@@ -105,6 +115,22 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
         """Finish the active atomic operation, then leave the daemon loop promptly."""
         self._stop.set()
 
+    def _weights_are_stale(self) -> bool:
+        """Have this validator's on-chain weights aged past `WEIGHT_REFRESH_BLOCKS`?
+
+        `blocks_since_weights` exists only on the live chain seam. The offline chains (MockChain,
+        LocalFileChain) have no activity cutoff to age out of, so they report nothing and never go
+        stale — which keeps every sim's submission pattern exactly as it was.
+        """
+        since = getattr(self.val.chain, "blocks_since_weights", None)
+        if since is None:
+            return False
+        try:
+            n = since()
+        except Exception:  # noqa: BLE001 — an unreadable chain must not manufacture a submission
+            return False
+        return n is not None and int(n) >= WEIGHT_REFRESH_BLOCKS
+
     def _flush_pending(self) -> bool:
         """Finish one durably staged epoch; safe to repeat after a crash or RPC failure."""
         weights = self.val.pending_weights
@@ -112,10 +138,16 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
         if weights is None and report is None:
             return True
         if weights is not None:
+            # SUBMIT ON CHANGE **OR** ON AGE. Change alone was the old rule, and it silently stopped
+            # writing weights for as long as the reign held (see WEIGHT_REFRESH_BLOCKS).
+            stale = self._weights_are_stale()
+            submit = bool(weights) and (weights != self.val.last_submitted_weights or stale)
+            ready = time.monotonic() >= getattr(self, "_weight_retry_not_before", 0.0)
             try:
-                if (weights and weights != self.val.last_submitted_weights
-                        and time.monotonic() >= getattr(self, "_weight_retry_not_before", 0.0)):
-                    self.val.chain.set_weights(weights)
+                if submit and ready:
+                    # `force` only when the slate is unchanged: it bypasses the chain seam's
+                    # already-current short-circuit, which would otherwise drop the refresh.
+                    self.val.chain.set_weights(weights, force=stale)
             except Exception as exc:  # noqa: BLE001 — keep the durable pending update for retry
                 retry_blocks = getattr(exc, "retry_blocks", None)
                 if retry_blocks is not None:
@@ -130,9 +162,8 @@ class KOTHValidatorNeuron:  # pragma: no cover — daemon loop
                 print(f"[koth-validator] weight submission pending; will retry ({type(exc).__name__}: "
                       f"{exc})", flush=True)
                 return False
-            if (weights and weights != self.val.last_submitted_weights
-                    and time.monotonic() < getattr(self, "_weight_retry_not_before", 0.0)):
-                return False
+            if submit and not ready:
+                return False              # inside the backoff window: retry, do not settle the epoch
             if weights:
                 self.val.record_submitted_weights(weights)
             self._weight_retry_not_before = 0.0

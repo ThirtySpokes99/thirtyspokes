@@ -177,6 +177,15 @@ class RealBenchmark:
     def grade(self, answer, gold): return self._grade(answer, gold)
 
 
+# THE SUITE'S SHAPE, WITHOUT ITS DATA. `real_suite()` downloads ~3n_load tasks over the network, so
+# anything that only needs to know HOW MANY benchmarks there are — the preflight's slice arithmetic,
+# the slice-agreement tests — was paying a live dataset download for a list length of 3. That made
+# `doctor`, which advertises itself as read-only and cheap, network-bound, and it made the offline
+# test suite depend on a download the CI workflow deliberately does not install (`eval` extra).
+# `real_suite()` asserts against this on every real call, so the two cannot drift apart silently.
+REAL_SUITE_BENCHMARKS: tuple[str, ...] = ("mmlu", "math", "code")
+
+
 def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
     """The live scored suite: rank on LiveCodeBench; MMLU + GSM8K are weight-0 eligibility floors.
 
@@ -235,9 +244,17 @@ def real_suite(n_load: int = 1000, seed: int = 0) -> list[Benchmark]:
     # `grade_patch` is a stand-in that scores any well-formed diff 1.0, so ranking on it today would
     # be trivially gameable. It needs `eval.swe_tasks.SWEGrader` (Docker + the SWE-bench Pro
     # harness) first, and one-shot SWE measured degenerate at the FLOOR (0/120) regardless.
-    return [RealBenchmark("mmlu", 0.0, mp, mh, grade_choice),
-            RealBenchmark("math", 0.0, gp, gh, math_tasks.grade),
-            lcb.make_lcb(seed=seed, weight=1.0)]
+    suite = [RealBenchmark("mmlu", 0.0, mp, mh, grade_choice),
+             RealBenchmark("math", 0.0, gp, gh, math_tasks.grade),
+             lcb.make_lcb(seed=seed, weight=1.0)]
+    # Checked on every REAL call — miner, validator, reference, doctor — so a benchmark added here
+    # cannot leave `REAL_SUITE_BENCHMARKS` behind. Callers size the epoch against that constant; a
+    # stale one would understate the run and the symptom would surface as miners missing epochs.
+    got = tuple(b.name for b in suite)
+    assert got == REAL_SUITE_BENCHMARKS, (
+        f"real_suite() is {got} but REAL_SUITE_BENCHMARKS says {REAL_SUITE_BENCHMARKS}; update the "
+        f"constant — the preflight and slice arithmetic size the epoch from it")
+    return suite
 
 
 # --- FRESH benchmarks (WS4): tasks generated per-epoch from the seed, so there is nothing

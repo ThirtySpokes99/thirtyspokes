@@ -63,7 +63,9 @@ class Chain(Protocol):
     def commit(self, hotkey: str, data: str) -> None: ...
     def revealed_commitments(self) -> list[Commitment]: ...
     def hotkeys(self) -> dict[int, str]: ...           # uid -> hotkey
-    def set_weights(self, weights: dict[int, float]) -> None: ...
+    # `force` re-submits an UNCHANGED distribution, which the live chain otherwise skips. It is how
+    # the daemon keeps `last_update` inside the subnet's activity cutoff during a stable reign.
+    def set_weights(self, weights: dict[int, float], *, force: bool = False) -> None: ...
     def beacon(self, epoch: int) -> str: ...           # per-epoch seed for the task nonce
     # owner-governed approved measurements (MRTD/RTMR/runtime/TCB); None if unpublished
     def owner_measurements(self) -> dict | None: ...
@@ -142,7 +144,8 @@ class MockChain:
     def hotkeys(self) -> dict[int, str]:
         return {uid: hk for hk, uid in self._uid_of.items()}
 
-    def set_weights(self, weights: dict[int, float]) -> None:
+    def set_weights(self, weights: dict[int, float], *, force: bool = False) -> None:
+        del force                       # no activity cutoff offline: a refresh is a plain re-write
         self._weights = dict(weights)
 
     def beacon(self, epoch: int) -> str:
@@ -219,7 +222,8 @@ class LocalFileChain:
     def hotkeys(self) -> dict[int, str]:
         return {uid: hk for hk, uid in self._load()["uids"].items()}
 
-    def set_weights(self, weights: dict[int, float]) -> None:
+    def set_weights(self, weights: dict[int, float], *, force: bool = False) -> None:
+        del force                       # no activity cutoff offline: a refresh is a plain re-write
         s = self._load(); s["weights"] = {str(u): w for u, w in weights.items()}; self._save(s)
 
     def beacon(self, epoch: int) -> str:
@@ -397,7 +401,7 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
             module="SubtensorModule", storage_function="Keys", params=[self.netuid])
         return {int(uid): str(getattr(hotkey, "value", hotkey)) for uid, hotkey in rows}
 
-    def set_weights(self, weights: dict[int, float]) -> None:
+    def set_weights(self, weights: dict[int, float], *, force: bool = False) -> None:
         """Set weights with a bounded inclusion wait and idempotent recovery.
 
         Finalization is not needed here: once the extrinsic is included, a rare reorg can be
@@ -405,11 +409,16 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
         stalled a live validator indefinitely.  The SDK's default RPC budget is also five one-minute
         waits, so temporarily bound this write to two 20-second waits and fail loudly.  The validator
         persists pending weights before calling this method and retries after restart.
+
+        `force` SKIPS THE ALREADY-CURRENT SHORT-CIRCUIT, and without it a periodic refresh is
+        impossible: the guard below compares distributions only, so re-submitting an unchanged slate
+        returned immediately and `last_update` never moved. The rate limit is still honoured — a
+        refresh that arrives too soon raises `WeightRateLimited` exactly like a real change.
         """
         uids = list(weights.keys())
         total = sum(weights.values()) or 1.0
         vals = [weights[u] / total for u in uids]        # normalize; SDK converts to u16 on-chain
-        if self._weights_are_current(weights):
+        if not force and self._weights_are_current(weights):
             return
 
         uid = self.subtensor.get_uid_for_hotkey_on_subnet(
@@ -439,9 +448,27 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
             if old_retries is not None:
                 substrate.max_retries = old_retries
 
-        if not getattr(response, "success", False) and not self._weights_are_current(weights):
+        # THE FALLBACK CANNOT VOUCH FOR A REFRESH. `_weights_are_current` is a legitimate second
+        # opinion when the distribution CHANGED (the write may have landed while the response was
+        # lost), but on a forced refresh the distribution is already current by definition — so it
+        # would report success for a submission that never went through, and `last_update` would
+        # keep ageing while the daemon believed it had refreshed. Force demands a real inclusion.
+        if not getattr(response, "success", False) and (force or not self._weights_are_current(weights)):
             message = getattr(response, "message", None) or "unknown chain error"
             raise RuntimeError(f"set_weights was not included: {message}")
+
+    def blocks_since_weights(self) -> int | None:
+        """Blocks since this validator last set weights; None if unregistered or unreadable.
+
+        This is the staleness signal the daemon refreshes on. Yuma stops counting a validator whose
+        `last_update` has aged past the subnet's `activity_cutoff`, however correctly it scored
+        every epoch in between.
+        """
+        uid = self.subtensor.get_uid_for_hotkey_on_subnet(
+            self.wallet.hotkey.ss58_address, self.netuid)
+        if uid is None:
+            return None
+        return self.subtensor.blocks_since_last_update(self.netuid, uid)
 
     @staticmethod
     def _same_weight_distribution(requested: dict[int, float], current) -> bool:

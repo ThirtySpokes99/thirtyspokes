@@ -97,10 +97,15 @@ def test_cascade_stops_escalating_when_the_task_runs_out_of_time():
     timeout and retries, and a task entering low can climb several rungs. Measured live (epoch
     76734): five tasks in 131s, then ~950s on the sixth, and the epoch was lost — a proof that misses
     its epoch is unrecoverable, since its nonce is stale."""
+    from thirtyspokes.eval.math_tasks import grade as grade_math
     from thirtyspokes.koth import harness as H
-    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.benchmarks import RealBenchmark
 
-    bench = next(b for b in real_suite() if b.name == "math")
+    # Escalation is driven by the VERIFIER, and `verify._bench_kind` reads the benchmark's GRADER,
+    # never its tasks — so the real suite's ~3000-task download bought this test nothing while
+    # making it unrunnable wherever the `eval` extra is absent (which is CI). Same grader, same
+    # verdicts, no network. The precondition assert below is what keeps the substitution honest.
+    bench = RealBenchmark("math", 0.0, [], [], grade_math)
     REJECTED = "I cannot solve this."
     assert not H.verifier_ok(REJECTED, bench), "precondition: this answer must make the ladder climb"
 
@@ -398,12 +403,15 @@ def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypat
             time.sleep(HANG)              # ...and ignore it completely
             return "", 0, 0, 0.0
 
-    suite = real_suite()
     # A real head, so the entry rungs are the ones a live miner would pick. Which rung it picks does
     # not matter here — every rung hangs — but a synthetic head would make the test prove less.
+    # SKIP BEFORE BUILDING THE SUITE. `real_suite()` downloads datasets, so doing it first turned
+    # this into a collection ERROR wherever the `eval` extra is absent (CI) — on a test that was
+    # going to skip two lines later anyway, for want of the very same head.
     weights = pathlib.Path("/root/koth-miner-work/weights.npz")
     if not weights.exists():
         pytest.skip("needs a trained head; the unit tests cover the bound without one")
+    suite = real_suite()
     art = routing_artifact(weights.read_bytes())
 
     t0 = time.monotonic()
@@ -645,7 +653,7 @@ def test_the_attempt_deadline_cannot_truncate_a_run_that_was_about_to_succeed():
     full-budget run was never seen finishing. The deadline has to clear the harness worst case with
     room for GCP provisioning (which precedes the kernel clock, so it is invisible in serial
     timestamps) and the operator's poll granularity."""
-    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.benchmarks import REAL_SUITE_BENCHMARKS
     from thirtyspokes.koth.gcp_operator import _attempt_deadline
     from thirtyspokes.koth.harness import RUN_BUDGET_S
 
@@ -653,7 +661,7 @@ def test_the_attempt_deadline_cannot_truncate_a_run_that_was_about_to_succeed():
     src = inspect.getsource(_attempt_deadline)
     assert "grace" in src, "the published grace must govern when available"
 
-    tasks = 2 * len(real_suite())
+    tasks = 2 * len(REAL_SUITE_BENCHMARKS)
     worst = RUN_BUDGET_S + tasks * 5 + 40 + 30 + 15      # budget, slack, boot, emit, poll
     import thirtyspokes.koth.gcp_operator as G
     default = [a for a in inspect.getsource(G.main).split("\n") if "--attempt-deadline" in a][0]

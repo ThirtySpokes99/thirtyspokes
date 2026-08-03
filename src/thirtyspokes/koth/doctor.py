@@ -36,7 +36,7 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     A proof completed after its epoch expires carries a stale nonce and can never validate — it is
     unrecoverable, not merely late. So slice x benchmarks x per-call latency must fit one epoch.
     """
-    from .benchmarks import real_suite
+    from .benchmarks import REAL_SUITE_BENCHMARKS
     from .epoch import EPOCH_BLOCKS
     from .harness import MIN_TASK_S, RUN_BUDGET_S
     # The harness refuses further escalation past TASK_BUDGET_S, so this is an actual CEILING, not
@@ -45,7 +45,7 @@ def check_slice_fits_epoch(n_per_bench: int) -> tuple[str, str, str]:
     # Measured against the whole epoch. A validator's --grace-blocks makes the REAL deadline tighter
     # still (85 blocks ~= 1020s), which is what RUN_BUDGET_S is sized for — see harness.RUN_BUDGET_S.
     block_s = 12.0
-    n_bench = len(real_suite())
+    n_bench = len(REAL_SUITE_BENCHMARKS)     # the COUNT only: no dataset download in a preflight
     # boot + attest/emit + upload, plus the watchdog's per-task slack (koth/runtime.py): the
     # watchdog waits budget+5s before abandoning, so the worst case is the budget plus that slack.
     overhead = 90.0 + n_per_bench * n_bench * 5.0

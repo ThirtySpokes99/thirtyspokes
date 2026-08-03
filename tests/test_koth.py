@@ -3744,10 +3744,10 @@ def test_miner_and_validator_agree_on_slice_size():
     # Measured on GCP C3 TDX against the pinned 7-rung pool: ~90s per pool call. 100-block epochs at
     # ~12s/block give ~1200s. 12 tasks landed with margin; 12 tasks also MISSED once when latency
     # ran high, and 48 tasks (~72 min) never finished.
-    from thirtyspokes.koth.benchmarks import real_suite
+    from thirtyspokes.koth.benchmarks import REAL_SUITE_BENCHMARKS
     from thirtyspokes.koth.epoch import EPOCH_BLOCKS
     PER_CALL_S, BLOCK_S, SAFETY = 90.0, 12.0, 0.6      # use only 60% of the epoch
-    n_bench = len(real_suite())
+    n_bench = len(REAL_SUITE_BENCHMARKS)
     budget_s = EPOCH_BLOCKS * BLOCK_S * SAFETY
     need_s = val * n_bench * PER_CALL_S
     assert need_s <= budget_s, (

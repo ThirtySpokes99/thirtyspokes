@@ -408,8 +408,15 @@ def test_a_run_of_hanging_calls_still_finishes_and_still_emits_a_proof(monkeypat
     # SKIP BEFORE BUILDING THE SUITE. `real_suite()` downloads datasets, so doing it first turned
     # this into a collection ERROR wherever the `eval` extra is absent (CI) — on a test that was
     # going to skip two lines later anyway, for want of the very same head.
+    # `.exists()` RAISES rather than returning False when the parent is unreadable, and CI runs
+    # unprivileged against a 0700 /root — so the guard meant to skip this test was itself the
+    # failure. Any OSError here means "no head available", which is a skip, not a result.
     weights = pathlib.Path("/root/koth-miner-work/weights.npz")
-    if not weights.exists():
+    try:
+        have_head = weights.is_file()
+    except OSError:
+        have_head = False
+    if not have_head:
         pytest.skip("needs a trained head; the unit tests cover the bound without one")
     suite = real_suite()
     art = routing_artifact(weights.read_bytes())

@@ -1585,6 +1585,138 @@ def test_bittensor_weight_replay_skips_an_identical_onchain_distribution():
     chain.set_weights({3: 0.25, 4: 0.75})
 
 
+def test_bittensor_weight_refresh_forces_an_identical_distribution():
+    """A REFRESH must beat the already-current short-circuit, or `last_update` never moves.
+
+    Regression, netuid 99: the slate was written once and then skipped forever because the
+    distribution never changed, so the validator aged toward `activity_cutoff` while scoring
+    every epoch correctly.
+    """
+    from types import SimpleNamespace
+
+    from thirtyspokes.subnet.chain import BittensorChain
+
+    class Subtensor:
+        substrate = SimpleNamespace(retry_timeout=60.0, max_retries=5)
+        submitted = None
+
+        def get_uid_for_hotkey_on_subnet(self, _hotkey, _netuid):
+            return 7
+
+        def weights(self, _netuid):
+            return [(7, [(3, 16384), (4, 49151)])]      # identical to what we re-submit
+
+        def blocks_since_last_update(self, _netuid, _uid):
+            return 181                                  # past the refresh point, past the limit
+
+        def weights_rate_limit(self, _netuid):
+            return 100
+
+        def set_weights(self, **kwargs):
+            self.submitted = kwargs
+            return SimpleNamespace(success=True, message="included")
+
+    chain = object.__new__(BittensorChain)
+    chain.netuid = 99
+    chain.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
+    chain.subtensor = Subtensor()
+
+    chain.set_weights({3: 0.25, 4: 0.75})                       # unchanged -> still skipped
+    assert chain.subtensor.submitted is None
+    chain.set_weights({3: 0.25, 4: 0.75}, force=True)           # ...unless forced
+    assert chain.subtensor.submitted is not None
+    assert sorted(chain.subtensor.submitted["uids"]) == [3, 4]
+
+
+def test_forced_refresh_is_not_vouched_for_by_the_onchain_fallback():
+    """`_weights_are_current` is always True during a refresh, so it must not stand in for success.
+
+    Otherwise a refresh that was never included reports success, the daemon believes it refreshed,
+    and `last_update` keeps ageing — the exact failure the refresh exists to prevent.
+    """
+    from types import SimpleNamespace
+
+    from thirtyspokes.subnet.chain import BittensorChain
+
+    class Subtensor:
+        substrate = SimpleNamespace(retry_timeout=60.0, max_retries=5)
+
+        def get_uid_for_hotkey_on_subnet(self, _hotkey, _netuid):
+            return 7
+
+        def weights(self, _netuid):
+            return [(7, [(3, 65535)])]
+
+        def blocks_since_last_update(self, _netuid, _uid):
+            return 181
+
+        def weights_rate_limit(self, _netuid):
+            return 100
+
+        def set_weights(self, **_kwargs):
+            return SimpleNamespace(success=False, message="dropped from the mempool")
+
+    chain = object.__new__(BittensorChain)
+    chain.netuid = 99
+    chain.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator"))
+    chain.subtensor = Subtensor()
+    with pytest.raises(RuntimeError, match="was not included"):
+        chain.set_weights({3: 1.0}, force=True)
+
+
+def test_daemon_resubmits_an_unchanged_slate_once_it_goes_stale():
+    """The daemon-side half: submit on CHANGE **or** on AGE, and force only in the latter case."""
+    from types import SimpleNamespace
+
+    from thirtyspokes.koth.neuron import WEIGHT_REFRESH_BLOCKS, KOTHValidatorNeuron
+
+    calls = []
+
+    class Chain:
+        since = 0
+
+        def blocks_since_weights(self):
+            return self.since
+
+        def set_weights(self, weights, *, force=False):
+            calls.append((dict(weights), force))
+
+    class Val:
+        pending_weights = {2: 0.5, 3: 0.5}
+        pending_report = None
+        last_submitted_weights = {2: 0.5, 3: 0.5}       # identical: the stable-reign case
+        chain = Chain()
+
+        def record_submitted_weights(self, _w):
+            pass
+
+        def complete_pending_weights(self):
+            pass
+
+    neuron = object.__new__(KOTHValidatorNeuron)
+    neuron.val = Val()
+    neuron.state_path = None
+    neuron.standings_repo = None
+
+    Val.chain.since = WEIGHT_REFRESH_BLOCKS - 1
+    assert neuron._flush_pending() is True
+    assert calls == [], "a fresh unchanged slate must not be re-submitted"
+
+    Val.chain.since = WEIGHT_REFRESH_BLOCKS
+    assert neuron._flush_pending() is True
+    assert calls == [({2: 0.5, 3: 0.5}, True)], "a stale unchanged slate must be forced through"
+
+
+def test_offline_chains_never_go_stale():
+    """MockChain/LocalFileChain have no activity cutoff, so sims keep their old write pattern."""
+    from thirtyspokes.koth.neuron import KOTHValidatorNeuron
+    from thirtyspokes.subnet.chain import MockChain
+
+    neuron = object.__new__(KOTHValidatorNeuron)
+    neuron.val = type("V", (), {"chain": MockChain()})()
+    assert neuron._weights_are_stale() is False
+
+
 def test_localfilechain_governance_and_register(tmp_path):
     from thirtyspokes.subnet.chain import LocalFileChain
     ch = LocalFileChain(str(tmp_path))

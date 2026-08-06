@@ -338,12 +338,22 @@ class KingChain:
         candidates: list[Submission],
         deregistered: set[str] | None = None,
         live: set[str] | None = None,
+        can_crown=None,
     ) -> EpochResult:
         """Advance one epoch. `live` = the miners that produced a VALID proof this epoch; only they
         can be paid or crowned. It is passed explicitly rather than inferred from `candidates`
         because under `scoring_mode="accumulate"` a miner that missed the epoch is still scored
         (miss=0) and so still appears as a candidate — inferring liveness there would pay absentees.
         `live=None` (offline sims, the graduated-`Reign` call shape) treats every candidate as live.
+
+        `can_crown(challenger_id, incumbent_id_or_None) -> bool` gates the CORONATION itself.
+        `None` (the default) allows every coronation, which is the historical behaviour.
+
+        Why gating here covers everything: `self.chain` is appended to in exactly one place — a king
+        that was just dethroned — so a miner can only ever be paid by having held the crown. A check
+        at the coronation therefore covers 100% of emissions while examining one challenger per crown
+        change, instead of every miner every epoch. That is the difference between an audit that is
+        affordable to run and one that is not.
         """
         ids = [c.miner_id for c in candidates]
         if len(ids) != len(set(ids)):
@@ -396,6 +406,20 @@ class KingChain:
                             else self.king.sub)
         else:
             new_king_sub = top                              # grace exhausted: the crown truly vacates
+
+        # --- coronation gate: a challenger must EARN the crown, not merely out-score for it ---
+        # Refusal falls back to the incumbent, never to the next-best challenger: promoting the
+        # runner-up would crown an unaudited miner by the back door, which is the whole hole.
+        # A genuinely vacant crown that the challenger cannot claim simply stays vacant (burn).
+        if (can_crown is not None and new_king_sub is not None
+                and new_king_sub.miner_id != prev_king_id
+                and not can_crown(new_king_sub.miner_id, prev_king_id or None)):
+            if incumbent is not None:
+                new_king_sub = incumbent
+            elif self.king is not None and not king_delinquent:
+                new_king_sub = self.king.sub
+            else:
+                new_king_sub = None
 
         if new_king_sub is not None:
             if prev_king_id and new_king_sub.miner_id != prev_king_id and self.king is not None:

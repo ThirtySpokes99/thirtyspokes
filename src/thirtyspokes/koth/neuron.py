@@ -59,7 +59,13 @@ def resolve_audit_mode(audit_mode: str, probe_bank_path: str | None) -> str:
 
     The daemon used to never pass `audit_mode` at all — it stayed at the "grounding" default while
     the validator gated the entire probe path on `audit_mode == "probe"`. So `--probe-bank` loaded
-    the bank, handed it to the validator, and was then silently ignored: a no-op flag."""
+    the bank, handed it to the validator, and was then silently ignored: a no-op flag.
+
+    An EXPLICIT mode always wins. `coronation` also consumes the bank, so inferring `probe` from the
+    bank alone would silently upgrade a cheap per-coronation audit into a per-miner-per-epoch one —
+    the same class of surprise, and this time a billing one."""
+    if audit_mode != "grounding":
+        return audit_mode
     return "probe" if probe_bank_path else audit_mode
 
 
@@ -458,11 +464,16 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
     p.add_argument("--probe-bank", help="path to the secret memorization-probe bank JSON "
                                         "(koth/heldout.py) matching the owner's on-chain probe_commit. "
                                         "Implies --audit-mode probe.")
-    p.add_argument("--audit-mode", choices=["grounding", "probe"], default="grounding",
+    p.add_argument("--audit-mode", choices=["grounding", "probe", "coronation"],
+                   default="grounding",
                    help="memorization backstop. 'grounding' (default): pure proof-inspection, the "
-                        "validator runs NO miner code, costs $0. 'probe': re-executes each miner's "
-                        "agent on a held-out slice — costs inference AND runs untrusted miner code in "
-                        "the sandbox.")
+                        "validator runs NO miner code, costs $0. 'probe': re-executes EVERY miner's "
+                        "agent on a held-out slice each epoch — costs inference AND runs untrusted "
+                        "miner code in the sandbox. 'coronation': the same held-out audit, but only "
+                        "on a challenger that is about to take the crown (and the incumbent, as its "
+                        "baseline). Since a miner can only ever be paid by having held the crown, "
+                        "this covers all emissions while auditing ~1 miner per crown change instead "
+                        "of every miner every epoch.")
     p.add_argument("--commit-window", type=int, default=None,
                    help="F7 anti-grind: require each proof committed on-chain within N blocks of the "
                         "epoch open (miners commit automatically). Off by default; calibrate N to one "
@@ -540,7 +551,7 @@ def validator_main() -> None:  # pragma: no cover — live daemon (needs bittens
     # that is off by default and never executed. Only the opt-in `probe` audit re-executes agents,
     # and only that needs a key. In grounding mode we install a backend that RAISES if anything ever
     # tries to infer, so a regression that silently starts spending money fails loudly instead.
-    if audit_mode == "probe":
+    if audit_mode in ("probe", "coronation"):
         cfg = config.LiveConfig(); cfg.require_key()
         backend = OpenRouterBackend(cfg.api_key, cfg.base_url, price_fn=config.price_for)
     else:

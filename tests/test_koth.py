@@ -3944,3 +3944,89 @@ def test_doctor_catches_the_deployment_faults_that_broke_live_runs():
 
     # 3. all five slice sites must agree; the live default must be self-consistent
     assert D.check_slice_agreement()[0] == D.OK
+
+
+def _sub(mid, score, block=1):
+    from thirtyspokes.reign import Submission
+    return Submission(mid, mid, block, score)
+
+
+def test_coronation_gate_refuses_a_challenger_that_collapses_on_unseen_tasks():
+    """The crown is the ONLY door to being paid — `KingChain.chain` is appended to in exactly one
+    place, a king that was just dethroned. So auditing the coronation covers every emission while
+    examining one challenger per crown change, instead of every miner every epoch. That is the
+    difference between an audit nobody can afford and one that runs.
+
+    Live motivation: the reigning miner on netuid 99 wins by appending task-specific reference
+    algorithms (and literal sample outputs) to prompts it recognises by fingerprint. It makes a real
+    pool call, so grounding passes; only a held-out probe separates it from a router.
+    """
+    from thirtyspokes.reign import KingChain
+
+    r = KingChain()
+    r.update([_sub("honest", 0.80)])                      # honest takes the vacant crown
+    assert r.king.sub.miner_id == "honest"
+
+    # a higher-scoring challenger that FAILS the audit must not be crowned
+    refused = []
+
+    def can_crown(challenger, incumbent):
+        refused.append((challenger, incumbent))
+        return challenger != "memoriser"
+
+    res = r.update([_sub("honest", 0.80), _sub("memoriser", 0.99)], can_crown=can_crown)
+    assert r.king.sub.miner_id == "honest", "a refused challenger must not take the crown"
+    assert refused == [("memoriser", "honest")], "the gate sees challenger + incumbent"
+    assert "memoriser" not in res.weights, "and must not be paid"
+
+    # the same challenger, now passing, is crowned and the ex-king keeps a pension seat
+    res = r.update([_sub("honest", 0.80), _sub("memoriser", 0.99)],
+                   can_crown=lambda c, i: True)
+    assert r.king.sub.miner_id == "memoriser"
+    assert set(res.weights) == {"memoriser", "honest"}
+
+
+def test_a_refused_coronation_falls_back_to_the_incumbent_not_the_runner_up():
+    """Promoting the runner-up would crown an UNAUDITED miner by the back door — the gate would then
+    only filter whoever happened to rank first, which is no gate at all."""
+    from thirtyspokes.reign import KingChain
+
+    r = KingChain()
+    r.update([_sub("king", 0.70)])
+    res = r.update([_sub("king", 0.70), _sub("cheat", 0.99), _sub("runner_up", 0.95)],
+                   can_crown=lambda c, i: False)
+    assert r.king.sub.miner_id == "king"
+    assert "cheat" not in res.weights and "runner_up" not in res.weights
+
+
+def test_a_vacant_crown_stays_vacant_when_the_only_challenger_is_refused():
+    """With no incumbent to fall back to, refusing means the crown is not handed out — emissions
+    burn rather than paying a miner that failed the audit."""
+    from thirtyspokes.reign import KingChain
+
+    r = KingChain()
+    res = r.update([_sub("cheat", 0.99)], can_crown=lambda c, i: False)
+    assert r.king is None
+    assert res.weights == {r.burn_uid: 1.0}, "unaudited challenger must not be paid"
+
+
+def test_default_reign_behaviour_is_unchanged_without_a_gate():
+    """`can_crown=None` is the historical path; every existing deployment must be untouched."""
+    from thirtyspokes.reign import KingChain
+
+    r = KingChain()
+    r.update([_sub("a", 0.5)])
+    r.update([_sub("a", 0.5), _sub("b", 0.99)])
+    assert r.king.sub.miner_id == "b"
+
+
+def test_an_explicit_audit_mode_is_not_overridden_by_supplying_a_probe_bank():
+    """`--probe-bank` implies probe mode only when no mode was chosen. Inferring it unconditionally
+    would silently upgrade a per-coronation audit into a per-miner-per-epoch one — a billing
+    surprise, since coronation mode consumes the same bank."""
+    from thirtyspokes.koth.neuron import resolve_audit_mode
+
+    assert resolve_audit_mode("grounding", "/bank.json") == "probe"
+    assert resolve_audit_mode("coronation", "/bank.json") == "coronation"
+    assert resolve_audit_mode("coronation", None) == "coronation"
+    assert resolve_audit_mode("grounding", None) == "grounding"

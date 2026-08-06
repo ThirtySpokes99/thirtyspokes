@@ -90,6 +90,9 @@ class _MinerEval:
     # distribution). The verdict holds graded outcomes; the decision is what the harness architecture
     # actually pays for, so the validator needs both.
     proof_results: tuple = ()
+    # the DOWNLOADED bundle, kept only so a coronation audit can re-execute this miner without
+    # fetching it a second time. Never used for scoring.
+    artifact: object | None = None
 
 
 class KOTHValidator:
@@ -199,6 +202,9 @@ class KOTHValidator:
         # probe's difficulty; max_probe_drop caps the allowance so a colluding all-memorizer
         # cohort cannot inflate it (the owner's "no honest probe is harder than this").
         self.min_cohort, self.max_probe_drop = min_cohort, max_probe_drop
+        # (hotkey, source_hash, weights_hash) -> passed?  A challenger that keeps nudging the crown
+        # pays for ONE audit per artifact; a re-commit changes the key and must earn the crown again.
+        self._coronation_verdicts: dict[tuple, bool] = {}
         self.epoch_blocks = epoch_blocks
         # F7 anti-grind: if set, a scored proof must have been COMMITTED on-chain (report_data) inside
         # [epoch*epoch_blocks, +commit_window] blocks and revealed EXACTLY — binding one run (no
@@ -598,7 +604,7 @@ class KOTHValidator:
         # from here the artifact is bound to the commit -> carry its hashes on EVERY outcome, so the
         # accumulator can key on (hotkey, source_hash, weights_hash, suite_version).
         def E(**kw):
-            return _MinerEval(sh=sh, wh=wh, **kw)
+            return _MinerEval(sh=sh, wh=wh, artifact=artifact, **kw)
         # 2. fetch the miner's attested proof + trace for this epoch (decoupled)
         try:
             sub = get_proof(hk, epoch, nonce, repo)
@@ -803,6 +809,85 @@ class KOTHValidator:
         if self.budget <= 0 or not self.cost_tiebreak:
             return vd.score
         return vd.score - self.cost_tiebreak * min(1.0, vd.total_cost_usd / self.budget)
+
+    def _coronation_gate(self, evals, nonce: str, probe_commit, audit_detail):
+        """`can_crown` for the reign: a challenger may take the crown only if it does not collapse
+        on tasks it has never seen.
+
+        WHY HERE AND NOT PER-MINER. `KingChain` appends to its pension chain in exactly one place —
+        a king that was just dethroned — so every paid seat traces back through a coronation. Gating
+        the coronation therefore covers ALL emissions while re-executing one or two agents per crown
+        change, instead of every miner every epoch. Whole-cohort probing was correct and nobody could
+        afford to run it; this is the same guarantee at ~1/100th the cost.
+
+        PAIRED, not absolute. `memorization_collapsed_relative` normalises a miner's drop by the
+        cohort median precisely because a probe merely HARDER than the scored slice otherwise
+        false-DQs honest miners (measured: a 15-point difficulty gap suffices at n=64). With a single
+        challenger there is no cohort, so the incumbent is audited on the SAME probe and supplies the
+        baseline. A challenger that drops no more than the sitting king is not memorising — it is
+        answering a harder set, exactly like the king.
+
+        Verdicts are cached on the artifact key the accumulator already uses, so a challenger that
+        keeps nudging the crown pays for one audit per artifact, not one per epoch.
+        """
+        bank = None
+        if self.probe_bank is not None:
+            bank = (self.probe_bank
+                    if (not probe_commit or self.probe_bank.commit() == probe_commit) else None)
+        if self.enforce and probe_commit and bank is None:
+            # a secret probe is REQUIRED but unverifiable -> refuse every coronation rather than
+            # crown on an audit we cannot trust. The incumbent keeps the crown; nothing is paid to
+            # an unaudited challenger.
+            audit_detail["coronation"] = {"error": "probe_bank_unverified"}
+            return lambda challenger, incumbent: False
+
+        probe = self._shared_probe(nonce, bank)
+
+        def _drop(hk):
+            """claimed - fresh for ONE miner, or None if it cannot be audited."""
+            ev = evals.get(hk)
+            if ev is None or ev.verdict is None or ev.artifact is None:
+                return None
+            try:
+                claimed, fresh, n_c, n_f = self._audit(ev.artifact, probe, ev.verdict)[1:]
+            except SandboxError:
+                return None
+            return (claimed, fresh, n_c, n_f)
+
+        def can_crown(challenger, incumbent):
+            key = self._audit_key(challenger, evals)
+            if key is not None and key in self._coronation_verdicts:
+                return self._coronation_verdicts[key]
+
+            ch = _drop(challenger)
+            if ch is None:
+                # unauditable challenger: refuse. Failing OPEN here would make "ship something the
+                # sandbox cannot run" the cheapest way past the gate.
+                audit_detail.setdefault("coronation", {})[challenger] = "unauditable"
+                return False
+            claimed, fresh, n_c, n_f = ch
+            inc = _drop(incumbent) if incumbent else None
+            allowance = max(0.0, min((inc[0] - inc[1]) if inc else self.max_probe_drop,
+                                     self.max_probe_drop))
+            ok = not memorization_collapsed_relative(claimed, n_c, fresh, n_f, allowance)
+            audit_detail.setdefault("coronation", {})[challenger] = {
+                "claimed": round(claimed, 4), "fresh": round(fresh, 4),
+                "allowance": round(allowance, 4), "passed": ok,
+                "baseline": "incumbent" if inc else "max_probe_drop"}
+            if key is not None:
+                self._coronation_verdicts[key] = ok
+            return ok
+
+        return can_crown
+
+    @staticmethod
+    def _audit_key(hk, evals):
+        """The artifact identity the accumulator already keys on — so a re-commit re-audits, and a
+        challenger that merely keeps competing does not."""
+        ev = evals.get(hk)
+        if ev is None or ev.sh is None or ev.wh is None:
+            return None
+        return (hk, ev.sh, ev.wh)
 
     def _accumulate(self, evals, dq, ref: dict | None = None, audit: dict | None = None) -> dict:
         """docs/DESIGN.md §5b: pool each committed artifact's per-epoch evidence into one Wilson-LCB (EWMA
@@ -1026,7 +1111,15 @@ class KOTHValidator:
         # ALWAYS settle the epoch, even with nothing to score: skipping `set_weights` leaves the
         # PREVIOUS weights standing on-chain, so a network where everyone stopped submitting kept
         # paying its last slate in full, forever. No live miners -> the reign burns to uid 0.
-        res = self.reign.update(subs, deregistered=dereg, live=live)
+        # Pass `can_crown` ONLY when the gate is active. The graduated `Reign` has no such
+        # parameter, so an inactive gate must not be handed to it — and an ACTIVE one reaching a
+        # reign that cannot honour it raises here rather than silently skipping the audit, which
+        # would be an unenforced gate that reads as enforced.
+        gate = (self._coronation_gate(evals, nonce, probe_commit, audit_detail)
+                if self.audit_mode == "coronation" else None)
+        res = (self.reign.update(subs, deregistered=dereg, live=live, can_crown=gate)
+               if gate is not None else
+               self.reign.update(subs, deregistered=dereg, live=live))
 
         weights: dict[int, float] = {}
         hk_to_uid = {hk: uid for uid, hk in self.chain.hotkeys().items()}

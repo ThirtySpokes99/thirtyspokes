@@ -205,6 +205,11 @@ class KOTHValidator:
         # (hotkey, source_hash, weights_hash) -> passed?  A challenger that keeps nudging the crown
         # pays for ONE audit per artifact; a re-commit changes the key and must earn the crown again.
         self._coronation_verdicts: dict[tuple, bool] = {}
+        # (source_hash, weights_hash) artifacts that COLLAPSED on the held-out seat audit and are
+        # therefore banned FOREVER: a re-submission of the same committed weights is rejected without
+        # re-auditing; a re-commit of NEW weights is a different artifact and may compete again.
+        # Persisted in snapshot()/restore() so a restart does not un-ban a caught memorizer.
+        self._banned_artifacts: set[tuple] = set()
         self.epoch_blocks = epoch_blocks
         # F7 anti-grind: if set, a scored proof must have been COMMITTED on-chain (report_data) inside
         # [epoch*epoch_blocks, +commit_window] blocks and revealed EXACTLY — binding one run (no
@@ -387,6 +392,8 @@ class KOTHValidator:
         return {"reign": self.reign.snapshot(), "king": king, "evidence": self._evidence.snapshot(),
                 "history": self._history, "last_scored_epoch": self._last_scored_epoch,
                 "pending_weights": self._pending_weights, "pending_report": pending_report,
+                # the forever-ban must survive a restart, else a reboot un-bans a caught memorizer
+                "banned_artifacts": [list(k) for k in self._banned_artifacts],
                 "last_submitted_weights": self._last_submitted_weights}
 
     def restore(self, snap: dict) -> None:
@@ -412,6 +419,7 @@ class KOTHValidator:
         self._last_submitted_weights = (
             {int(uid): float(weight) for uid, weight in submitted.items()}
             if submitted is not None else None)
+        self._banned_artifacts = {tuple(map(str, k)) for k in snap.get("banned_artifacts", [])}
         self._king_id = None
         self._king_vd = None
         k = snap.get("king")
@@ -599,6 +607,10 @@ class KOTHValidator:
         except Exception:  # noqa: BLE001
             return _MinerEval(dq="artifact_unavailable")
         sh, wh = hash_source(artifact.source_text), hash_weights(artifact.weights)
+        if (sh, wh) in self._banned_artifacts:
+            # these exact committed weights already collapsed on the held-out seat audit -> rejected
+            # forever, without re-auditing. A re-commit of NEW weights is a different artifact.
+            return _MinerEval(dq="banned_artifact")
         if not commitmod.verify_commit(commit_data, hk, sh, wh):
             return _MinerEval(dq="bad_commit")
         # from here the artifact is bound to the commit -> carry its hashes on EVERY outcome, so the
@@ -889,6 +901,66 @@ class KOTHValidator:
             return None
         return (hk, ev.sh, ev.wh)
 
+    def _audit_paid_seats(self, evals, probe, paid: list[str], audit_detail: dict) -> set[str]:
+        """Held-out audit of the seats the reign is about to PAY (king + live pension members).
+
+        The coronation gate stops a memorizer from ever being CROWNED, but it never re-examines the
+        sitting king or the ex-kings already in the pension chain — exactly the seats a hardcoding
+        attacker that took the crown before the gate existed still draws emissions from. This closes
+        that hole: every epoch, each paid seat whose artifact is not already known-good is re-run on
+        the SAME shared probe; a collapse (vs the cohort's own allowance, like `_detect_memorizers`)
+        ejects it.
+
+        Only seats in `evals` (live this epoch, artifact downloaded) can be audited — an absent seat
+        is not paid anyway, so skipping it costs nothing. Results cache on the artifact key like the
+        coronation gate: a seat pays for ONE audit per committed artifact, not one per epoch.
+        Returns the set of hotkeys that collapsed (caller ejects + bans them).
+        """
+        auditable: dict[str, tuple] = {}     # hk -> (claimed, fresh, n_c, n_f) this epoch
+        for hk in paid:
+            ev = evals.get(hk)
+            if ev is None or ev.verdict is None or ev.artifact is None:
+                continue                                  # absent / unauditable this epoch -> skip
+            key = (hk, ev.sh, ev.wh)
+            if (ev.sh, ev.wh) in self._banned_artifacts:
+                continue                                  # already banned -> caller rejects it
+            if key in self._coronation_verdicts and self._coronation_verdicts[key]:
+                continue                                  # already audited clean on this artifact
+            try:
+                auditable[hk] = self._audit(ev.artifact, probe, ev.verdict)[1:]
+            except SandboxError:
+                audit_detail.setdefault("seat_audit", {})[hk] = "unauditable"
+        if not auditable:
+            return set()
+        allowance = cohort_probe_allowance(
+            [c - f for (c, f, _, _) in auditable.values()],
+            min_cohort=self.min_cohort, max_drop=self.max_probe_drop)
+        collapsed: set[str] = set()
+        for hk, (claimed, fresh, n_c, n_f) in auditable.items():
+            bad = memorization_collapsed_relative(claimed, n_c, fresh, n_f, allowance)
+            ev = evals[hk]
+            self._coronation_verdicts[(hk, ev.sh, ev.wh)] = not bad
+            audit_detail.setdefault("seat_audit", {})[hk] = {
+                "claimed": round(claimed, 4), "fresh": round(fresh, 4),
+                "allowance": round(allowance, 4), "passed": not bad}
+            if bad:
+                collapsed.add(hk)
+                self._banned_artifacts.add((ev.sh, ev.wh))   # ban these weights forever
+        return collapsed
+
+    def _eject_seats(self, hotkeys: set[str]) -> None:
+        """Remove collapsed hotkeys from the reign's paid seats (king + pension chain).
+
+        Ejecting the king leaves the crown VACANT (it burns to uid 0) rather than promoting the
+        runner-up — the same fail-closed rule the coronation gate uses, so an unaudited miner is
+        never handed emissions by the back door. Only `KingChain` exposes king/chain; the graduated
+        `Reign` never runs the seat audit, so this is a no-op there."""
+        if not hasattr(self.reign, "king"):
+            return
+        if self.reign.king is not None and self.reign.king.sub.hotkey in hotkeys:
+            self.reign.king = None
+        self.reign.chain = [s for s in self.reign.chain if s.hotkey not in hotkeys]
+
     def _accumulate(self, evals, dq, ref: dict | None = None, audit: dict | None = None) -> dict:
         """docs/DESIGN.md §5b: pool each committed artifact's per-epoch evidence into one Wilson-LCB (EWMA
         decay, reset-on-recommit) and return {hotkey: accumulated score} for the eligible candidates.
@@ -1120,6 +1192,36 @@ class KOTHValidator:
         res = (self.reign.update(subs, deregistered=dereg, live=live, can_crown=gate)
                if gate is not None else
                self.reign.update(subs, deregistered=dereg, live=live))
+
+        # PAID-SEAT AUDIT: re-examine the seats the reign is about to PAY (king + live ex-kings),
+        # which the coronation gate never re-checks once crowned. A seat whose committed artifact
+        # collapses on the held-out probe is ejected and its weights banned forever. Runs only in
+        # `coronation` mode, alongside the gate — the cheap audit the deployment can afford.
+        if gate is not None:
+            paid = [m.sub.hotkey for m in self.reign.members
+                    if m.sub.miner_id in live and m.sub.hotkey not in dereg]
+            bank = None
+            if self.probe_bank is not None:
+                bank = (self.probe_bank
+                        if (not probe_commit or self.probe_bank.commit() == probe_commit) else None)
+            collapsed = self._audit_paid_seats(evals, self._shared_probe(nonce, bank),
+                                               paid, audit_detail)
+            for hk in collapsed:
+                dq[hk] = "memorization"
+                scored_out.pop(hk, None)
+                verdicts.pop(hk, None)
+                self._evidence.drop(hk)               # forget the poisoned accumulated evidence
+            if collapsed:
+                self._eject_seats(collapsed)          # remove from king/pension; crown stays vacant
+                # recompute the payout over the surviving seats: the reign already emitted weights
+                # including the ejected seats, so rescale (or burn) before anything is submitted.
+                surv = [m.sub.hotkey for m in self.reign.members
+                        if m.sub.miner_id in live and m.sub.hotkey not in dereg]
+                res.weights = ({m: 1.0 / len(surv) for m in surv}
+                               if surv else {self.reign.burn_uid: 1.0})
+                res.slots = ([self.reign.members[0].sub.miner_id] if self.reign.members else []) + \
+                            [m.sub.miner_id for m in self.reign.members[1:]]
+                res.slots += [""] * (self.reign.chain_size - len(res.slots))
 
         weights: dict[int, float] = {}
         hk_to_uid = {hk: uid for uid, hk in self.chain.hotkeys().items()}

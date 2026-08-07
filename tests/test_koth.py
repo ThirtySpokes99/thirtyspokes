@@ -2360,6 +2360,40 @@ def test_scan_weights_finds_an_answer_table_but_not_random_weights():
     assert scan_weights(b"", golds, salt="n1")[0] is False
 
 
+def test_scan_source_catches_a_prompt_lookup_table_and_solution_contracts():
+    """The live hardcoding king (tommy120429/ares1) stored NO answer string: a sha256(prompt)→rung
+    table plus a dict of canned solution contracts. `_HARDCODE` and the digit-decoy `scan_weights`
+    both miss that shape — it must be caught STRUCTURALLY."""
+    from thirtyspokes.koth.verify import scan_source
+    rows = ",\n".join(f"    '{i:064x}': {i % 7}" for i in range(20))
+    contract_rows = ",\n".join(
+        f"    'algo-{i}': \"{'Reference algorithm contract. ' * 40}\"" for i in range(5))
+    src = (
+        "EXACT = {\n" + rows + "\n}\n"
+        "_CONTRACTS = {\n" + contract_rows + "\n}\n"
+        "def build_agent(w):\n    def agent(p, c): return c(0, [], {})\n    return agent\n")
+    assert scan_source(src)[0] is True
+    # honest router: a prompt template + small config, no digest table, no canned solutions
+    honest = ("TEMPLATE = 'Route this ask to the best model: {ask}'\n"
+              "CONFIG = {'a': 1, 'b': 2}\n"
+              "def build_agent(w):\n    def agent(p, c): return c(0, [], {})\n    return agent\n")
+    assert scan_source(honest) == (False, "clean")
+    # an unparseable artifact is not auto-DQ'd on that basis
+    assert scan_source("def broken(:")[0] is False
+
+
+def test_scan_weights_catches_a_routing_lookup_table():
+    """The king's weights.bin was JSON `exact`/`near`/`contracts` rows (hex prompt-digest → rung),
+    not a float vector. No answer string present, so only the structural shape catches it."""
+    import json
+    from thirtyspokes.koth.verify import scan_weights
+    table = json.dumps({"exact": [[f"{i:064x}", i % 7] for i in range(56)]}).encode()
+    assert scan_weights(table, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+    # below the row threshold an honest head's JSON metadata is not flagged
+    tiny = json.dumps({"exact": [["a" * 64, 1], ["b" * 64, 2]]}).encode()
+    assert scan_weights(tiny, [1, 2, 3], salt="n1")[0] is False
+
+
 # --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------
 # The old scalar (Q_lcb - lambda*cost) scores the OUTCOME, is ABSOLUTE rather than baseline-relative
 # (on a 95%-accurate pool ~98% of it measures the POOL), and fixes ONE quality/price exchange rate.

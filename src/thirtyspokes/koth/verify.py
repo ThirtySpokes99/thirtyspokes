@@ -23,6 +23,7 @@ probe (`memorization_collapsed*` + the validator sandbox) is the opt-in upgrade 
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from math import sqrt
@@ -451,11 +452,72 @@ def behavioral_duplicates(fingerprints: dict[str, tuple], commit_block: dict[str
 _HARDCODE = re.compile(r"ANSWER_TABLE|GOLD_ANSWERS|hardcoded|answers\s*=\s*\{", re.IGNORECASE)
 
 
+def _is_hex(s: str, lengths: tuple[int, ...]) -> bool:
+    return len(s) in lengths and all(c in "0123456789abcdef" for c in s.lower())
+
+
+def _lookup_table(tree, min_rows: int) -> tuple[bool, str]:
+    """Detect a memorized prompt→disposition table in the AST.
+
+    A hardcoding router never stores an answer string (that is what `_HARDCODE` and
+    `scan_weights` hunt for). It stores an INDEX: the prompt's sha256 / simhash keying a fixed
+    table whose values are which model to call or which canned solution to prepend. That is
+    invisible to any substring scan, so it is caught structurally here. Two shapes:
+
+      * a dict literal with >= `min_rows` keys that are hex digests (32/40/64) — a hash→rung or
+        hash→contract table (`exact`, `contracts`, a prototype map);
+      * a list/tuple of >= `min_rows` rows that each lead with a hex digest — the same table as
+        `[[hex, rung], ...]` rows (`near`, and the weights-side `exact`/`contracts` encoding).
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            keys = [k for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+            if len(keys) >= min_rows and all(_is_hex(k.value, (32, 40, 64)) for k in keys):
+                return True, "prompt_lookup_table"
+        elif isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) >= min_rows:
+            rows = [e for e in node.elts
+                    if isinstance(e, (ast.List, ast.Tuple)) and e.elts
+                    and isinstance(e.elts[0], ast.Constant) and isinstance(e.elts[0].value, str)]
+            if len(rows) >= min_rows and all(_is_hex(r.elts[0].value, (32, 64)) for r in rows):
+                return True, "prompt_lookup_table"
+    return False, "clean"
+
+
+def _solution_blob(tree, min_blob: int, min_count: int) -> bool:
+    """Detect canned solution/hint text embedded in the source: several long prose string
+    constants (the `_CONTRACTS` body). A single long docstring or one prompt template is normal;
+    `min_count` separate multi-hundred-char instruction blobs is a hardcoded answer key."""
+    blobs = [n.value for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) >= min_blob]
+    return len(blobs) >= min_count
+
+
 def scan_source(source_text: str) -> tuple[bool, str]:
-    """Flag literal hardcoded-answer tables in the PUBLIC source. A pattern scan is a
-    stand-in for an AST/human audit; the validator runs it on the artifact it
-    downloads, so it is bound to the committed source by construction."""
-    return (True, "hardcoded_answers") if _HARDCODE.search(source_text) else (False, "clean")
+    """Flag hardcoding in the PUBLIC source. The validator runs it on the artifact it downloads,
+    so it is bound to the committed source by construction.
+
+    Two layers: the legacy `_HARDCODE` keyword grep (a literal, self-labelled answer table), then
+    a STRUCTURAL pass that catches the lookup-table shape a deliberate hardcoder actually uses —
+    a prompt-hash → model-rung table, or a prompt-hash → canned-solution contract — which stores no
+    answer string and so defeats both `_HARDCODE` and `scan_weights`. Parse failure falls back to
+    the regex alone (an unparseable artifact is not auto-DQ'd on that basis)."""
+    if _HARDCODE.search(source_text):
+        return True, "hardcoded_answers"
+    try:
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
+        return False, "clean"
+    if _solution_blob(tree, _MIN_SOLUTION_BLOB, _MIN_SOLUTION_BLOBS):
+        return True, "hardcoded_solution_contract"
+    return _lookup_table(tree, _MIN_LOOKUP_ROWS)
+
+
+# a dict/list needs at least this many digest-keyed rows before it is a memorized index rather
+# than an incidental constant; tuned well above any honest router's literal config.
+_MIN_LOOKUP_ROWS = 8
+# a single long string is a prompt template or docstring; several are canned solutions.
+_MIN_SOLUTION_BLOB = 400
+_MIN_SOLUTION_BLOBS = 2
 
 
 def _decoys(golds: list[str], salt: str) -> list[str]:
@@ -495,6 +557,12 @@ def scan_weights(weights: bytes, golds: list, *, salt: str = "", min_golds: int 
     """
     if not weights:
         return False, "clean"
+    # structural pass: a JSON blob that is a memorized prompt→rung index (`exact`/`near`/`contracts`
+    # — hex-digest keys or digest-leading rows mapping to small model indices). This stores no answer
+    # string, so the digit-decoy substring pass below can never see it; catch the shape directly.
+    lookup = _weights_lookup_table(weights)
+    if lookup:
+        return True, lookup
     # only golds that are numeric enough to build a same-shape control for
     usable = [s for s in (str(g) for g in golds) if s.isdigit()]
     if len(usable) < min_golds:
@@ -505,6 +573,37 @@ def scan_weights(weights: bytes, golds: list, *, salt: str = "", min_golds: int 
     if real >= min_hit and real >= ratio * max(ctrl, 1e-9):
         return True, "answers_in_weights"
     return False, "clean"
+
+
+def _weights_lookup_table(weights: bytes, min_rows: int = _MIN_LOOKUP_ROWS) -> str:
+    """Return the DQ reason if the weights blob is a JSON memorized prompt→disposition table, else "".
+
+    Trained router weights are a float vector/matrix; a JSON object whose values are rows keyed by
+    (or leading with) a hex prompt-digest and resolving to a small model index is a lookup table.
+    Requires >= `min_rows` such rows so an honest head that happens to ship JSON metadata is not
+    flagged. Never raises — an unparseable/non-JSON blob is simply not this shape."""
+    import json
+    try:
+        data = json.loads(weights.decode("utf-8"))
+    except Exception:                                   # noqa: BLE001 — not JSON -> not this table
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    def digest_keyed(rows) -> bool:
+        if isinstance(rows, dict):
+            return len(rows) >= min_rows and all(
+                isinstance(k, str) and _is_hex(k, (32, 40, 64)) for k in rows)
+        if isinstance(rows, list):
+            return len(rows) >= min_rows and all(
+                isinstance(r, list) and r and isinstance(r[0], str) and _is_hex(r[0], (32, 64))
+                for r in rows)
+        return False
+
+    for key in ("exact", "near", "contracts"):
+        if key in data and digest_keyed(data[key]):
+            return "routing_lookup_table"
+    return ""
 
 
 @dataclass(frozen=True)

@@ -2392,9 +2392,11 @@ def test_scan_weights_catches_a_routing_lookup_table():
     from thirtyspokes.koth.verify import scan_weights
     table = json.dumps({"exact": [[f"{i:064x}", i % 7] for i in range(56)]}).encode()
     assert scan_weights(table, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
-    # below the row threshold an honest head's JSON metadata is not flagged
+    # even a 2-row digest->rung table is a lookup table (a real one can be small — the live evader's
+    # `routes` had just 2), so it is flagged; only a NON-digest-keyed JSON stays clean
     tiny = json.dumps({"exact": [["a" * 64, 1], ["b" * 64, 2]]}).encode()
-    assert scan_weights(tiny, [1, 2, 3], salt="n1")[0] is False
+    assert scan_weights(tiny, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+    assert scan_weights(json.dumps({"lr": 0.01, "layers": [64, 32]}).encode(), [1, 2, 3], salt="n1")[0] is False
 
 
 def test_scan_weights_catches_a_routes_keyed_table():
@@ -2404,6 +2406,25 @@ def test_scan_weights_catches_a_routes_keyed_table():
     from thirtyspokes.koth.verify import scan_weights
     routes = json.dumps({"efforts": {}, "routes": {f"{i:064x}": 6 for i in range(20)}}).encode()
     assert scan_weights(routes, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+
+
+def test_scan_weights_catches_truncated_hash_keys_and_prose_values():
+    """The jaysun007/koth-miner evasion: the table is keyed by a TRUNCATED digest (sha256(...)[:24])
+    under a renamed key (`notes`/`routes`), with the canned solutions as long prose VALUES in the
+    weights blob (kept out of source, where `_solution_blob` would see them). Generalised detector:
+    any digest-keyed map carrying solution prose is flagged at one row; a bare digest->int map at 2+.
+    """
+    import json
+    from thirtyspokes.koth.verify import scan_weights
+    prose = "Implementation blueprint (mandatory): " + "do the thing precisely. " * 30
+    notes = {f"{i:024x}": [4, prose] for i in range(8)}       # 24-char truncated digest keys
+    w = json.dumps({"default": 4, "fmt": "x", "notes": notes, "routes": {"ab" * 12: 1}}).encode()
+    assert scan_weights(w, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+    # a bare truncated-digest -> model-index table (no prose) is caught at 2+ rows
+    bare = json.dumps({"routes": {f"{i:024x}": 1 for i in range(3)}}).encode()
+    assert scan_weights(bare, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+    # a single coincidental hex config key with no prose is NOT flagged
+    assert scan_weights(json.dumps({"deadbeefcafe1234": 3}).encode(), [1, 2, 3], salt="n1")[0] is False
 
 
 # --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------

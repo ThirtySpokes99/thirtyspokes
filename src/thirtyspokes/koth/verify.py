@@ -452,7 +452,11 @@ def behavioral_duplicates(fingerprints: dict[str, tuple], commit_block: dict[str
 _HARDCODE = re.compile(r"ANSWER_TABLE|GOLD_ANSWERS|hardcoded|answers\s*=\s*\{", re.IGNORECASE)
 
 
-def _is_hex(s: str, lengths: tuple[int, ...]) -> bool:
+def _is_hex(s: str, lengths: tuple[int, ...] = (16, 24, 32, 40, 64)) -> bool:
+    """A hex digest OR a truncated one. Hardcoders key their lookup tables by a prompt hash, and a
+    deliberate evasion truncates it (a 24-char `sha256(...)[:24]`) to slip a length allow-list that
+    only knew full digests. 16 hex chars is 64 bits — already far past accidental collision for a
+    routing table, and shorter than any honest coincidental hex constant needs to be."""
     return len(s) in lengths and all(c in "0123456789abcdef" for c in s.lower())
 
 
@@ -472,13 +476,13 @@ def _lookup_table(tree, min_rows: int) -> tuple[bool, str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             keys = [k for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
-            if len(keys) >= min_rows and all(_is_hex(k.value, (32, 40, 64)) for k in keys):
+            if len(keys) >= min_rows and all(_is_hex(k.value) for k in keys):
                 return True, "prompt_lookup_table"
         elif isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) >= min_rows:
             rows = [e for e in node.elts
                     if isinstance(e, (ast.List, ast.Tuple)) and e.elts
                     and isinstance(e.elts[0], ast.Constant) and isinstance(e.elts[0].value, str)]
-            if len(rows) >= min_rows and all(_is_hex(r.elts[0].value, (32, 64)) for r in rows):
+            if len(rows) >= min_rows and all(_is_hex(r.elts[0].value) for r in rows):
                 return True, "prompt_lookup_table"
     return False, "clean"
 
@@ -575,13 +579,20 @@ def scan_weights(weights: bytes, golds: list, *, salt: str = "", min_golds: int 
     return False, "clean"
 
 
-def _weights_lookup_table(weights: bytes, min_rows: int = _MIN_LOOKUP_ROWS) -> str:
+def _weights_lookup_table(weights: bytes, min_rows: int = 2) -> str:
     """Return the DQ reason if the weights blob is a JSON memorized prompt→disposition table, else "".
 
-    Trained router weights are a float vector/matrix; a JSON object whose values are rows keyed by
-    (or leading with) a hex prompt-digest and resolving to a small model index is a lookup table.
-    Requires >= `min_rows` such rows so an honest head that happens to ship JSON metadata is not
-    flagged. Never raises — an unparseable/non-JSON blob is simply not this shape."""
+    Trained router weights are a float vector/matrix; a JSON object that maps a prompt digest to a
+    model index or a canned solution is a lookup table. Three evasions are caught by construction:
+
+      * KEY NAME — the table need not be called `exact`/`near`/`contracts`; evaders renamed it
+        `routes`, then `notes`. EVERY digest-keyed mapping is examined, whatever its key.
+      * TRUNCATED DIGEST — keys may be a cut-down hash (`sha256(...)[:24]`); `_is_hex` accepts it.
+      * ROW COUNT — a digest-keyed map whose values carry solution prose is flagged at ONE row; a
+        bare digest→small-int map needs `min_rows` (>=2) so a single coincidental hex config key
+        (`{"deadbeef…": 3}`) is not flagged on its own.
+
+    Never raises — an unparseable/non-JSON blob is simply not this shape."""
     import json
     try:
         data = json.loads(weights.decode("utf-8"))
@@ -590,19 +601,48 @@ def _weights_lookup_table(weights: bytes, min_rows: int = _MIN_LOOKUP_ROWS) -> s
     if not isinstance(data, dict):
         return ""
 
-    def digest_keyed(rows) -> bool:
-        if isinstance(rows, dict):
-            return len(rows) >= min_rows and all(
-                isinstance(k, str) and _is_hex(k, (32, 40, 64)) for k in rows)
-        if isinstance(rows, list):
-            return len(rows) >= min_rows and all(
-                isinstance(r, list) and r and isinstance(r[0], str) and _is_hex(r[0], (32, 64))
-                for r in rows)
+    def row_digest(r) -> bool:
+        return isinstance(r, list) and r and isinstance(r[0], str) and _is_hex(r[0])
+
+    def has_prose(v) -> bool:
+        """A canned solution/blueprint: a long instruction string, or a row containing one."""
+        if isinstance(v, str):
+            return len(v) >= _MIN_SOLUTION_BLOB
+        if isinstance(v, (list, tuple)):
+            return any(isinstance(x, str) and len(x) >= _MIN_SOLUTION_BLOB for x in v)
         return False
 
-    for key in ("exact", "near", "contracts", "routes", "table", "lookup"):
-        if key in data and digest_keyed(data[key]):
+    def small_int(v) -> bool:
+        return isinstance(v, int) or (isinstance(v, (list, tuple)) and v and isinstance(v[0], int))
+
+    def scan_mapping(rows) -> str:
+        if not isinstance(rows, dict) or not rows:
+            return ""
+        items = [(k, v) for k, v in rows.items() if isinstance(k, str) and _is_hex(k)]
+        if not items:
+            return ""
+        # any digest-keyed entry carrying solution prose is a hardcoded answer key, however few
+        if any(has_prose(v) for _, v in items):
             return "routing_lookup_table"
+        # a bare digest->model-index map needs enough rows to be a table, not a coincidence
+        if len(items) >= min_rows and all(small_int(v) for _, v in items):
+            return "routing_lookup_table"
+        return ""
+
+    def scan_rows(rows) -> str:
+        if not isinstance(rows, list) or not rows:
+            return ""
+        sel = [r for r in rows if row_digest(r)]
+        if any(has_prose(r) for r in sel):
+            return "routing_lookup_table"
+        if len(sel) >= min_rows and all(small_int(r[1:]) for r in sel):
+            return "routing_lookup_table"
+        return ""
+
+    for v in data.values():
+        hit = scan_mapping(v) if isinstance(v, dict) else scan_rows(v) if isinstance(v, list) else ""
+        if hit:
+            return hit
     return ""
 
 

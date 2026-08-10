@@ -862,7 +862,10 @@ def test_simulation_every_defense_fires():
     assert dq.get("lying-rt") == "unapproved_runtime"
     assert dq.get("fake-quote") == "bad_platform_quote"
     assert dq.get("replayer") == "epoch_nonce_mismatch"
-    assert dq.get("hardcoder") == "hardcoded_answers"
+    # the hardcoder's committed artifact is now caught by the commit-time scan (which permanently
+    # bans it) BEFORE the proof path runs — so accept either the commit-scan ban or the in-gate scan.
+    assert dq.get("hardcoder") in {"banned_artifact", "hardcoded_answers",
+                                   "hardcoded_solution_contract", "prompt_lookup_table"}
     # the memorizer keeps its answer table in weights.bin. `scan_weights` now catches it BEFORE the
     # probe audit runs — a cheaper, earlier catch — so accept either memorization defense firing.
     assert dq.get("memorizer") in {"answers_in_weights", "memorization", "ungrounded", "laundered"}
@@ -2392,6 +2395,15 @@ def test_scan_weights_catches_a_routing_lookup_table():
     # below the row threshold an honest head's JSON metadata is not flagged
     tiny = json.dumps({"exact": [["a" * 64, 1], ["b" * 64, 2]]}).encode()
     assert scan_weights(tiny, [1, 2, 3], salt="n1")[0] is False
+
+
+def test_scan_weights_catches_a_routes_keyed_table():
+    """Live evaders (jacob-rojic/koth-miner-9 et al.) renamed the lookup key to `routes` — a dict of
+    hex prompt-hash -> rung — to slip past a key-list that only knew exact/near/contracts."""
+    import json
+    from thirtyspokes.koth.verify import scan_weights
+    routes = json.dumps({"efforts": {}, "routes": {f"{i:064x}": 6 for i in range(20)}}).encode()
+    assert scan_weights(routes, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
 
 
 # --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------

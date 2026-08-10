@@ -600,7 +600,7 @@ def _weights_lookup_table(weights: bytes, min_rows: int = _MIN_LOOKUP_ROWS) -> s
                 for r in rows)
         return False
 
-    for key in ("exact", "near", "contracts"):
+    for key in ("exact", "near", "contracts", "routes", "table", "lookup"):
         if key in data and digest_keyed(data[key]):
             return "routing_lookup_table"
     return ""

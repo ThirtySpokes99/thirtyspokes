@@ -901,6 +901,42 @@ class KOTHValidator:
             return None
         return (hk, ev.sh, ev.wh)
 
+    def _scan_commit(self, hk: str, commit_data: str, repo: str, revision: str,
+                     nonce: str) -> str | None:
+        """Static hardcoding scan of the COMMITTED artifact, independent of any proof.
+
+        WHY THIS EXISTS. The per-miner scan in `_score_one_miner` runs only AFTER a valid proof is
+        verified — so a hardcoder that commits a lookup-table artifact and then withholds its proof
+        (`no_proof`) never reaches the scan, is never flagged, and keeps a live binding commitment
+        that can sneak a proof through on a later epoch. Scanning at commit time closes that: every
+        committed artifact is examined whether or not the miner ever submits. On a hit the artifact
+        is PERMANENTLY banned (its (sh, wh) joins `_banned_artifacts`), so those exact weights can
+        never be re-submitted; a re-commit of NEW weights is a different artifact and re-scanned.
+
+        Returns the DQ reason, or None when the artifact is clean (or unscannable this epoch —
+        a download failure / unpinned revision is left to the normal proof path to handle)."""
+        if not is_pinned_revision(revision):
+            return None
+        try:
+            artifact = self.store.download(repo, revision)
+        except Exception:                       # noqa: BLE001 — unavailable is not proof of cheating
+            return None
+        sh, wh = hash_source(artifact.source_text), hash_weights(artifact.weights)
+        if (sh, wh) in self._banned_artifacts:
+            return "banned_artifact"
+        if not commitmod.verify_commit(commit_data, hk, sh, wh):
+            return None                         # a bad binding is caught downstream, not our call here
+        hard, reason = scan_source(artifact.source_text)
+        if not hard:
+            golds = [t.gold for b in self.suite
+                     for t in b.sample(self.n_per_bench, bench_seed(nonce, 0, b.name))]
+            hard, reason = scan_weights(artifact.weights, golds, salt=nonce)
+        if hard:
+            self._banned_artifacts.add((sh, wh))         # permanent ban on these exact weights
+            self._evidence.drop(hk)                      # forget any evidence the cheat accumulated
+            return reason
+        return None
+
     def _audit_paid_seats(self, evals, probe, paid: list[str], audit_detail: dict) -> set[str]:
         """Held-out audit of the seats the reign is about to PAY (king + live pension members).
 
@@ -1085,6 +1121,13 @@ class KOTHValidator:
             if parsed is None:
                 continue                        # not a KOTH commit -> skip (no dq)
             commit_block[hk] = c.block
+            # COMMIT-TIME HARDCODING SCAN, before any proof is considered. A hardcoder that
+            # withholds its proof never reaches the in-gate scan, so scan the committed artifact
+            # here regardless; a hit DQ's the miner and permanently bans those exact weights.
+            committed_dq = self._scan_commit(hk, c.data, parsed[0], parsed[1], nonce)
+            if committed_dq is not None:
+                dq[hk] = committed_dq
+                continue
             ev = self._score_one_miner(hk, c.data, parsed[0], parsed[1], epoch, nonce, get_proof,
                                        gov, probe)
             evals[hk] = ev

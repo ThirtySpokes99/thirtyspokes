@@ -456,8 +456,22 @@ def _is_hex(s: str, lengths: tuple[int, ...] = (16, 24, 32, 40, 64)) -> bool:
     """A hex digest OR a truncated one. Hardcoders key their lookup tables by a prompt hash, and a
     deliberate evasion truncates it (a 24-char `sha256(...)[:24]`) to slip a length allow-list that
     only knew full digests. 16 hex chars is 64 bits — already far past accidental collision for a
-    routing table, and shorter than any honest coincidental hex constant needs to be."""
-    return len(s) in lengths and all(c in "0123456789abcdef" for c in s.lower())
+    routing table, and shorter than any honest coincidental hex constant needs to be.
+
+    A second evasion prepends a single non-hex tag character (`k003074e62…`) so the key is not pure
+    hex; strip ONE leading non-hex character and re-check, so a tagged digest is still recognised.
+    Only one char is stripped — a genuinely non-digest key is untouched."""
+    def hexpart(t: str) -> bool:
+        return len(t) in lengths and all(c in "0123456789abcdef" for c in t.lower())
+    if hexpart(s):
+        return True
+    # a single leading non-hex tag char: the REMAINDER is measured on its own length, so a
+    # `k` + 24-char truncation (25 chars total) is recognised by its 23/24-char hex body.
+    if len(s) > 1 and s[0].lower() not in "0123456789abcdef":
+        body = s[1:]
+        return all(c in "0123456789abcdef" for c in body.lower()) and \
+            (len(body) in lengths or len(body) >= 16)
+    return False
 
 
 def _lookup_table(tree, min_rows: int) -> tuple[bool, str]:

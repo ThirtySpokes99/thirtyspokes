@@ -2427,6 +2427,22 @@ def test_scan_weights_catches_truncated_hash_keys_and_prose_values():
     assert scan_weights(json.dumps({"deadbeefcafe1234": 3}).encode(), [1, 2, 3], salt="n1")[0] is False
 
 
+def test_scan_weights_catches_a_prefix_tagged_digest_table():
+    """The Zayaan/sn99-router evasion: each truncated digest key is prefixed with a non-hex tag
+    (`k003074e62…`) so the key is not pure hex and `_is_hex` rejected it. Strip ONE leading non-hex
+    char and re-check the body. The `guide` values are the same canned 'Reference algorithm…' prose
+    as the earlier evaders (copied verbatim)."""
+    import json
+    from thirtyspokes.koth.verify import scan_weights
+    prose = "Reference algorithm, required for both correctness and speed. " + "Work 0-based. " * 20
+    guide = {"k" + f"{i:024x}"[:23]: [4, "high", prose] for i in range(7)}   # k-prefixed digests
+    index = {"k" + f"{i:024x}"[:23]: 4 for i in range(19)}
+    w = json.dumps({"default": 4, "fmt": "sev4-blueprint-1", "guide": guide, "index": index}).encode()
+    assert scan_weights(w, [1, 2, 3], salt="n1") == (True, "routing_lookup_table")
+    # a plain non-hex config key is untouched by the prefix strip
+    assert scan_weights(json.dumps({"layers": [64, 32], "kind": "x"}).encode(), [1, 2, 3], salt="n1")[0] is False
+
+
 # --- the router scalar: "best answer at the lowest price, for a given ask" -----------------------
 # The old scalar (Q_lcb - lambda*cost) scores the OUTCOME, is ABSOLUTE rather than baseline-relative
 # (on a 95%-accurate pool ~98% of it measures the POOL), and fixes ONE quality/price exchange rate.

@@ -1,6 +1,6 @@
 # ThirtySpokes — deploying the subnet (owner)
 
-How to stand the subnet up (currently live on **testnet 526**; mainnet is netuid 99) and build the measured
+How to stand the subnet up (**live on mainnet netuid 99 since 2026-08-01**; testnet 526 remains for dev) and build the measured
 runtime image. To run a single node instead, see [`MINER.md`](MINER.md) / [`VALIDATOR.md`](VALIDATOR.md);
 for *how it works*, see [`DESIGN.md`](DESIGN.md). *(Forking this to run your own subnet? Substitute your
 own netuid throughout.)*
@@ -45,10 +45,11 @@ set -a && . ./.env && set +a && uv run python scripts/koth_live_smoke.py   # rea
 
 ## Production — Bittensor
 
-> **Currently deployed on Bittensor TESTNET — netuid 526** (`--network test`). Every command below
-> shows the live testnet target; mainnet (netuid 99, `--network finney`) remains the eventual
-> destination and is the code default, so **pass `--network test` explicitly** while running against
-> 526. Governance, the measured image (`v27`) and the per-epoch pool reference are published there.
+> **Live on Bittensor MAINNET — netuid 99 (`finney`), since 2026-08-01.** Governance record v7, the
+> measured image (`v27`) and the per-epoch reference are published on-chain there (verified: the
+> deployed runtime measurement matches this repo). Testnet **526** (`--network test`) remains available
+> for dev bring-up. The commands below still show the `526`/`--network test` target — **substitute
+> `--netuid 99 --network finney` (the code default) for the live mainnet deployment.**
 
 
 The trust claim is only real with genuine hardware attestation, so a production subnet needs the

@@ -7,8 +7,9 @@ grade the attested answers, score the *decisions* against the owner's pool refer
 and deterministic, so honest validators converge on the same king. For *how the mechanism works* see
 [`DESIGN.md`](DESIGN.md); to stand up a subnet see [`DEPLOYING.md`](DEPLOYING.md).
 
-> **Currently deployed on Bittensor TESTNET — netuid 526** (pass `--network test`; the code
-> default is mainnet `finney`, netuid 99, which remains the eventual destination).
+> **Live on Bittensor MAINNET — netuid 99 (`finney`, the code default), since 2026-08-01** (governance
+> v7, verified on-chain). Testnet **526** (`--network test`) remains for dev; the `526`/`--network test`
+> examples below **need `--netuid 99 --network finney` for the live mainnet deployment.**
 >
 > The daemon runs **fail-closed** by default: it scores a
 > proof only if the hardware quote matches the owner's pinned measured image. The no-gate (`--insecure`)

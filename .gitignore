@@ -29,3 +29,10 @@ wallets/
 koth_validator_state.json
 *_validator_state.json
 state.json
+
+# M3a run outputs — episodes are results, not source
+m3a-*/
+m3a-*.log
+
+# transient agent worktrees — never part of the tree
+.claude/worktrees/

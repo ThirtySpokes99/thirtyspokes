@@ -18,7 +18,7 @@ Two halves, both hardware-real (no shared secret, unlike the mock TEE):
 
 Residual (needs live Intel PCS collateral, not done here): TCB-status / CRL revocation.
 The cryptographic binding to authentic Intel silicon and to *this* proof IS checked.
-See docs/DEPLOYING.md §Production.
+See docs/DEPLOYING.md (removed with v2, 2026-09-07) §Production.
 """
 
 from __future__ import annotations
@@ -110,6 +110,47 @@ def get_quote(report_data: bytes) -> bytes:
                 os.rmdir(entry)
             except OSError:
                 pass
+
+
+IMAGE_ID_LABEL = b"thirtyspokes-image/1"
+IMAGE_ID_RTMRS = (0, 1, 2)
+
+
+def measurement_id(mr_td: str, rtmrs) -> str:
+    """One string that identifies a measured image — MRTD *and* the boot RTMRs.
+
+    MRTD ALONE IS NOT THE IMAGE. On a cloud TD it measures the initial memory the host builds, which
+    is the virtual firmware — the same for every guest on the platform. What distinguishes one image
+    from another is the boot chain: RTMR1 (kernel/UKI) and RTMR2 (initrd/cmdline), which is exactly
+    why `koth/owner.py` (removed with v2, 2026-09-07) always bound "approved MRTD + boot RTMR1/2" rather than MRTD by itself.
+    An identity built on MRTD alone would accept any image running on the same firmware.
+
+    RTMR3 is excluded deliberately: `koth/rtmr.py` (removed with v2, 2026-09-07) extended it with RUNTIME data, so it varies per run
+    and belongs to what the enclave did, not to which image it is.
+    """
+    h = hashlib.sha256()
+    h.update(IMAGE_ID_LABEL)
+    h.update(bytes.fromhex(mr_td))
+    for i in IMAGE_ID_RTMRS:
+        h.update(bytes.fromhex(rtmrs[i]))
+    return h.hexdigest()
+
+
+def self_measurement() -> str:
+    """The composite identity of the image THIS process is running inside, read from the hardware."""
+    p = parse_quote(get_quote(b"\x00" * 64))
+    return measurement_id(p.mr_td.hex(), tuple(r.hex() for r in p.rtmrs))
+
+
+def self_mrtd() -> str:
+    """The MRTD of the image THIS process is running inside, read from the hardware.
+
+    An enclave should never be *told* which image it is. Taking the measurement from a quote makes
+    the claim unforgeable at the source: a modified image cannot report the approved MRTD, because
+    the value comes from the TD's measurement register rather than from configuration. The quote is
+    over zeroed report_data — only the measurement is wanted here, nothing is being bound.
+    """
+    return parse_quote(get_quote(b"\x00" * 64)).mr_td.hex()
 
 
 def report_data_from_hash(payload_hash_hex: str) -> bytes:

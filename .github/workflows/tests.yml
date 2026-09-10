@@ -16,7 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        # 3.12 only, matching `.python-version` and the miner guide's requirement: 3.12 sums floats
+        # with error compensation and the accounting tests assert exact sums (measured 2026-09-08:
+        # the same arm summed to 1.4 on 3.12 and 1.4000000000000001 on 3.11).
+        python-version: ["3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +40,14 @@ jobs:
       # client stack installed it does not skip quietly — it fails collection — and the obvious
       # "fix" of making it skippable would retire the regression test for a live security property.
       # It adds no network dependency: nothing in the offline suite makes a request.
+      #
+      # `store`, `chain`, `miner`, `benchmarks` are the v3 seams the suite drives offline: the S3
+      # bucket class over a fake client, the chain adapter over generated storage items, the wallet
+      # keyfile reader, and the benchmark adapters' fetch path — four tests fail outright without
+      # `bittensor` and `huggingface_hub` installed (measured 2026-09-08), and the rest of those
+      # seams' tests would skip, which is the same retirement by omission.
       - name: Install package + test deps
-        run: uv pip install --system --no-cache -e ".[dev,tee,llm]"
+        run: uv pip install --system --no-cache -e ".[dev,tee,llm,store,chain,miner,benchmarks]"
 
       - name: Run test suite
         run: pytest -q

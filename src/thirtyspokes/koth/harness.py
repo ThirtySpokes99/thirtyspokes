@@ -18,12 +18,21 @@ to a router. Moving the engine into the harness deletes that whole class rather 
   * the PARAM CAP bounds artifact size and copy surface — but it does NOT stop a routing-table
     memoriser, and an earlier version of this file claimed it did. MEASURED
     (`scripts/memoriser_capacity.py`): the 6,364-param default head fits a RANDOM rung table for
-    1,000 tasks at 100%, and still beats chance 5x at 5,000. At the live 56-task pool that is 114
-    parameters per task — enormous overcapacity. Memorising DECISIONS is therefore cheap even though
-    memorising ANSWERS is impossible, so the anti-overfitting defence has to be behavioural:
-    `generalisation_gap` scores the head on a HELD-OUT slice, which is free here because a validator
-    can run the head itself (a matrix multiply, no inference). A memoriser scores well on the public
-    slice and at chance on held-out; an honest router scores alike on both.
+    1,000 tasks at 100%, and still beats chance 5x at 5,000. The security-relevant bank is the whole
+    PUBLIC pool — 112 LCB problems, 56 scored + 56 held-out (`koth/lcb.py`), both public and so both
+    memorisable — which is 57 parameters per task. (Against the 56 scored alone it is 114; that is
+    the number to quote for scored-slice capacity, not for the memorisation bound.) Either way the
+    head is enormously overcapacity, and measurement 10 puts the edge at the live bank at 100% — the
+    FULL oracle. Holding it under 15% needs >=20,000 tasks, so the live suite is short by ~180x.
+
+    THERE IS CURRENTLY NO DEFENCE FOR THIS. Earlier versions of this docstring named a
+    `generalisation_gap` held-out score, and line ~107 below named `smoothness`; NEITHER WAS EVER
+    IMPLEMENTED, and `grep` will confirm no such symbol exists. `smoothness` is worse than absent:
+    `scripts/memoriser_detector.py` built exactly that detector and REJECTED it, because an honest
+    router trained on 50%-noisy labels is equally jagged (1.0x) and the gate would have disqualified
+    honest miners. Memorising DECISIONS is therefore cheap, unmitigated, and on a static public bank
+    it is the dominant strategy. The fix is architectural, not a detector — score on traffic the
+    miner could not have trained on. See `docs/ROUTER_V2.md (removed with v2, 2026-09-07)`.
 
 WHAT A MINER COMPETES ON. Given a task, the head picks WHERE TO ENTER a cheap->expensive ladder. The
 harness invokes that rung, runs the pinned verifier on the answer, and escalates while the verifier
@@ -43,7 +52,6 @@ import io
 import numpy as np
 
 from ..router import RouterHead
-from .benchmarks import Benchmark
 
 # Bumped whenever the harness's OBSERVABLE behaviour changes (action space, verifier, encoder,
 # feature construction). Folded into `runtime_measurement()` beside SUITE_VERSION, so a changed
@@ -81,16 +89,10 @@ HARNESS_VERSION = "koth-harness-4"
 #
 # Part of the measured harness: miner and validator must agree on it, and
 # `doctor.check_slice_fits_epoch` derives the preflight bound from it, not from a guessed latency.
-RUN_BUDGET_S = 780.0
 
 # ...but no task may starve the ones after it. Each may spend everything EXCEPT this much held in
 # reserve per remaining task, so one greedy task cannot leave the rest with no time to answer at all.
-MIN_TASK_S = 45.0
 
-
-def task_budget(remaining_s: float, tasks_left_after_this: int) -> float:
-    """How long this task may run: everything left, minus a floor reserved for those still to come."""
-    return max(MIN_TASK_S, remaining_s - MIN_TASK_S * max(0, tasks_left_after_this))
 
 # The frozen encoder. Pinned by name because the embedding must be byte-identical in the miner's
 # enclave, in the owner's reference build, and in the trainer a miner runs at home; a different
@@ -104,7 +106,9 @@ EMBED_DECIMALS = 6
 # A head is d*h + h + h*k + k params. At d=384, k=12, h=16 that is ~6.4K; the cap admits h up to ~128.
 # It bounds artifact size, load cost and copy surface. It does NOT bound memorisation — see the module
 # docstring; ~6.4K params memorise a random rung table for 1,000 tasks outright. Treat this as a
-# resource limit, not a security bound, and rely on `smoothness` for the anti-memorisation property.
+# resource limit, not a security bound. There is NO anti-memorisation property today — an earlier
+# version of this line pointed at `smoothness`, which does not exist and was measured and rejected
+# (see the module docstring). Do not add one here; the fix is `docs/ROUTER_V2.md (removed with v2, 2026-09-07)`.
 PARAM_CAP = 50_000
 DEFAULT_HIDDEN = 16
 
@@ -139,9 +143,25 @@ def pool_models() -> list[str]:
 
 
 def price_of(model: str) -> float:
-    """Blended $/M used only to ORDER the ladder. Completion tokens dominate real spend on these
-    workloads, so they carry most of the weight; an unknown model sorts last rather than raising,
-    because an ordering helper must never be able to fail a miner's run."""
+    """Blended $/M used only to ORDER the ladder. An unknown model sorts last rather than raising,
+    because an ordering helper must never be able to fail a miner's run.
+
+    MEASURED CAVEAT (2026-08-13, 112 LiveCodeBench problems x this pool). This weights the PRICE of
+    completion tokens 3x, but it cannot know their COUNT — and the count is what actually varies.
+    Mean completion tokens across the pinned pool span 27x:
+
+        gpt-5.6-luna 1,259 | gemini-3.6-flash 3,204 | kimi-k3 3,905
+        deepseek-v4-flash 10,084 | deepseek-v4-pro 11,412 | glm-5.2 18,697 | qwen3.7-flash 27,812
+
+    So advertised price-per-token ranks the ladder differently from realised cost-per-task —
+    Spearman 0.607. Concretely: this function calls qwen3.7-flash 22.6x CHEAPER than gpt-5.6-luna,
+    while measured spend is 5.1x the other way. Rung 0 -> rung 4 is a cost DECREASE, which falsifies
+    `rung_order`'s premise that escalation is monotonically more expensive.
+
+    Ordering is NOT changed here: `rung_order` is the action space, so correcting it is a
+    HARNESS_VERSION change (new runtime measurement, evidence reset, fresh owner approval). The fix
+    is to order by measured cost from the owner's per-epoch reference. See `docs/ROUTER_V2.md (removed with v2, 2026-09-07)`.
+    """
     for m, pin, pout in ROUTING_POOL:
         if m == model:
             return (pin + 3.0 * pout) / 4.0
@@ -233,63 +253,3 @@ def encode(prompts: list[str]) -> np.ndarray:
     return np.round(emb, EMBED_DECIMALS)
 
 
-def verifier_ok(answer: str, bench: Benchmark) -> bool:
-    """The PINNED verifier: does this answer parse under the benchmark's own grader?
-
-    Deliberately deterministic and free. It must return the identical verdict in the miner's enclave
-    and in the owner's reference build, or the cascade the miner trained against is not the cascade
-    that runs — and a model-based judge is neither reproducible nor cheap enough to sit in the inner
-    loop of every escalation.
-
-    It checks WELL-FORMEDNESS, not correctness: a truncated program, an empty answer, a refusal, a
-    reasoning model that spent its whole budget thinking. That is a real and common failure of cheap
-    models, and it is exactly the signal a cascade needs — "did this rung produce something usable?"
-    It cannot catch a fluent wrong answer, which bounds what the ladder can recover and is stated
-    plainly in docs/DESIGN.md rather than papered over.
-    """
-    from .verify import _bench_kind, answer_token
-    return answer_token(answer, _bench_kind(bench)) is not None
-
-
-def rung_order(pool: list[str], price_of) -> list[int]:
-    """Pool indices ordered cheap -> expensive. The ladder's rungs, and the action space: action r
-    means 'enter at rung r'. Ordering by price (not by name or pool order) is what makes escalation
-    monotonically more expensive, which is the whole premise of the cascade."""
-    return sorted(range(len(pool)), key=lambda i: (price_of(pool[i]), pool[i]))
-
-
-def run_cascade(start_rung: int, prompt: str, bench: Benchmark, pool: list[str],
-                order: list[int], call_model, params: dict, *,
-                budget_s: float = RUN_BUDGET_S, now=time.monotonic) -> tuple[str, list[int]]:
-    """Enter the ladder at `start_rung`, escalate while the verifier rejects, bank on accept.
-
-    Mirrors `cascade.to_cascade_cache` exactly — invoke, verify, escalate, and take whatever the top
-    rung produces — so a head trained offline against a precomputed cache behaves identically here.
-    Returns the banked answer and the rungs actually invoked (the cost trail, which the proof
-    records so a validator can price the run without re-executing it).
-
-    ESCALATION IS BUDGETED, THE FIRST CALL IS NOT. Without a bound, one task's worst case exceeds the
-    whole epoch: each `call_model` is an HTTP call with its own timeout and retries, and a task
-    entering low can climb several rungs. Measured live (epoch 76734): a miner finished five tasks in
-    131s, then spent ~950s on the sixth and lost the epoch entirely — and a proof that misses its
-    epoch is unrecoverable, not late, because its nonce is stale. The budget makes the epoch bound
-    structural: RUN_BUDGET_S is a number the preflight can check against the validator's grace.
-
-    Never skip the FIRST call, whatever the clock says — a task with no call has no answer, which
-    would turn a slow provider into a zero instead of a cheap answer. Truncation banks the best
-    answer obtained so far and is fully visible in `rungs_used`, so the validator prices exactly what
-    ran; it does not require a cascade to reach the top.
-    """
-    used: list[int] = []
-    answer = ""
-    start = max(0, min(start_rung, len(order) - 1))
-    t0 = now()
-    for pos in range(start, len(order)):
-        if pos > start and now() - t0 > budget_s:
-            break                       # out of time: bank what the ladder has produced so far
-        idx = order[pos]
-        used.append(idx)
-        answer = call_model(pool[idx], [{"role": "user", "content": prompt}], dict(params))
-        if verifier_ok(answer, bench) or pos == len(order) - 1:
-            break
-    return answer, used

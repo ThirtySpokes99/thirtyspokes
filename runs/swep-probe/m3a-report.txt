@@ -1,0 +1,55 @@
+
+==============================================================================
+M3a — SPREAD SMOKE
+==============================================================================
+
+KING0 = always_cheapest   (the best fixed policy by quality; pass it as V3_KING0)
+lambda is fitted between always_cheapest and always_strongest (reference.fit_pool)
+
+arm                    quality   spend $
+always_cheapest         0.0000    0.0053
+always_strongest        0.0000    0.3015
+cascade                 0.0000    0.3711
+
+-- per benchmark (exit 1): spread between best and worst fixed policy --
+
+swebench_pro         n=0    spread +0.0000   always_cheapest=0.000  always_strongest=0.000  cascade=0.000
+                     cheapest-dominance: cheapest IS the best fixed policy here
+
+-- disagreement rate (exit 2): §5.4 assumes 20%, never measured until now --
+
+always_cheapest vs always_strongest: 0.000
+always_cheapest vs cascade: 0.000
+always_strongest vs cascade: 0.000
+
+-- provisional lambda / C_b (exit 3) — cheap+mid pool, NOT launch grade --
+
+swebench-pro         lambda=+0.00000  C=0.00731  flags: dominator: the best fixed policy buys no quality over the cheapest; this benchmark is excluded from scoring
+                     always_strongest - cheapest = +0.0000; always_strongest won 0, cheapest won 0, tied 21; sign test p=1.0000
+                     bootstrap over TASKS (provider errors excluded, n=19): lambda in [+0.00000, +0.00000], DOMINATOR fires in 100% of resamples
+
+  A NARROW BOOTSTRAP IS NOT A PINNABLE LAMBDA. It resamples TASKS, so it cannot
+  see variance BETWEEN RUNS, and the worker is nondeterministic at temperature 0
+  (measured 2026-09-06: six identical calls to one task, six distinct answers,
+  one pinned endpoint). Replicating the cheap arm three times FLIPPED
+  livecodebench's flag, while each single draw's own bootstrap called itself
+  settled at 3%. Re-run an arm with --arms before pinning lambda: a flag seen
+  once has not been measured.
+
+-- reliability (the validity guard): a call that cost $0 ERRORED --
+
+anthropic/claude-haiku-4.5                       2/42   errored    4.8%
+qwen/qwen3-30b-a3b-instruct-2507                 5/42   errored   11.9%  <- watch
+qwen/qwen3-coder                                 0/21   errored    0.0%
+
+NOTE: an error rate above 10% is enough to move a 15-task spread. Treat the
+spread as provisional and re-run the flagged rung before pinning lambda.
+
+-- what this can conclude --
+  clear spread  -> proceed.
+  no spread     -> look again before building further. NOT a kill: a cheap+mid pool
+                   showing nothing is weak evidence, and on hard agentic benchmarks
+                   cheap models may all score near zero for a floor-effect reason
+                   that says nothing about routing.
+
+table written: PROVIDER ERRORS EXCLUDED, paired n={'swebench-pro': 19} — the fit the report recommends, not the raw one

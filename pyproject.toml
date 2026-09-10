@@ -1,10 +1,10 @@
 [project]
 name = "thirtyspokes"
 version = "0.0.1"
-description = "ThirtySpokes — Phase 0 offline prototype for a TinyRouter-style LLM-routing Bittensor subnet"
+description = "Thirty Spokes — the v3 LLM-routing subnet (Bittensor netuid 99): conductor, validator, owner tools, serving"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
 ]
@@ -16,21 +16,39 @@ dependencies = [
 # `router_subnet`'s sim import it at module scope, so three unconditional tests fail collection
 # without it — which is exactly how they failed in CI on every push for days. It pulls no network
 # seam (unlike the dataset clients, which stay in `eval`), so it belongs with the offline suite.
-dev = ["pytest>=8.0", "math_verify>=0.5", "scikit-learn>=1.3"]
+# `httpx` is here for the same reason and by the same argument: `test_openrouter.py` guards it
+# with a MODULE-SCOPE `importorskip`, so a clean `dev` environment does not fail — it silently drops
+# all 30 tests of the client that decides what the subnet spends, which is the worst of both. Like
+# scikit-learn it pulls no network seam (the tests drive it through `httpx.MockTransport`), so it
+# belongs with the offline suite rather than in `llm`/`serve`, where it was reachable only by
+# installing a live-model extra to test a client that never goes live in CI.
+dev = ["pytest>=8.0", "math_verify>=0.5", "scikit-learn>=1.3", "httpx>=0.27"]
+# The v3 validator's two real-world seams. Neither is needed by the offline suite — every test that
+# wants one SKIPS without it — but both are imported by shipped code at runtime, and until now
+# neither appeared in any extra, so `store.r2_bucket` and SWE-bench grading had no install path at
+# all. `swebench` IS SWE-bench Verified's grader (§6.1.2 refuses reimplementing it); `pyarrow` reads
+# the pinned parquet; `huggingface_hub` fetches it at its pinned commit.
+store = ["boto3>=1.34"]
+# Everything `orchestra-miner` imports beyond the core: the S3 client for the upload, the chain SDK
+# (and its wallet) for `hotkey`/`identity`/`submit`, and the envelope cryptography `access` needs at
+# import time — so the documented miner install (docs/MINER.md §1a step 0) runs.
+miner = ["boto3>=1.34", "bittensor>=11.1,<12", "bittensor-wallet>=4.1,<5", "typer<0.27.2", "cryptography>=42.0"]
+benchmarks = ["swebench>=4.1,<5", "pyarrow>=14", "huggingface_hub>=0.24"]
 # Optional real-LLM outcome backends (offline runs work without these).
 # `certifi` is declared explicitly rather than leaned on as an httpx transitive: the pool client's
 # TLS regression test imports it DIRECTLY to build a hostile CA, and a transitive dependency that
 # silently stops being pulled would turn that security test into a collection error.
 llm = ["httpx>=0.27", "openai>=1.40", "certifi"]
 # Live Bittensor chain integration (offline simulator works without it).
-# PINNED BELOW 11: `BittensorChain` drives `subtensor.substrate` directly for the storage reads the
-# SDK does not wrap (CommitmentOf, the Keys uid->hotkey map, SubnetOwnerHotkey, SubnetOwnerCut), and
-# bittensor 11 removed that attribute. With the old `>=8.0` the host resolved 10.5.0 — the version
-# the chain seam was verified against — while a fresh Docker build resolved 11.0.1 and the validator
-# crash-looped on startup with `'Subtensor' object has no attribute 'substrate'`. An unpinned major
-# on the one dependency that talks to the chain is a silent time bomb; porting to 11.x is tracked
-# separately.
-chain = ["bittensor>=10.5,<11", "huggingface_hub>=0.24"]
+# PINNED TO 11.x: bittensor 11 dropped `Subtensor.substrate`, so `v3/chain.py` drives the 11 SDK's
+# `query`/`query_map` over generated storage items and `submit_call` over generated call builders
+# (ported and verified against testnet 526 on 2026-09-07). The offline suite cannot see an SDK break —
+# every chain in it is a mock — which is why the major is pinned rather than left open.
+# `typer<0.27.2`: bittensor 11.1's own `btcli` reads `Exit` from typer's vendored click module, and
+# typer 0.27.2 (2026-08-28, after bittensor 11.1.0) dropped it — every btcli command then dies in
+# its exit handler with AttributeError after doing its work. 0.27.1 and below expose it.
+# Measured 2026-09-08 on 0.15.4 through 0.27.2.
+chain = ["bittensor>=11.1,<12", "bittensor-wallet>=4.1,<5", "typer<0.27.2", "huggingface_hub>=0.24"]
 # Metered-gateway linchpin: ed25519 receipt signing
 gateway = ["cryptography>=42.0"]
 # Real Intel-TDX attestation: pure-Python DCAP cert-chain (cryptography) + full DCAP
@@ -38,26 +56,22 @@ gateway = ["cryptography>=42.0"]
 tee = ["cryptography>=42.0", "dcap-qvl>=0.5"]
 # Live evaluation: OpenRouter client + real task datasets (GSM8K, SWE-bench Pro),
 # math_verify for robust MATH-500 grading, math_verify pulls sympy
-eval = ["cryptography>=42.0", "openai>=1.40", "datasets>=2.14", "math_verify>=0.5", "dcap-qvl>=0.5"]
+# Beta routing API (`orchestra-serve`). The HTTP surface only — the routing decision itself is
+# numpy + the pinned encoder, so the core package stays free of a web framework.
+# scikit-learn is for `orchestra-serve-train` (the escalate-predictor trainer).
+serve = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.27", "openai>=1.40", "certifi",
+         "scikit-learn>=1.3"]
 
 [project.scripts]
-thirtyspokes = "thirtyspokes.cli:main"
-orchestra-sim = "thirtyspokes.subnet.simulate:main"
-orchestra2-sim = "thirtyspokes.gateway.subnet:main"
-orchestra-tee-sim = "thirtyspokes.tee.subnet:main"
-orchestra-koth-sim = "thirtyspokes.koth.subnet:main"
-orchestra-koth-router-sim = "thirtyspokes.koth.router_subnet:main"
-orchestra-koth-local = "thirtyspokes.koth.neuron:main"
-orchestra-koth-miner = "thirtyspokes.koth.miner:main"
-orchestra-koth-gcp-miner = "thirtyspokes.koth.gcp_operator:main"
-orchestra-koth-validator = "thirtyspokes.koth.neuron:validator_main"
-orchestra-koth-dev = "thirtyspokes.koth.devkit:main"
-orchestra-koth-train = "thirtyspokes.koth.trainer:main"
-orchestra-koth-owner = "thirtyspokes.koth.owner:main"
-orchestra-koth-doctor = "thirtyspokes.koth.doctor:main"
-orchestra-koth-reference = "thirtyspokes.koth.reference:main"
-orchestra-miner = "thirtyspokes.subnet.miner:main"
-orchestra-validator = "thirtyspokes.subnet.validator:main"
+orchestra-enclave = "thirtyspokes.serve.enclave_cli:main"
+orchestra-serving-governance = "thirtyspokes.serve.governance:main"
+orchestra-dev = "thirtyspokes.v3.devkit:main"
+orchestra-sim = "thirtyspokes.v3.simulate:main"
+orchestra-validator = "thirtyspokes.v3.validator:main"
+orchestra-miner = "thirtyspokes.v3.miner:main"
+orchestra-owner = "thirtyspokes.v3.owner:main"
+orchestra-serve = "thirtyspokes.serve.cli:main"
+orchestra-serve-train = "thirtyspokes.serve.escalate:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,72 @@
+
+==============================================================================
+M3a — SPREAD SMOKE
+==============================================================================
+
+KING0 = cascade   (the best fixed policy by quality; pass it as V3_KING0)
+lambda is fitted between always_cheapest and cascade (reference.fit_pool)
+
+arm                    quality   spend $
+always_cheapest         0.3011    0.1547
+always_strongest        0.3441    0.9759
+cascade                 0.5114    1.1096
+
+-- per benchmark (exit 1): spread between best and worst fixed policy --
+
+livecodebench        n=124  spread +0.2755   always_cheapest=0.489  always_strongest=0.624  cascade=0.765
+                     cheapest-dominance: cheapest is NOT the best fixed policy here
+hle                  n=124  spread +0.1935   always_cheapest=0.113  always_strongest=0.065  cascade=0.258
+                     cheapest-dominance: cheapest is NOT the best fixed policy here
+
+-- disagreement rate (exit 2): §5.4 assumes 20%, never measured until now --
+
+always_cheapest vs always_strongest: 0.278
+always_cheapest vs cascade: 0.327
+always_strongest vs cascade: 0.230
+
+-- provisional lambda / C_b (exit 3) — cheap+mid pool, NOT launch grade --
+
+hle                  lambda=+0.09358  C=0.00225  flags: none
+                     cascade - cheapest = +0.1452; cascade won 20, cheapest won 2, tied 102; sign test p=0.0001
+                     errors excluded (n=94): lambda=+0.07824  flags: none  <- the fit to pin if the rung is not re-run
+                     bootstrap over TASKS (provider errors excluded, n=94): lambda in [+0.02704, +0.13934], DOMINATOR fires in 0% of resamples
+livecodebench        lambda=+0.18635  C=0.00284  flags: none
+                     cascade - cheapest = +0.2755; cascade won 55, cheapest won 4, tied 65; sign test p=0.0000
+                     errors excluded (n=88): lambda=+0.08975  flags: none  <- the fit to pin if the rung is not re-run
+                     bootstrap over TASKS (provider errors excluded, n=88): lambda in [+0.03859, +0.16644], DOMINATOR fires in 0% of resamples
+
+  A NARROW BOOTSTRAP IS NOT A PINNABLE LAMBDA. It resamples TASKS, so it cannot
+  see variance BETWEEN RUNS, and the worker is nondeterministic at temperature 0
+  (measured 2026-09-06: six identical calls to one task, six distinct answers,
+  one pinned endpoint). Replicating the cheap arm three times FLIPPED
+  livecodebench's flag, while each single draw's own bootstrap called itself
+  settled at 3%. Re-run an arm with --arms before pinning lambda: a flag seen
+  once has not been measured.
+
+-- LiveCodeBench by release: the enable question, answered for free --
+
+test.jsonl       n=63   mean 0.8333
+test2.jsonl      n=63   mean 0.6495
+test3.jsonl      n=63   mean 0.6614
+test4.jsonl      n=63   mean 0.4722
+test5.jsonl      n=60   mean 0.6014
+test6.jsonl      n=60   mean 0.5319
+span             +0.3611 across releases
+
+-- reliability (the validity guard): a call that cost $0 ERRORED --
+
+anthropic/claude-haiku-4.5                       0/399  errored    0.0%
+qwen/qwen3-30b-a3b-instruct-2507                63/496  errored   12.7%  <- watch
+qwen/qwen3-coder                                 9/176  errored    5.1%
+
+NOTE: an error rate above 10% is enough to move a 15-task spread. Treat the
+spread as provisional and re-run the flagged rung before pinning lambda.
+
+-- what this can conclude --
+  clear spread  -> proceed.
+  no spread     -> look again before building further. NOT a kill: a cheap+mid pool
+                   showing nothing is weak evidence, and on hard agentic benchmarks
+                   cheap models may all score near zero for a floor-effect reason
+                   that says nothing about routing.
+
+table written: PROVIDER ERRORS EXCLUDED, paired n={'hle': 94, 'livecodebench': 88} — the fit the report recommends, not the raw one

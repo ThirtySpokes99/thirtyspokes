@@ -1,14 +1,10 @@
-"""KOTH-TEE subnet — miners run the owner-given benchmarks inside their own TEE
-and validators only verify an attested proof (docs/DESIGN.md).
+"""The library the v3 mechanism (`v3/`) and the serving path (`serve/`) import.
 
-Composes the existing primitives instead of rebuilding them:
-  * hardware-root attestation  — `tee.attestation` (Quote / Platform / verify_quote)
-  * in-enclave metering        — `tee.runtime.MeteringProxy`
-  * king-of-the-hill emissions — `reign.KingChain` (king + equal-share ex-king chain, eps hysteresis)
-  * chain seam                 — `subnet.chain` (commit-reveal + set_weights + burn)
-
-What KOTH adds on top: the artifact BINDING (report_data commits to source+weights,
-so the score is provably tied to the public artifact), a MULTI-BENCHMARK proof, a
-Pareto dethrone guard, and the optimistic anti-cheat backstops (fresh-probe audit
-for weight-memorization, fraud-proof for literal hardcoding).
+What is here survived the 2026-09-07 cutover because v3 imports it: real Intel TDX quotes and
+their full DCAP verification (`tdx`, `collateral`), enclave-sealed keys (`sealed`), the
+OpenRouter key gate (`orkey`), the chained manifest the schedule root is built from
+(`holdout_feed`), corpus freshness (`corpus`), the pinned embedding harness and routing pool
+(`harness`), reference-record signing (`reference`), image records (`imagestore`) and on-chain
+measurement governance (`governance`). The KOTH-TEE mechanism that once lived in this package —
+miners running benchmarks in their own TEE, validators verifying a proof — was removed with v2.
 """

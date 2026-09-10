@@ -1,99 +1,81 @@
-# ThirtySpokes — a TEE-attested King-of-the-Hill LLM-agent subnet
+# Thirty Spokes — a routing subnet where miners ship the conductor and the validator runs it
 
 [![tests](https://github.com/thirtyspokes99/thirtyspokes/actions/workflows/tests.yml/badge.svg)](https://github.com/thirtyspokes99/thirtyspokes/actions/workflows/tests.yml)
-[![docker](https://github.com/thirtyspokes99/thirtyspokes/actions/workflows/docker.yml/badge.svg)](https://github.com/thirtyspokes99/thirtyspokes/actions/workflows/docker.yml)
 [![CodeRabbit](https://img.shields.io/coderabbit/prs/github/thirtyspokes99/thirtyspokes?labelColor=171717&color=FF570A&label=CodeRabbit%20reviews)](https://coderabbit.ai)
 [![Bittensor](https://img.shields.io/badge/Bittensor-netuid%2099-6c5ce7)](https://taostats.io/subnets/99)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Miners compete to build the **routing / orchestration agent** that gets the highest
-benchmark quality *per dollar* over an owner-pinned pool of models. Each miner runs the
-owner's benchmark suite **inside its own confidential-VM TEE**, publishes a hardware-attested
-proof to its own HuggingFace repo, and commits a salted hash on-chain. Validators do **no
-inference** — they download the public bundle, verify the attestation, grade the attested
-answers against public gold, and a formula over the verified reports crowns the king.
+Every model is a spoke; the hub holds nothing. Miners train a **conductor** — full weights on a
+pinned `Qwen3.6-35B-A3B` — that, given an agentic task, delegates it to a real model on the catalog,
+watches the outcome, and retries or stops. It never writes an answer and never touches the question.
+A single owner-run validator runs each challenger against the sitting king on the same fresh slice
+of benchmarks, paid on each miner's own OpenRouter key, and scores **quality minus what that quality
+cost** at an exchange rate measured from the pool rather than chosen. The crown moves only to a
+challenger that wins broadly; until someone beats the best *fixed* policy, the king's share burns.
 
-The load-bearing idea: because a miner's agent (source **and** weights) is public and
-**cryptographically bound** to what ran in the enclave, cheating is publicly detectable rather
-than something we prevent by hiding data. That is what makes **static public benchmarks**
-(math, MMLU, GPQA, SWE-bench Pro) safe to score on.
+**Status.** Registered on Bittensor mainnet as netuid 99. The mechanism (v3, v3)
+is complete and tested and is being rehearsed end to end on testnet 526 before it opens on 99. The
+first-generation mechanism was retired on 2026-09-07 and removed from this tree.
 
 ```
-┌── miner (own TEE / confidential VM) ──┐        ┌── validator (verify-only) ──┐
-│ run owner suite → attested Proof      │        │ download bundle             │
-│ bind source_hash+weights_hash+cost    │──HF──▶ │ verify quote + binding      │
-│ upload proof+trace to own HF repo     │        │ grade answers vs public gold│
-│ commit salted hash on-chain           │──chain▶│ score → reign → set_weights │
-└───────────────────────────────────────┘        └─────────────────────────────┘
+┌── miner ─────────────────────────────┐        ┌── validator (owner-run) ───────────────────────┐
+│ train full weights, pinned arch      │        │ commit the schedule root; draw the slice from  │
+│ check locally (the validator's gate) │──S3──▶ │   a chain beacon; snapshot the catalog          │
+│ upload ~70 GB, commit the digest     │──chain▶│ power gate → king's arm once → each challenger │
+│ register your OpenRouter key, sealed │        │ verdict (Δ>ε, lcb>0, LOO>0, median>0)          │
+└──────────────────────────────────────┘        │ set weights → publish the signed reveal        │
+                                                └────────────────────────────────────────────────┘
 ```
 
-## Quickstart (offline, no chain / no API key)
+## Quickstart (offline — no chain, no key, no GPU)
 
 ```bash
 uv venv --python 3.12 && uv pip install -e ".[dev]"
 
-uv run pytest -q                 # the full suite (158 passed, 2 skipped)
-uv run orchestra-koth-sim        # full mechanism + every adversary (mock everything)
-uv run orchestra-koth-local      # the decoupled 2-neuron demo: miner uploads, validator verifies + scores
+uv run pytest -q                 # the invariant suite
+uv run orchestra-sim         # one window against the archetype cast, nothing mocked in the mechanism
+uv run orchestra-dev --help  # the miner's dev kit: the validator's own gate and scaffold, locally
 ```
 
-Add real models + real benchmarks (still local chain + mock TEE) with an `OPENROUTER_API_KEY`:
+The live window, on real benchmarks with an `OPENROUTER_API_KEY`:
 
 ```bash
-set -a && . ./.env && set +a && uv run python scripts/koth_live_smoke.py
+set -a && . ./.env && set +a && uv run python scripts/live_smoke.py --help
 ```
 
 ## Documentation
 
-Everything lives under [`docs/`](docs/):
+[`docs/`](docs/) holds three documents and a brief README:
 
-| Doc | What it covers |
+| document | read it for |
 |---|---|
-| [`docs/DESIGN.md`](docs/DESIGN.md) | **how it works** — trust model, data models, the miner/validator flow, scoring (per-epoch quality + evidence accumulation + the anti-grind commit/grace windows), and the anti-cheat backstops (grounding, copy-dedup, hardware binding) |
-| [`docs/MINER.md`](docs/MINER.md) | **run a miner** — build an agent, test it locally, publish + run the locked-image `orchestra-koth-gcp-miner`, DQ reasons |
-| [`docs/VALIDATOR.md`](docs/VALIDATOR.md) | **run a validator** — the per-epoch verify/grade/score loop, fail-closed enforcement, Docker, flags |
-| [`docs/DEPLOYING.md`](docs/DEPLOYING.md) | **stand up the subnet** (owner) — local development, production deploy on mainnet, and building the measured runtime image |
+| [`WHITEPAPER.md`](docs/WHITEPAPER.md) | **the whitepaper** — the artifact, the action space, the episode, money, scoring and the four-condition verdict, the corpus, the queue and every operational rule, the owner decisions |
+| [`MINER.md`](docs/MINER.md) | **mine** — the ed25519 hotkey, `check`, the one-shot `submit`, budget, the queue |
+| [`VALIDATOR.md`](docs/VALIDATOR.md) | **validate** (owner) — the grading host, launching, the owner account and the miners' keys, issuing credentials |
+
+The measurements every constant traces to are kept with the owner's operating records, outside this tree.
 
 ## Repo layout
 
 ```
 src/thirtyspokes/
-  koth/         the subnet: proof, commit, runtime, validator, miner, neuron, reign,
-                tdx/rtmr/collateral (real Intel-TDX attestation + DCAP), confine (no-egress),
-                evidence (accumulation), owner (on-chain governance)
-  tee/          the measured enclave runtime + hardware-root attestation primitives
-  subnet/       the chain seam (Mock / LocalFile / Bittensor) + the reign
-  eval/         the live-run harness (real GSM8K / MMLU / GPQA + OpenRouter metering)
-  gateway/      the earlier metered-gateway experiment (superseded by tee/ for cost trust)
-  cache, oracle, router, train, sepcmaes, …   the Phase-0 routing core (see below)
-scripts/        smokes + experiments (koth_live_smoke, koth_tdx_smoke, koth_enforce_smoke, …)
+  v3/           the mechanism: action grammar, scaffold, conductor seam, worker gateway + metering,
+                admission, store (S3), mailbox credentials, chain seam, window schedule, score,
+                duel, emissions, validator daemon, miner / owner / dev-kit / simulator CLIs
+  v3/benchmarks/  the corpus adapters (LiveCodeBench, HLE, SWE-bench Pro, R2E-Gym, GDPval) + the Docker sandbox
+  serve/        the OpenAI-compatible serving path and the enclave app for confidential serving
+  koth/         the library v3 imports: TDX quotes + DCAP, sealed keys, the chained manifest, harness
+  gateway/, subnet/chain, tee/attestation   signing, the Bittensor SDK seam, attestation primitives
+scripts/        live_smoke (the live window), m3a_spread (the λ measurement), the reference
+                pinning + census tools, build_router_image.sh (the measured serving image)
+runs/           the pinned λ table, the M3a report, the first live window's signed reveal
 ```
 
-## Status
+## Command-line tools
 
-**Live on Bittensor mainnet — netuid 99.** The mechanism is complete and hardware-verified: real Intel-TDX
-attestation with full DCAP (TCB / CRL / QE-identity), the runtime bound into RTMR3 with the validator
-gating MRTD + RTMR1/2/3, no-egress agent confinement, on-chain measurement governance, and the
-grounding / accumulation scoring — all landed and exercised on a confidential-TDX VM (see
-[`docs/DEPLOYING.md`](docs/DEPLOYING.md)).
-
-Validators run **fail-closed**: a proof is scored only if its hardware quote matches the owner's pinned
-measured image, and the no-gate `--insecure` mode is **refused on mainnet**. The mock TEE exists only
-for offline development.
-
-The anti-grind commit window (F7) and grace window (F2) are implemented but **opt-in**, pending a
-calibration of their two constants against the live suite — see
-[`docs/VALIDATOR.md`](docs/VALIDATOR.md).
-
-## Phase-0 routing origin
-
-This repo began as an offline prototype of a *pick-one-model router* subnet. That core still ships —
-`uv run thirtyspokes demo` runs it — and is where the "routing has no accuracy moat on broad traffic"
-finding came from, which drove the pivot to the orchestration / KOTH-TEE design above. The routing
-modules (`cache`, `oracle`, `router`, `train`, `sepcmaes`) are that layer; the subnet is `koth/`.
-
-## License
-
-[MIT](LICENSE) — you may use, modify, and redistribute this freely, including for your own subnet or
-miner. Miner agents you build on top of it are yours.
+`orchestra-miner` (`hotkey` · `identity` · `check` · `register-key` · `submit`), `orchestra-owner` (`issue` ·
+`credit` · `balances` · `status` · `key` · `commit-schedule`), `orchestra-validator`,
+`orchestra-dev`, `orchestra-sim`; `orchestra-serve`, `orchestra-enclave`,
+`orchestra-serving-governance`. Every seam of the validator is a required argument — there is no
+offline default that could set weights on a real subnet from a simulation.

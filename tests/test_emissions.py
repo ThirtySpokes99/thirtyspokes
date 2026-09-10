@@ -238,3 +238,38 @@ def test_the_pension_is_five_deep_and_the_ladder_is_the_pinned_one():
 
     lineage = Lineage.from_coronations(tuple(f"hk_{i}" for i in range(9)))
     assert len(lineage.pensioners("hk_king")) == len(EMISSION_PENSION)
+
+
+# --- the owner's opt-out: King₀ paid at a UID instead of burned -----------------------------------
+
+def test_king_zero_uid_pays_the_crown_at_that_uid_instead_of_burning_it():
+    """§5.5's burn is the DEFAULT, not the only option. An owner who wants the genesis king visible
+    as a reigning king names the UID it reigns at, and the 0.85 is paid there."""
+    lineage = Lineage.from_coronations(("hk_a", "hk_b"))
+    mg = metagraph("hk_a", "hk_b")
+
+    weights = emission_weights(lineage, KING0, mg, king_zero_uid=uid_of(mg, "hk_a"))
+
+    # The crown lands on the named UID, on top of the pension that UID had already earned.
+    assert weights[uid_of(mg, "hk_a")] == pytest.approx(EMISSION_KING + EMISSION_PENSION[1])
+    assert weights[uid_of(mg, "hk_b")] == EMISSION_PENSION[0]
+    assert sum(weights.values()) == 1.0
+
+
+def test_king_zero_uid_equal_to_the_burn_uid_leaves_the_slate_bit_identical():
+    """The case the owner of netuid 99 actually runs. The burn UID was already collecting King₀'s
+    share, so re-attributing it there must not move a single number on chain — what changes is the
+    reveal's claim about who reigns, and nothing else."""
+    lineage = Lineage.from_coronations(("hk_a",))
+    mg = metagraph("hk_a")
+
+    burned = emission_weights(lineage, KING0, mg)
+    attributed = emission_weights(lineage, KING0, mg, king_zero_uid=BURN_UID)
+
+    assert attributed == burned
+    assert sum(attributed.values()) == 1.0
+
+
+def test_king_zero_uid_left_unset_still_burns():
+    """The default is unchanged: absent the flag, §5.5 stands exactly as before."""
+    assert emission_weights(Lineage(), KING0, metagraph("hk_a")) == {BURN_UID: 1.0}

@@ -61,7 +61,8 @@ from thirtyspokes.v3.types import Catalog, CatalogEntry, EpisodeResult, TaskSpec
 from thirtyspokes.v3.window import task_order
 from thirtyspokes.v3.validator import (Cadence, Checkpoint, Crown, History, Owner, Validator,
                                         ValidatorError, WindowUnavailable, chain_beacon,
-                                        check_launch, format_reveal, reveal_path, served_name)
+                                        check_launch, format_reveal, reveal_path, served_name,
+                                        LATEST_PATH)
 from thirtyspokes.v3.window import build as build_window
 from thirtyspokes.v3.window import window_path
 from thirtyspokes.v3.worker import MockWorker, WorkerError
@@ -1146,6 +1147,34 @@ def test_history_is_persisted_before_the_weights_and_the_reveal_is_published_las
     assert reveal.weights_written
     assert h.validator.history.published(1)
     assert reveal_path(1) in h.client.objects
+
+
+def test_the_latest_pointer_names_the_window_just_published(tmp_path):
+    """The reveals are addressable but not discoverable: without a pointer a reader has to probe
+    `1.json`, `2.json`, ... until one 404s. The pointer is what makes one page one request."""
+    h = harness(tmp_path)
+    h.enrol("hopeful", block=10, conductor=router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    h.open_window(1)
+
+    h.run(1)
+
+    assert json.loads(h.store.get(LATEST_PATH)) == {"window": 1}
+
+
+def test_the_latest_pointer_never_names_a_window_whose_reveal_is_missing(tmp_path):
+    """Ordering, not decoration. A pointer written before the reveal names bytes that are not there
+    yet, and a reader that believes it reports an outage that never happened."""
+    h = harness(tmp_path)
+    h.enrol("hopeful", block=10, conductor=router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    h.open_window(1)
+    h.client.readonly = True                       # the store dies at the moment of publishing
+
+    h.validator.run_window(1)
+
+    assert reveal_path(1) not in h.client.objects
+    assert LATEST_PATH not in h.client.objects
 
 
 def test_a_crash_between_the_weights_and_the_publish_re_does_only_the_publish(tmp_path):

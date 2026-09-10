@@ -95,6 +95,7 @@ def emission_weights(
     hotkey_of: Mapping[int, str],
     *,
     burn_uid: int = 0,
+    king_zero_uid: int | None = None,
 ) -> dict[int, float]:
     """The window's weight slate: `uid -> share`, summing to 1.0 with the burn included.
 
@@ -115,6 +116,12 @@ def emission_weights(
     uid_of = {hotkey: uid for uid, hotkey in hotkey_of.items()}
     weights: dict[int, float] = {}
 
+    # `king_zero_uid` OPTS OUT OF "King₀'s share burns" AND IS THE OWNER'S CHOICE, NOT A DEFAULT.
+    # Left None the module docstring's rule stands and the crown burns while the best fixed policy
+    # holds it. Set, King₀'s 0.85 is paid to that UID instead, which is how an owner who wants the
+    # genesis king to be a VISIBLE reigning king rather than an absence expresses it. The on-chain
+    # slate is unchanged when it equals `burn_uid` — the same UID was already collecting the share
+    # as burn — so what this moves is the ATTRIBUTION the reveal publishes, not the money.
     king_uid = uid_of.get(king_hotkey) if king_hotkey != KING0 else None
     if king_uid is not None:
         weights[king_uid] = EMISSION_KING
@@ -123,6 +130,15 @@ def emission_weights(
         pensioner_uid = uid_of.get(hotkey)
         if pensioner_uid is not None:
             weights[pensioner_uid] = share
+
+    # AFTER the pension slots, and ACCUMULATED rather than assigned. A real king is excluded from
+    # its own pension list by `pensioners`, so it can never collide; King₀ is not in the lineage at
+    # all, so the UID an owner names here CAN also be an ex-king still drawing a tail. Assigning
+    # would silently drop whichever of the two ran second — the crown if it were written first, the
+    # pension if it were written last — and the slate would still sum to 1.0, so nothing downstream
+    # would notice. Caught by test on the ordering, not by inspection.
+    if king_hotkey == KING0 and king_zero_uid is not None:
+        weights[king_zero_uid] = weights.get(king_zero_uid, 0.0) + EMISSION_KING
 
     # The correctly-rounded complement of what was paid, rather than `1.0 - sum(paid)`. None of
     # 0.85/0.05/... is representable in binary, and the residual of an accumulated sum leaves the

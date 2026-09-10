@@ -1718,6 +1718,13 @@ class Validator:
         lineage = self.history.lineage()
         weights = emission_weights(lineage, self.history.crown.hotkey, metagraph.hotkey_of,
                                    burn_uid=self.burn_uid, king_zero_uid=self.king_zero_uid)
+        # §5.5, captured HERE and not from `self.history.crown`: `settle` has already run by this
+        # point and may have crowned a challenger, so reading the live crown would describe the
+        # END-of-window king while `king_hotkey` beside it documents the START-of-window one — the
+        # two fields would disagree in exactly the window where a coronation happened. At entry
+        # `king_hotkey` is still `crown.hotkey` from before the duels, and KING0 is the empty
+        # string, so this is that king and no other. Read before the mapping below overwrites it.
+        king_is_genesis = not king_hotkey
         # DISPLAY ONLY, AND DELIBERATELY LATE. When King₀ reigns its hotkey is the empty sentinel,
         # which publishes as an absence — a reader (and the dashboard) cannot tell "the genesis king
         # holds the throne" from "this field was forgotten". With `king_zero_uid` set the reveal
@@ -1731,6 +1738,7 @@ class Validator:
             window=opened.epoch, nonce=opened.nonce, benchmarks=opened.benchmarks,
             n_tasks=len(opened.tasks), freshness=opened.record["freshness"], power=power,
             reference=arms, king_hotkey=king_hotkey, king=king_arm, king_results=king_results,
+            king_is_genesis=king_is_genesis,
             graders_failed=tuple(sorted(guard.failed)), outcomes=outcomes,
             crowned=None if crowned is None else crowned.hotkey,
             pensioners=lineage.pensioners(self.history.crown.hotkey), weights=weights,
@@ -1853,6 +1861,9 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
                   "by_benchmark": [list(row) for row in report.power.by_benchmark]},
         "graders_failed": list(report.graders_failed),
         "king_hotkey": report.king_hotkey,
+        # §5.5, stated rather than left to be inferred from `king_hotkey` being empty — see
+        # `WindowReport.king_is_genesis`. `power.king_zero` beside it names WHICH fixed policy.
+        "king_is_genesis": report.king_is_genesis,
         "king": _arm_json(report.king),
         "outcomes": [_outcome_json(outcome) for outcome in report.outcomes],
         "crowned": report.crowned,

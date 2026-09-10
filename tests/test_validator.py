@@ -1149,6 +1149,25 @@ def test_history_is_persisted_before_the_weights_and_the_reveal_is_published_las
     assert reveal_path(1) in h.client.objects
 
 
+def test_the_reveal_states_that_king_zero_reigns_even_when_it_has_a_uid(tmp_path):
+    """§5.5, stated rather than inferred. A reader used to detect King0 by `king_hotkey` being the
+    empty sentinel — which stops being true under `--king-zero-uid`, and the genesis policy then
+    reads as a miner's conductor. The flag must not change the answer."""
+    h = harness(tmp_path)
+    h.validator.king_zero_uid = 0
+    h.enrol("hopeful", block=10, conductor=router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    h.open_window(1)
+
+    h.run(1)
+
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    # Window 1's duels faced King0 whatever the outcome, so the flag describes THAT king — a
+    # coronation in the same window does not retroactively make the defender a miner's conductor.
+    assert record["king_is_genesis"] is True
+    assert record["power"]["king_zero"]          # and it names WHICH fixed policy
+
+
 def test_the_latest_pointer_names_the_window_just_published(tmp_path):
     """The reveals are addressable but not discoverable: without a pointer a reader has to probe
     `1.json`, `2.json`, ... until one 404s. The pointer is what makes one page one request."""

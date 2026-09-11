@@ -169,8 +169,10 @@ upload prefix      submissions/3f9c…a12e/
 Send the owner the hotkey (the rest they re-derive from the chain — nothing you type can change
 where your credential is scoped to). They run `thirtyspokes-owner issue`, which publishes your
 envelope on the subnet's public store, `https://store.thirtyspokes.ai` — the tools poll it by
-default — and reply with their **ed25519 public key**; `submit` refuses any envelope not signed by
-it. Register your OpenRouter key once the envelope is up (step 6): an entry
+default. **You don't need anything back from the owner.** Their ed25519 public key is pinned in the
+tools (`config.OWNER_MAILBOX_KEY`, `ae6cea37…3d21`), and `submit` refuses any envelope not signed by
+it. Anyone who hands you a *different* owner key is not the owner: passing it would make
+`register-key` seal your OpenRouter key to them. Register your OpenRouter key once the envelope is up (step 6): an entry
 with no key and no credit is deferred, not judged.
 
 #### 4. Get the reference tree and prepare yours
@@ -212,8 +214,7 @@ register it with the cap one window may spend:
 ```bash
 printf '%s' 'sk-or-v1-…' > ~/.openrouter-key && chmod 600 ~/.openrouter-key
 uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" register-key \
-    --key-file ~/.openrouter-key --cap-usd 20 \
-    --owner-key <owner's ed25519 public key, hex>
+    --key-file ~/.openrouter-key --cap-usd 20
 ```
 
 The key is sealed to the owner's key **before** it leaves this machine and the record is signed by
@@ -230,8 +231,7 @@ what the key reports it can still spend.
 
 ```bash
 uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" submit \
-    --model ./weights --reference ./reference \
-    --owner-key <owner's ed25519 public key, hex>
+    --model ./weights --reference ./reference
 ```
 
 In order, and it stops at the first refusal: re-runs the admission gate; refuses if this hotkey has
@@ -281,7 +281,8 @@ A refusal is final for that hotkey; a new attempt is a new hotkey, a new registr
 | `no hotkey keyfile at …` | the hotkey is not on this machine | create it (step 1), or copy the registered hotkey's keyfile from the machine that holds it |
 | `identity` fails with no registration | the hotkey is not registered on this netuid | step 2 |
 | `this tree would be REFUSED at admission` | config/tokenizer/tensor/format mismatch | copy the reference's `config.json` + tokenizer back; remove any `*.py`, pickle shards; re-run `check` |
-| `mailbox envelope is not signed by the owner` | wrong `--owner-key`, or a `--mailbox-url` that is not the subnet's store | re-check the key with the owner; drop `--mailbox-url` unless you were told to pass one |
+| `mailbox envelope is not signed by the owner` | an `--owner-key` override that is not the owner's, or a `--mailbox-url` that is not the subnet's store | on netuid 99 drop both flags — the owner key is pinned in the tools; pass them only for a rehearsal you were told to run |
+| `--owner-key is required off finney netuid 99` | you are on another network or netuid, where the pinned key belongs to the wrong owner | pass that subnet owner's `--owner-key` |
 | `mailbox credential has already expired` | the upload outran the credential | ask for a rotation; `--generation 2` |
 | `register-key` says the credential expired and your shot is spent | the submission credential is gone for good | ask the owner for a key-only credential (`issue --key-only`); re-run with `--key-credential --generation N` |
 | `… has already committed manifest …` | this hotkey's shot is spent | a new hotkey |
@@ -289,7 +290,7 @@ A refusal is final for that hotkey; a new attempt is a new hotkey, a new registr
 | your entry shows `deferred` in the reveal | no key and no credit, or the queue was full | `register-key` (step 6); a deferred shot is intact |
 | `deferred` with `OpenRouter refused the registered key (HTTP 401)` | the key is dead or mistyped | register a live one (`register-key` again) |
 | `deferred` with `has nothing to spend this window` | the account behind the key is empty, its limit is used up, or the cap is zero | add credits at openrouter.ai, raise the key's limit, or re-register with a larger `--cap-usd` |
-| `deferred` with `the registered OpenRouter key cannot be used` | the record was sealed to another owner key, or signed by another hotkey | re-run `register-key` with the right `--owner-key` from this wallet |
+| `deferred` with `the registered OpenRouter key cannot be used` | the record was sealed to another owner key, or signed by another hotkey | re-run `register-key` from this wallet without `--owner-key` — on netuid 99 the pinned key is the right one |
 | `no OpenRouter key: pass --key-file, or set OPENROUTER_API_KEY` | `register-key` found no key | the file is empty, or the variable is unset in this shell |
 
 ---

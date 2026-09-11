@@ -193,10 +193,11 @@ deregistered before they are ever judged.
 Every model call is metered by the gateway against an allowance. The **owner account** pays the
 two reference arms every window, the king's arm while King zero reigns, and the retest sample;
 **each miner pays on their own OpenRouter key** (whitepaper §4, D18): `thirtyspokes-miner
-register-key` seals it to your mailbox key — the one `thirtyspokes-owner key` prints and miners pass
-as `--owner-key` — and the daemon opens it with the seed in `<state>/mailbox-key.hex`, so the
+register-key` seals it to your mailbox key — the one `thirtyspokes-owner key` prints, which the
+miner tools pin as `config.OWNER_MAILBOX_KEY` so no miner ever has to be told it — and the daemon opens it with the seed in `<state>/mailbox-key.hex`, so the
 daemon's `--state` must be the directory `thirtyspokes-owner` uses, and that key must never be
-rotated behind miners' backs (every key sealed to it would stop opening). At each window the
+rotated behind miners' backs (every key sealed to it would stop opening, and every `submit` would refuse
+your envelopes until `OWNER_MAILBOX_KEY` changed in a release — so the two only ever change together). At each window the
 daemon reads the record fresh, probes the key (`GET /auth/key`, `/credits`), binds the hotkey to a
 client on that key with the miner's cap bounded by what the key reports, and journals the cap as
 `op: cap` in `allowances.jsonl`. A key that is refused, empty or capped at zero defers the entry.

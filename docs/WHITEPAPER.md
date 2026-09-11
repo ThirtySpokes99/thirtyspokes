@@ -197,7 +197,7 @@ on that slice. The episode above is unchanged; what changed is that a draw is on
 
 Each miner registers their own OpenRouter API key beside their submission and sets their own
 per-window cap; the validator runs that miner's arm on that key (D18, 2026-09-08). The key travels
-**sealed** to the owner's mailbox key (`orchestra-owner key`) and signed by the hotkey — the
+**sealed** to the owner's mailbox key (`thirtyspokes-owner key`) and signed by the hotkey — the
 mirror of §7's credential envelope — and only the validator opens it (`funding.py`). The window's
 allowance is the miner's cap bounded by what the key itself reports it can still spend, read at
 arm time; the request body is still the owner's pinned one, so the two arms of a duel send the
@@ -223,7 +223,7 @@ same bytes to different accounts.
   account with nothing left, or a cap of zero is found before the arm is opened (one probe), and
   the entry rolls over as unfunded rather than being judged at zero. Mid-arm, a 401/402 on the
   key is the meter's refusal — counted as `unfunded_calls`, never stored as the model's outcome.
-- **The owner may still credit a hotkey by hand** (`orchestra-owner credit`); it widens that
+- **The owner may still credit a hotkey by hand** (`thirtyspokes-owner credit`); it widens that
   window's allowance and is the owner's grant, not the rail.
 
 Consequence, recorded rather than argued: because allowances are miner-set and unequal, the
@@ -982,11 +982,11 @@ enter has no competition to ossify.
    the commit marker.
 5. Commit readiness on chain, packing the digests into one commitment
    (`r2ready:v1:<86 base64url chars>` — teutonic's encoding, two SHA-256 in one slot).
-6. Register your own OpenRouter key: `orchestra-miner register-key` seals it to the owner's
+6. Register your own OpenRouter key: `thirtyspokes-miner register-key` seals it to the owner's
    mailbox key, signs the record with your hotkey and puts it beside your tree, with the cap one
    window may spend (§4, D18). It uses the same credential as step 3, so it runs before or after
    the commit for as long as that credential lives, and re-running it rotates the key or moves the
-   cap; after it has expired and the shot is spent, a key-only credential (`orchestra-owner issue
+   cap; after it has expired and the shot is spent, a key-only credential (`thirtyspokes-owner issue
    --key-only`, scoped to the `openrouter/` sub-prefix the tree's verification ignores) rotates
    the key without ever re-opening the tree. The validator reads it fresh every window and runs your arm on it through its own gateway,
    which still builds the pinned request (§11-1 records what that does and does not close).

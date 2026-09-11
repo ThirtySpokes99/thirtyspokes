@@ -1,7 +1,7 @@
 """The three CLIs, driven as an operator drives them — the code `# pragma: no cover` excused.
 
 WHY THIS FILE EXISTS. A 110-agent audit on 2026-09-03 found two CRITICAL defects that had shipped
-inside `main()` bodies carrying that pragma, past 1484 passing tests: `orchestra-owner
+inside `main()` bodies carrying that pragma, past 1484 passing tests: `thirtyspokes-owner
 commit-schedule` called `_load(args.world)()` when `devkit._load` already invokes the attribute, so
 the ONLY writer of the §6.3 schedule root raised `TypeError` before it reached the chain and the
 validator — which refuses to start without a root — could not be started at all; and
@@ -18,8 +18,8 @@ network, a wallet or an account, and replacing them there leaves the whole of `m
 THE ASSERTIONS ARE CROSS-CHECKS AGAINST THE OTHER SIDE, never against a literal this file also
 computes. The root `commit-schedule` writes is compared to the one a real `Validator` computes from
 the same world (that equality is the whole of §6.3 — a root that only matches itself is a number
-nobody can check a window against); the mailbox key `orchestra-miner identity` tells a miner to
-poll is compared to the key `orchestra-owner issue` actually published to; and the envelope the
+nobody can check a window against); the mailbox key `thirtyspokes-miner identity` tells a miner to
+poll is compared to the key `thirtyspokes-owner issue` actually published to; and the envelope the
 owner published is opened with the miner's own seed against the public key `owner ... key` printed.
 Each of those spans two programs that derive their answer independently, which is what makes them
 able to fail.
@@ -192,7 +192,7 @@ def issue_argv(state: Path, hotkey: str = MINER) -> list[str]:
                       "--r2-bucket", BUCKET)
 
 
-# --- orchestra-owner commit-schedule: the command that was dead on arrival -------------------
+# --- thirtyspokes-owner commit-schedule: the command that was dead on arrival -------------------
 
 
 def test_commit_schedule_puts_the_root_the_validator_computes_on_chain(tmp_path, wired, chain):
@@ -263,7 +263,7 @@ def test_the_committed_root_moves_when_the_schedule_parameters_do(tmp_path, wire
     assert len(set(roots)) == len(roots), "the root does not distinguish the schedules it pins"
 
 
-# --- orchestra-owner issue / status / key ----------------------------------------------------
+# --- thirtyspokes-owner issue / status / key ----------------------------------------------------
 
 
 def test_issue_publishes_an_envelope_the_miner_can_actually_open(tmp_path, wired, chain, bucket,
@@ -301,7 +301,7 @@ def test_issue_refuses_an_unregistered_hotkey_with_a_message_and_a_nonzero_exit(
     scoped to a guessed registration is the one failure the derivation exists to prevent."""
     with pytest.raises(SystemExit) as caught:
         owner_tool.main(issue_argv(tmp_path / "state", STRANGER))
-    assert "orchestra-owner:" in str(caught.value) and "holds no uid" in str(caught.value)
+    assert "thirtyspokes-owner:" in str(caught.value) and "holds no uid" in str(caught.value)
     assert bucket.client.objects == {}
 
 
@@ -345,7 +345,7 @@ def test_key_is_the_same_key_on_every_run_and_is_the_one_that_signed_the_envelop
     assert capsys.readouterr().out.strip() == first, "issuing rotated the published owner key"
 
 
-# --- orchestra-miner check / identity --------------------------------------------------------
+# --- thirtyspokes-miner check / identity --------------------------------------------------------
 
 
 def test_check_runs_the_validators_gate_with_no_wallet_and_no_chain(tmp_path, wired, capsys):
@@ -371,7 +371,7 @@ def test_check_refuses_in_the_validators_own_words_and_exits_nonzero(tmp_path, w
                          "--model", str(tree),
                          "--reference", str(_reference_tree(tmp_path / "ref"))])
     message = str(caught.value)
-    assert "orchestra-miner:" in message and "pickle archive refused" in message
+    assert "thirtyspokes-miner:" in message and "pickle archive refused" in message
     assert "REFUSED at admission" in message
 
 
@@ -742,7 +742,7 @@ def test_from_env_refuses_a_table_that_does_not_say_which_pool_it_priced(env, mo
         world.from_env()
 
 
-# --- orchestra-miner hotkey: the ed25519 check, BEFORE the registration burn -----------------
+# --- thirtyspokes-miner hotkey: the ed25519 check, BEFORE the registration burn -----------------
 
 
 def test_hotkey_command_approves_an_ed25519_keyfile_without_touching_the_chain(tmp_path, monkeypatch,

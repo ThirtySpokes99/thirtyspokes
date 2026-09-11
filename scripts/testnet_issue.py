@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`orchestra-owner issue`, against a MinIO bucket instead of Cloudflare R2 — the testnet rehearsal.
+"""`thirtyspokes-owner issue`, against a MinIO bucket instead of Cloudflare R2 — the testnet rehearsal.
 
 WHAT THIS STANDS IN FOR, AND THE ONE THING IT DOES NOT TEST. Production minting is
 `access.scoped_credential`: a prefix-scoped R2 token that is a signed JWT Cloudflare accepts as a

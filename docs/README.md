@@ -19,9 +19,9 @@ is being rehearsed end to end on testnet 526 before it opens on 99.
 | [`MINER.md`](MINER.md) | **miners** — the ed25519 hotkey, registering, the local admission gate, the sealed OpenRouter key, the one-shot `submit`, budget, the queue |
 | [`VALIDATOR.md`](VALIDATOR.md) | **the validator (owner)** — the grading host, launching, the owner account and the miners' keys, issuing credentials, what is published |
 
-Tools: `orchestra-miner` (`hotkey` · `identity` · `check` · `register-key` · `submit`), `orchestra-owner`
-(`issue` · `credit` · `balances` · `status` · `key` · `commit-schedule`), `orchestra-validator`,
-`orchestra-dev` (the miner's local dev kit), `orchestra-sim` (one offline window).
+Tools: `thirtyspokes-miner` (`hotkey` · `identity` · `check` · `register-key` · `submit`), `thirtyspokes-owner`
+(`issue` · `credit` · `balances` · `status` · `key` · `commit-schedule`), `thirtyspokes-validator`,
+`thirtyspokes-dev` (the miner's local dev kit), `thirtyspokes-sim` (one offline window).
 
 The measurements every constant traces to (the λ fit, the corpus census, the first live window)
 are kept with the owner's operating records, outside this tree.

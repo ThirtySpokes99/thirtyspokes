@@ -1417,7 +1417,7 @@ def test_a_daemon_whose_owner_account_is_empty_refuses_to_start(tmp_path):
     message = str(caught.value)
     assert "no allowance" in message
     # The refusal has to say what to DO: this is the one failure whose symptom points at the corpus.
-    assert "orchestra-owner" in message and "credit" in message
+    assert "thirtyspokes-owner" in message and "credit" in message
 
 
 def test_a_funded_owner_account_passes_the_same_gate(tmp_path):
@@ -1855,7 +1855,7 @@ def test_a_drained_owner_account_refuses_the_next_window_not_just_the_first(tmp_
         h.run(2)
 
     assert "no allowance" in str(caught.value)
-    assert "orchestra-owner" in str(caught.value)
+    assert "thirtyspokes-owner" in str(caught.value)
 
 
 def test_a_king_that_stops_paying_loses_the_throne(tmp_path):

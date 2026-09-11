@@ -117,7 +117,7 @@ def load_json(text: str | bytes, owner_public_hex: str | None) -> Approved:
 
 
 def main() -> None:
-    """`orchestra-serving-governance` — sign an approved-image record.
+    """`thirtyspokes-serving-governance` — sign an approved-image record.
 
     The MRTD is not discovered for you. Read it from a quote taken on the built image
     (`tdx.self_mrtd()` inside it, or `parse_quote` on a captured quote) and pass it in, so that

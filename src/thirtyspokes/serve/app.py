@@ -132,7 +132,7 @@ def create_app(policy, backend, *, stats: Stats | None = None,
     """`policy` is anything with `.decide(prompt) -> Decision` — RoutingPolicy or TieredPolicy.
 
     `log_features` writes the prompt's EMBEDDING (float16, base64) into each log record. It is what
-    the training loop consumes (`orchestra-serve-train`), and it is opt-in for the same reason
+    the training loop consumes (`thirtyspokes-serve-train`), and it is opt-in for the same reason
     `log_prompts` is: embeddings carry no text but they are semantic and partially invertible, so a
     features log must be kept private. Without it the service still runs — it just cannot learn.
 

@@ -1,4 +1,4 @@
-"""`orchestra-enclave` — bring up the confidential router inside a TDX guest.
+"""`thirtyspokes-enclave` — bring up the confidential router inside a TDX guest.
 
 Boot order matters here, because each step's failure has to be a refusal to serve rather than a
 degraded service that still answers:

@@ -21,7 +21,7 @@
 # runtime must not fetch it at boot (HF_HUB_OFFLINE=1; anything unmeasured is outside RTMR1).
 #
 # Build on a machine with mkosi 25+, then boot the .raw on a TDX host and read the MRTD with
-# `tdx.self_mrtd()`. That value is what `orchestra-serving-governance --mrtd` approves.
+# `tdx.self_mrtd()`. That value is what `thirtyspokes-serving-governance --mrtd` approves.
 set -euo pipefail
 export PATH="$PATH:/root/.local/bin"
 
@@ -208,7 +208,7 @@ export OPENROUTER_API_KEY="$(cat /run/router/openrouter.key)"
 export THIRTYSPOKES_OWNER_ACCOUNT="$(cat /run/router/owner.txt)"
 ARGS=(--host 0.0.0.0 --port 8080 --epoch "${ROUTER_EPOCH:-1}")
 [ -f /run/router/model/weights.npz ] && ARGS+=(--weights /run/router/model/weights.npz)
-exec /opt/router/venv/bin/orchestra-enclave "${ARGS[@]}"
+exec /opt/router/venv/bin/thirtyspokes-enclave "${ARGS[@]}"
 EOF
 chmod +x "$OUT/mkosi.extra/opt/router/start.sh"
 
@@ -295,4 +295,4 @@ mcopy -o -i "$OUT/thirtyspokes-router.raw@@1048576" "$OUT/thirtyspokes-router.ef
 echo "=== artifacts ==="; ls -la "$OUT"/*.raw* "$OUT"/*.efi 2>/dev/null
 echo
 echo "NEXT: boot this on a TDX host, read the MRTD with tdx.self_mrtd(), and approve it with"
-echo "  orchestra-serving-governance --mrtd <value> --owner-key <seed> --out approved.json"
+echo "  thirtyspokes-serving-governance --mrtd <value> --owner-key <seed> --out approved.json"

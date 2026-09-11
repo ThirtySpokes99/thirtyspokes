@@ -1,4 +1,4 @@
-"""The whole mechanism as one offline window — `orchestra-sim` (the build plan M9 exit 1).
+"""The whole mechanism as one offline window — `thirtyspokes-sim` (the build plan M9 exit 1).
 
 Every module built so far meets here: the committed window (`window`), the pinned harness
 (`scaffold`), the fixed policies and the power gate (`reference`), the priced score (`score`), the
@@ -1006,7 +1006,7 @@ def run_simulation(root: Path, *, verbose: bool = True) -> list[WindowReport]:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="orchestra-sim",
+        prog="thirtyspokes-sim",
         description="Run the whole v3 mechanism offline: a committed window, the power gate, one "
                     "king arm shared by every duel, the three-condition verdict, batch coronation "
                     "and the emission schedule. No network, no key, no GPU, no chain.")

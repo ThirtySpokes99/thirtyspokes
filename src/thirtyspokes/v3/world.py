@@ -1,4 +1,4 @@
-"""The production world — what `orchestra-validator --world` resolves to (§5.1b, §5.5, §6.2).
+"""The production world — what `thirtyspokes-validator --world` resolves to (§5.1b, §5.5, §6.2).
 
 `validator.main` requires `--world module:attr`: a zero-argument callable returning the published
 `Pins` — the lambda/C table, King0 and its contrast, over the real corpus. Nothing in the tree

@@ -402,7 +402,7 @@ def test_the_key_comes_from_a_file_or_the_environment_never_from_argv(tmp_path, 
 
 
 def test_mailbox_seed_is_the_key_orchestra_owner_key_publishes(tmp_path):
-    """Miners seal to `orchestra-owner key`; the daemon opens with `mailbox_seed`. Same file."""
+    """Miners seal to `thirtyspokes-owner key`; the daemon opens with `mailbox_seed`. Same file."""
     state = tmp_path / "state"
     seed = owner_tool.mailbox_seed(state)
     assert Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw().hex() \

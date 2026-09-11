@@ -3,7 +3,7 @@
 THE OWNER'S DECISION, 2026-09-08: a miner pays for their arm's worker calls on THEIR OWN OpenRouter
 account, not through a balance the owner holds. The key travels sealed — the mirror of the mailbox
 envelope in `access.py`: there the owner seals a credential to the miner's ed25519 hotkey; here the
-miner seals an API key to the owner's ed25519 mailbox key (`orchestra-owner key`, the same hex a
+miner seals an API key to the owner's ed25519 mailbox key (`thirtyspokes-owner key`, the same hex a
 miner already passes as `--owner-key`). Only the validator's mailbox seed opens it. The record is
 signed by the hotkey, so a key found under a miner's prefix is that miner's and nobody else's, and
 it names the registration it belongs to, so a record lifted from one prefix into another opens
@@ -26,7 +26,7 @@ by that the owner's own arms were not. That is evidence, not a gate.
 WHERE IT LIVES. One object, `openrouter/key.json`, under the miner's submission prefix, written with
 the same prefix-scoped credential the tree is uploaded with — or, once that credential has expired
 and the shot is spent, with a KEY-ONLY credential the owner issues for the `openrouter/` sub-prefix
-alone (`Mailbox.issue_key`; `orchestra-owner issue --key-only`; `register-key --key-credential`).
+alone (`Mailbox.issue_key`; `thirtyspokes-owner issue --key-only`; `register-key --key-credential`).
 `store.fetch_submission` ignores everything under that sub-prefix. Re-uploading the record replaces
 the key or the cap; the validator reads it fresh every window.
 """

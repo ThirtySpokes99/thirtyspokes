@@ -137,7 +137,7 @@ Every argument below is required except `--poll-seconds`, `--check` and the serv
 defaults.
 
 ```bash
-orchestra-validator \
+thirtyspokes-validator \
   --state /var/lib/v3 --netuid <n> --network finney \
   --wallet <owner-wallet> --hotkey <owner-hotkey> \
   --genesis-block <b> --window-blocks <n> --windows <n> --immunity-blocks <n> \
@@ -192,10 +192,10 @@ deregistered before they are ever judged.
 
 Every model call is metered by the gateway against an allowance. The **owner account** pays the
 two reference arms every window, the king's arm while King zero reigns, and the retest sample;
-**each miner pays on their own OpenRouter key** (whitepaper §4, D18): `orchestra-miner
-register-key` seals it to your mailbox key — the one `orchestra-owner key` prints and miners pass
+**each miner pays on their own OpenRouter key** (whitepaper §4, D18): `thirtyspokes-miner
+register-key` seals it to your mailbox key — the one `thirtyspokes-owner key` prints and miners pass
 as `--owner-key` — and the daemon opens it with the seed in `<state>/mailbox-key.hex`, so the
-daemon's `--state` must be the directory `orchestra-owner` uses, and that key must never be
+daemon's `--state` must be the directory `thirtyspokes-owner` uses, and that key must never be
 rotated behind miners' backs (every key sealed to it would stop opening). At each window the
 daemon reads the record fresh, probes the key (`GET /auth/key`, `/credits`), binds the hotkey to a
 client on that key with the miner's cap bounded by what the key reports, and journals the cap as
@@ -204,9 +204,9 @@ client on that key with the miner's cap bounded by what the key reports, and jou
 The owner account is the one balance nothing else fills, so this is a step, not a detail:
 
 ```bash
-orchestra-owner --state /srv/v3-state credit --hotkey owner --usd 40 --ref "extrinsic 0x91af"
-orchestra-owner --state /srv/v3-state credit --hotkey <MINER_SS58> --usd 12.50 --ref "invoice 7"
-orchestra-owner --state /srv/v3-state balances
+thirtyspokes-owner --state /srv/v3-state credit --hotkey owner --usd 40 --ref "extrinsic 0x91af"
+thirtyspokes-owner --state /srv/v3-state credit --hotkey <MINER_SS58> --usd 12.50 --ref "invoice 7"
+thirtyspokes-owner --state /srv/v3-state balances
 ```
 
 `--ref` is free text and is never parsed. A credit to a miner's hotkey is your grant on top of
@@ -230,21 +230,21 @@ while `--check` stays green. `preflight` refuses instead, and names this command
 
 **The validator daemon cannot issue a credential, and that is deliberate**: it wires its mailbox with
 a minter that always raises, because a daemon able to mint could hand out write access to a
-submission prefix from inside the loop that scores it. Issuing is `orchestra-owner`.
+submission prefix from inside the loop that scores it. Issuing is `thirtyspokes-owner`.
 
 ```bash
 # A miner sends you their `identity` output. You need only the hotkey.
-orchestra-owner --state /var/lib/v3 issue \
+thirtyspokes-owner --state /var/lib/v3 issue \
   --hotkey <miner ss58> --netuid <n> --wallet <owner-wallet> \
   --r2-endpoint <url> --r2-bucket <bucket>
 
 # Who holds credentials, and which must now be revoked.
-orchestra-owner --state /var/lib/v3 status
+thirtyspokes-owner --state /var/lib/v3 status
 
 # A KEY-ONLY credential (D18): write access to `openrouter/` under the miner's prefix and nothing
 # else, issued to a spent hotkey too — how a miner rotates a dead or leaked OpenRouter key after
 # their submission credential expired. Its own generation series; nothing to revoke on a spent shot.
-orchestra-owner --state /var/lib/v3 issue --key-only \
+thirtyspokes-owner --state /var/lib/v3 issue --key-only \
   --hotkey <miner ss58> --netuid <n> --wallet <owner-wallet> \
   --r2-endpoint <url> --r2-bucket <bucket>
 ```

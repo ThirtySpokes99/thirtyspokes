@@ -119,7 +119,7 @@ def duelled(report, hotkey: str):
 
 @pytest.fixture(scope="module")
 def simulation(tmp_path_factory):
-    """The shipped `orchestra-sim` cast, run once: three windows, two coronations."""
+    """The shipped `thirtyspokes-sim` cast, run once: three windows, two coronations."""
     return run_simulation(tmp_path_factory.mktemp("sim"), verbose=False)
 
 

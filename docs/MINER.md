@@ -25,7 +25,7 @@ The format pin is what makes "no miner code ever executes" survive a full-weight
 archive is code, and `safetensors` is not.
 
 **A hotkey gets exactly one submission, ever** (§7). Not one per window — one. A malformed upload,
-a wrong dtype, a stray `.bin` spends it. Use the dev kit (`orchestra-dev`) against your own
+a wrong dtype, a stray `.bin` spends it. Use the dev kit (`thirtyspokes-dev`) against your own
 artifact before you spend the shot; it runs the same admission checks the validator will.
 
 **Copy `config.json` and the tokenizer files from the reference tree verbatim.** This is the trap
@@ -38,7 +38,7 @@ however you like; when you save, put the reference's own `config.json` and token
 
 ### 1a. Step by step — from an empty wallet to a spent shot
 
-The whole path is `btcli` for the chain-side account work and `orchestra-miner` for everything
+The whole path is `btcli` for the chain-side account work and `thirtyspokes-miner` for everything
 the mechanism owns. Nothing here is optional and nothing past step 7 is reversible.
 
 #### 0. Prerequisites
@@ -57,7 +57,7 @@ the mechanism owns. Nothing here is optional and nothing past step 7 is reversib
 ```bash
 git clone https://github.com/thirtyspokes99/thirtyspokes && cd thirtyspokes
 uv venv --python 3.12 && uv pip install -e ".[dev,miner]"
-uv run orchestra-miner --help
+uv run thirtyspokes-miner --help
 ```
 
 `miner` is what the miner commands import beyond the core — the S3 client for the upload, the chain SDK and wallet, and the envelope cryptography; the offline suite never touches them.
@@ -104,7 +104,7 @@ EOF
 **Verify before you spend anything.** This reads only the keyfile:
 
 ```bash
-uv run orchestra-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" hotkey
+uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" hotkey
 ```
 
 ```
@@ -152,7 +152,7 @@ least that long, which is the whole time the queue can take to reach you (§7).
 #### 3. Send the owner your identity
 
 ```bash
-uv run orchestra-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" identity
+uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" identity
 ```
 
 ```
@@ -167,7 +167,7 @@ upload prefix      submissions/3f9c…a12e/
 ```
 
 Send the owner the hotkey (the rest they re-derive from the chain — nothing you type can change
-where your credential is scoped to). They run `orchestra-owner issue`, which publishes your
+where your credential is scoped to). They run `thirtyspokes-owner issue`, which publishes your
 envelope on the subnet's public store, `https://store.thirtyspokes.ai` — the tools poll it by
 default — and reply with their **ed25519 public key**; `submit` refuses any envelope not signed by
 it. Register your OpenRouter key once the envelope is up (step 6): an entry
@@ -189,14 +189,14 @@ by digest). Your tree must contain only `.safetensors` shards, their index, `con
 no `auto_map`, no `trust_remote_code`. Run the dev kit until the endings look like routing:
 
 ```bash
-uv run orchestra-dev --model-tree ./weights --reference ./reference \
+uv run thirtyspokes-dev --model-tree ./weights --reference ./reference \
     --conductor my_serving:conductor --budget-usd 1
 ```
 
 #### 5. `check` — the validator's gate, locally, until it says admitted
 
 ```bash
-uv run orchestra-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" check \
+uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" check \
     --model ./weights --reference ./reference
 ```
 
@@ -211,7 +211,7 @@ register it with the cap one window may spend:
 
 ```bash
 printf '%s' 'sk-or-v1-…' > ~/.openrouter-key && chmod 600 ~/.openrouter-key
-uv run orchestra-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" register-key \
+uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" register-key \
     --key-file ~/.openrouter-key --cap-usd 20 \
     --owner-key <owner's ed25519 public key, hex>
 ```
@@ -220,7 +220,7 @@ The key is sealed to the owner's key **before** it leaves this machine and the r
 your hotkey; it lands beside your tree as `openrouter/key.json`, and only the owner's validator opens
 it. It uses the same envelope `submit` opens, so run it any time that credential is valid — before
 or after step 7 — and run it again to rotate the key or move the cap. Once that credential has expired and the
-shot is spent, ask the owner for a **key-only** credential (`orchestra-owner issue --key-only`)
+shot is spent, ask the owner for a **key-only** credential (`thirtyspokes-owner issue --key-only`)
 and run `register-key --key-credential --generation N`: it can write your key and nothing of
 your tree. §6 has the order of
 magnitude for the cap; the validator reads the record fresh every window and bounds the cap by
@@ -229,7 +229,7 @@ what the key reports it can still spend.
 #### 7. `submit` — this spends the shot
 
 ```bash
-uv run orchestra-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" submit \
+uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" submit \
     --model ./weights --reference ./reference \
     --owner-key <owner's ed25519 public key, hex>
 ```

@@ -320,7 +320,7 @@ def _jwt_claims(credential: Credential) -> dict:
 def test_a_concurrent_writer_does_not_erase_an_issued_generation(tmp_path):
     """THE OWNER TOOL AND THE VALIDATOR DAEMON BOTH WRITE THIS FILE, from different processes.
 
-    Measured 2026-09-02, and reachable only once `orchestra-owner` gave the ledger a second
+    Measured 2026-09-02, and reachable only once `thirtyspokes-owner` gave the ledger a second
     writer: the daemon loads it at startup and `_persist` writes its whole in-memory view, so an
     `issue` landing before the daemon's next `consume` used to vanish. The rotation then re-minted
     generation 1 over a mailbox key a miner may already be polling, and `Submission.generations`
@@ -329,7 +329,7 @@ def test_a_concurrent_writer_does_not_erase_an_issued_generation(tmp_path):
     """
     path = tmp_path / "mailbox.json"
     daemon = Mailbox(path, Signer(), mint)          # loaded once, as `run_forever` loads it
-    owner = Mailbox(path, Signer(), mint)           # the separate `orchestra-owner` process
+    owner = Mailbox(path, Signer(), mint)           # the separate `thirtyspokes-owner` process
 
     other = registration(OTHER, uid=9)
     first, _ = owner.issue(other)

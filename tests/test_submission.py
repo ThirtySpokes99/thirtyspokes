@@ -4,7 +4,7 @@ THIS IS THE PATH THAT DID NOT EXIST. Every piece of it shipped — `access` seal
 uploads the tree, `chain` writes the ready signal, `admission` decides what is acceptable — and
 nothing joined them, so a registered miner had no route to a submission and the owner had no way to
 hand one out (`validator.main` wires a minter that always raises). What is tested here is the join:
-`orchestra-owner` and `orchestra-miner`, driven with a mock chain, an in-memory bucket and a
+`thirtyspokes-owner` and `thirtyspokes-miner`, driven with a mock chain, an in-memory bucket and a
 local reference tree.
 
 NO NETWORK, NO WALLET, NO BOTO3. The two seams that would reach a service — fetching the envelope

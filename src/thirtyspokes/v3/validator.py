@@ -103,7 +103,8 @@ from .score import ArmScore, best_possible_final, score_arm
 from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
                        _exhausted, _GraderGuard, _pairs, _why, format_window, priced)
-from .store import S3Bucket, fetch_submission
+from .store import (GRACE_SECONDS, Retention, S3Bucket, apply_retention, fetch_manifest,
+                    fetch_submission, promote_submission, retention_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
 from .window import Window, WindowError, exclude, schedule, window_path
 from .worker import WorkerError
@@ -126,6 +127,16 @@ WEIGHT_REFRESH_BLOCKS = 180
 POLL_SECONDS = 60.0
 
 STATE_VERSION = 1
+
+# A winner whose copy to the public models bucket will not verify is retried on later polls rather
+# than crowned or dropped at the first failure — the budget teutonic's promotion worker uses.
+# Exhausted, the crown is FORFEITED: a king whose weights are not public breaks D14's promise that
+# the crown is derivable, and holding the throne open indefinitely would stall every later duel.
+PROMOTION_MAX_ATTEMPTS = 8
+# ...and spaced as teutonic spaces them: 30 s after the first failure, doubling per attempt (the
+# exponent capped at 8), so the eight attempts span a little over an hour. Retrying on every poll
+# instead would spend the whole budget inside a few minutes of an R2 blip.
+PROMOTION_RETRY_BASE_SECONDS = 30.0
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -488,6 +499,9 @@ class Crown:
     hotkey: str = KING0
     model_dir: str = ""
     served_model: str = ""
+    # Where D14 makes this king's weights public: `models/sha256/<manifest>/` in the public models
+    # bucket, set only once that copy has verified. Empty for King0, which has no weights.
+    public_prefix: str = ""
 
     @property
     def is_king_zero(self) -> bool:
@@ -520,6 +534,13 @@ class History:
         self.crown = Crown()
         self.revealed: set[str] = set()
         self.windows: dict[int, dict] = {}
+        # A verdict that won but whose public copy has not verified yet (`Validator._promote`).
+        self.pending_crown: dict | None = None
+        # hotkey -> {registration_id, at}: when each submission was judged, which is where §8b.7's
+        # grace window starts, and which prefix its weights live under.
+        self.judged_at: dict[str, dict] = {}
+        # registration ids whose weights retention has already deleted.
+        self.purged: set[str] = set()
         self._restore()
 
     # --- reads ------------------------------------------------------------------------------
@@ -535,8 +556,19 @@ class History:
 
     # --- writes -----------------------------------------------------------------------------
     def settle(self, window: int, *, crowned: str | None, judged: Iterable[str],
-               revealed: Iterable[str]) -> None:
-        """§8 step 5's first half — the half a crash must never repeat."""
+               revealed: Iterable[str], registrations: Mapping[str, str] | None = None,
+               at: float | None = None) -> None:
+        """§8 step 5's first half — the half a crash must never repeat.
+
+        `registrations` maps a judged hotkey to the registration its submission lives under and `at`
+        is the wall-clock moment of judgment; together they are what §8b.7's retention counts from.
+        A hotkey keeps its FIRST judgment time.
+        """
+        judged = list(judged)
+        for hotkey in judged:
+            if registrations and at is not None and hotkey in registrations:
+                self.judged_at.setdefault(hotkey, {"registration_id": registrations[hotkey],
+                                                   "at": float(at)})
         self.judged.update(judged)
         self.revealed.update(revealed)
         if crowned is not None:
@@ -552,6 +584,23 @@ class History:
         self.crown = crown
         self.save()
 
+    def defer_crown(self, pending: Mapping) -> None:
+        """A verdict won but its public copy has not verified: remember the winner, do not crown."""
+        self.pending_crown = dict(pending)
+        self.save()
+
+    def crown_promoted(self, crown: Crown, *, window: int) -> None:
+        """Finish a deferred coronation once its copy verified on a later poll."""
+        self.crown = crown
+        self.coronations.append(crown.hotkey)
+        self.windows.setdefault(window, {"crowned": None})["crowned"] = crown.hotkey
+        self.pending_crown = None
+        self.save()
+
+    def forfeit_crown(self) -> None:
+        self.pending_crown = None
+        self.save()
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
@@ -560,9 +609,13 @@ class History:
             "judged": sorted(self.judged),
             "coronations": list(self.coronations),
             "crown": {"hotkey": self.crown.hotkey, "model_dir": self.crown.model_dir,
-                      "served_model": self.crown.served_model},
+                      "served_model": self.crown.served_model,
+                      "public_prefix": self.crown.public_prefix},
             "revealed": sorted(self.revealed),
             "windows": {str(w): body for w, body in sorted(self.windows.items())},
+            "pending_crown": self.pending_crown,
+            "judged_at": {hotkey: dict(entry) for hotkey, entry in sorted(self.judged_at.items())},
+            "purged": sorted(self.purged),
         }, sort_keys=True), encoding="utf-8")
         temporary.replace(self.path)
 
@@ -575,6 +628,9 @@ class History:
         self.crown = Crown(**state.get("crown", {}))
         self.revealed = set(state.get("revealed", ()))
         self.windows = {int(w): dict(body) for w, body in state.get("windows", {}).items()}
+        self.pending_crown = state.get("pending_crown")
+        self.judged_at = {str(k): dict(v) for k, v in state.get("judged_at", {}).items()}
+        self.purged = set(state.get("purged", ()))
 
 
 class Checkpoint:
@@ -771,6 +827,12 @@ class Validator:
     reference: Reference
     chain: Chain
     store: S3Bucket
+    # Teutonic's layout. `store` stays the PUBLIC store for window files, reveals and envelopes;
+    # `private_models` holds every submission and is readable by nobody but the miner's scoped
+    # credential and this daemon; `public_models` receives a winner's tree, content-addressed, once
+    # it has won — D14's public king and nothing else. Three distinct buckets, checked at preflight.
+    private_models: S3Bucket
+    public_models: S3Bucket
     mailbox: Mailbox
     gateway: OwnerGateway
     owner: Owner
@@ -801,6 +863,9 @@ class Validator:
     king_zero_uid: int | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
+    # Wall-clock seconds for anything PERSISTED (judgment times retention counts from). Not `clock`,
+    # which is monotonic and means nothing across a restart.
+    now: Callable[[], float] = time.time
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -826,6 +891,7 @@ class Validator:
         """`check_launch` against this chain's own reported limit, once. Idempotent."""
         if self._preflighted:
             return
+        self._require_private_submissions()
         check_chain_launch(self.chain, self.cadence)
         # §6.3: the schedule root must be ON CHAIN and must be the one this validator computed.
         # The draw is a pure function of a schedule entry (D12), so N entries are N slices; a root
@@ -858,6 +924,20 @@ class Validator:
         # reads the code.
         self._require_owner_funds()
         self._preflighted = True
+
+    def _require_private_submissions(self) -> None:
+        """Refuse a deployment where a submission could be public (D14; WHITEPAPER's exposure line).
+
+        The three buckets are three visibilities, and the mistake that matters is the silent one:
+        pointing `private_models` at a public bucket uploads every challenger's weights where anyone
+        can download them, and nothing about a window would look wrong.
+        """
+        names = (self.store.bucket, self.private_models.bucket, self.public_models.bucket)
+        if len(set(names)) != len(names):
+            raise ValidatorError(
+                f"the store, private models and public models buckets must be distinct, got "
+                f"{names}: a submission in a public bucket is downloadable by anyone before it has "
+                f"won anything")
 
     def _require_owner_funds(self) -> None:
         """§4's allowance, checked before every window rather than once at launch.
@@ -916,6 +996,8 @@ class Validator:
         be verified (fail closed, §8 step 2 — challengers roll over with their shot intact).
         """
         self.preflight()
+        self._settle_pending_crown()
+        self._apply_retention()
         block = self.chain.current_block()
         window = self.cadence.window_at(block)
         if window is None or self.history.completed(window):
@@ -970,6 +1052,9 @@ class Validator:
         # report who rolled over. §5.5's reversion is resolved on the same metagraph read.
         notes: dict[str, str] = {}              # D18: why a registered key could not fund an arm
         queue, turned_away = self._queue(metagraph, window, notes)
+        # Every queued hotkey's registration, for §8b.7's retention: taken from the whole queue
+        # here because two of `_publish`'s callers pass it no `queued` mapping at all.
+        registrations = {entry.hotkey: entry.registration.registration_id for entry in queue}
         self._resolve_reign(metagraph)
         crown = self.history.crown
         king_hotkey = crown.hotkey            # the START-OF-WINDOW king; every duel faces this one
@@ -996,7 +1081,8 @@ class Validator:
             return self._publish(opened, power, tuple(arms), king_hotkey, None, (), guard,
                                  tuple([Outcome(q.hotkey, q.block, DEFERRED, power.reason)
                                         for q in queue] + turned_away),
-                                 None, tuple(ref_audits), {}, table=table, splits=splits)
+                                 None, tuple(ref_audits), {}, table=table, splits=splits,
+                                 registrations=registrations)
 
         # PHASE 3 — admission for the WHOLE queue, before the king's arm is touched (§8b.2). A
         # window whose entire queue is invalid therefore spends the king nothing at all.
@@ -1073,6 +1159,7 @@ class Validator:
             outcomes.extend(Outcome(q.hotkey, q.block, DEFERRED, broken) for q, _ in admitted)
             return self._publish(opened, power, tuple(arms), king_hotkey, None, king_results, guard,
                                  tuple(outcomes), None, meters, {}, judged=judged, table=table,
+                                 registrations=registrations,
                                  splits=splits)
 
         # §4: "The king must stay funded ... an unfunded king scores zeroes and loses." The code
@@ -1183,7 +1270,8 @@ class Validator:
         # PHASE 7 — batch coronation, every delta measured against the same king arm (§5.2a).
         return self._publish(opened, power, tuple(arms), king_hotkey, king_arm, king_results, guard,
                              tuple(outcomes), champion(contenders), meters, crowned_dirs,
-                             judged=judged, table=table, retest=retest, splits=splits)
+                             judged=judged, table=table, retest=retest, splits=splits,
+                             registrations=registrations)
 
     # --- the steps ---------------------------------------------------------------------------
 
@@ -1254,7 +1342,7 @@ class Validator:
             return None
         path = f"submissions/{registration_id}/{KEY_NAME}"
         try:
-            raw = self.store.get(path)
+            raw = self.private_models.get(path)
         except Exception as exc:                 # noqa: BLE001 — absent, or the store is down
             if not _absent(exc):
                 self._log(f"window {window}: could not read {path} ({exc}); {hotkey} stays on "
@@ -1389,7 +1477,7 @@ class Validator:
         our failure.
         """
         dest = self.root / "trees" / queued.registration.registration_id
-        fetch_submission(self.store, dest, commitment=queued.commitment,
+        fetch_submission(self.private_models, dest, commitment=queued.commitment,
                          registration=queued.registration)
         admit(dest, self.reference)
         return self.serve(dest, served_name(queued.commitment))
@@ -1685,7 +1773,8 @@ class Validator:
                  guard: _GraderGuard, outcomes: tuple[Outcome, ...], crowned: Contender | None,
                  meters: tuple[ArmAudit, ...], queued: Mapping[str, Queued],
                  judged: Sequence[str] = (), table: OutcomeTable | None = None,
-                 retest: dict | None = None, splits: Mapping[str, dict] | None = None) -> Reveal:
+                 retest: dict | None = None, splits: Mapping[str, dict] | None = None,
+                 registrations: Mapping[str, str] | None = None) -> Reveal:
         """§8 step 5, in its required order: persist history, set weights, publish the reveal.
 
         Persisting first is not tidiness. Re-judging is NOT idempotent under the one-shot rule, so a
@@ -1703,16 +1792,34 @@ class Validator:
         # Sorted here rather than at each return, because there are three of them and the one that
         # forgets is the one nobody reads.
         outcomes = tuple(sorted(outcomes, key=lambda o: (o.commit_block, o.hotkey)))
+        # CROWN AFTER VERIFY. A winner's weights must be public before the crown is theirs (D14), so
+        # the coronation waits on `_promote`; a copy that fails leaves the verdict standing and the
+        # shot spent, and the crown pending for `step` to retry.
+        promotion: dict | None = None
+        crowned_hotkey: str | None = None
         if crowned is not None:
             entry = queued[crowned.hotkey]
-            self.history.crown_to(Crown(
-                hotkey=crowned.hotkey,
-                model_dir=str(self.root / "trees" / entry.registration.registration_id),
-                served_model=served_name(entry.commitment)))
-        self.history.settle(opened.epoch, crowned=None if crowned is None else crowned.hotkey,
+            pending = {"window": opened.epoch, "hotkey": crowned.hotkey,
+                       "registration_id": entry.registration.registration_id,
+                       "manifest_sha256": entry.commitment.ready.manifest_sha256,
+                       "served_model": served_name(entry.commitment), "attempts": 1}
+            public_prefix, error = self._promote(pending)
+            if public_prefix is not None:
+                self._supersede_pending(crowned.hotkey)
+                self.history.crown_to(self._crown_for(pending, public_prefix))
+                crowned_hotkey = crowned.hotkey
+                promotion = {"hotkey": crowned.hotkey, "state": "promoted", "prefix": public_prefix}
+            else:
+                self._supersede_pending(crowned.hotkey)
+                self.history.defer_crown({**pending, "error": error,
+                                          "next_attempt_at": self._next_attempt_at(1)})
+                promotion = {"hotkey": crowned.hotkey, "state": "pending", "attempts": 1,
+                             "error": error}
+        self.history.settle(opened.epoch, crowned=crowned_hotkey,
                             judged=judged,
                             revealed=[task.task_id for task in opened.tasks]
-                            if power.separates else ())
+                            if power.separates else (),
+                            registrations=registrations, at=self.now())
 
         metagraph = self.chain.metagraph()
         lineage = self.history.lineage()
@@ -1740,11 +1847,12 @@ class Validator:
             reference=arms, king_hotkey=king_hotkey, king=king_arm, king_results=king_results,
             king_is_genesis=king_is_genesis,
             graders_failed=tuple(sorted(guard.failed)), outcomes=outcomes,
-            crowned=None if crowned is None else crowned.hotkey,
+            crowned=crowned_hotkey,
             pensioners=lineage.pensioners(self.history.crown.hotkey), weights=weights,
             metagraph=metagraph.hotkey_of, table=None if table is None else table.stats())
 
-        body = _record(report, meters, retest=retest, splits=splits)
+        body = _record(report, meters, retest=retest, splits=splits, promotion=promotion,
+                       crown_model=self._crown_model())
         self._local_reveal(opened.epoch).parent.mkdir(parents=True, exist_ok=True)
         self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
                                                     encoding="utf-8")
@@ -1754,6 +1862,124 @@ class Validator:
             self.history.mark_published(opened.epoch)
         return Reveal(report=report, arms=meters, weights_written=written, retest=retest,
                       splits=None if splits is None else dict(splits))
+
+    # --- private submissions, public kings --------------------------------------------------
+
+    def _crown_for(self, pending: Mapping, public_prefix: str) -> Crown:
+        return Crown(hotkey=pending["hotkey"],
+                     model_dir=str(self.root / "trees" / pending["registration_id"]),
+                     served_model=pending["served_model"], public_prefix=public_prefix)
+
+    def _crown_model(self) -> dict | None:
+        """Where the reigning king's weights can be downloaded — None for King0."""
+        crown = self.history.crown
+        if crown.is_king_zero or not crown.public_prefix:
+            return None
+        return {"bucket": self.public_models.bucket, "prefix": crown.public_prefix,
+                "manifest_sha256": crown.public_prefix.rstrip("/").rsplit("/", 1)[-1]}
+
+    def _promote(self, pending: Mapping) -> tuple[str | None, str | None]:
+        """Publish a winner's tree to the public models bucket: (prefix, None), or (None, error).
+
+        The only thing read from the private bucket is the manifest, which must still be the one
+        the chain names. The bytes come from this validator's verified copy of the tree, never from
+        the bucket — `store.promote_submission` says why.
+        """
+        registration_id = str(pending["registration_id"])
+        prefix = f"submissions/{registration_id}/"
+        try:
+            manifest = fetch_manifest(self.private_models, prefix)
+            if manifest.sha256 != pending["manifest_sha256"]:
+                raise ValidatorError(f"{prefix} now holds manifest {manifest.sha256}, the chain "
+                                     f"committed {pending['manifest_sha256']}")
+            public_prefix = promote_submission(self.root / "trees" / registration_id,
+                                               self.public_models, manifest=manifest)
+        except Exception as exc:          # noqa: BLE001 — every failure defers; none crowns
+            # Logged in full, published by type only (teutonic's `error_code`): a store exception
+            # can carry the account endpoint and this host's paths, and the reveal is public.
+            self._log(f"window {pending['window']}: {pending['hotkey']} won, but its model is not "
+                      f"public yet ({type(exc).__name__}: {exc}); the crown waits")
+            return None, type(exc).__name__
+        self._log(f"window {pending['window']}: {pending['hotkey']}'s model is public at "
+                  f"{self.public_models.bucket}/{public_prefix}")
+        return public_prefix, None
+
+    def _next_attempt_at(self, attempts: int) -> float:
+        return self.now() + PROMOTION_RETRY_BASE_SECONDS * 2 ** max(0, min(attempts - 1, 8))
+
+    def _supersede_pending(self, hotkey: str) -> None:
+        """A newer winner replaces an older crown still waiting on its copy.
+
+        The older winner never duelled the newer one, and its claim was conditional on a public copy
+        that has not verified; crowning it afterwards would put a king on the throne behind a
+        verdict that has already been overtaken.
+        """
+        pending = self.history.pending_crown
+        if pending and pending["hotkey"] != hotkey:
+            self._log(f"window {pending['window']}: {pending['hotkey']}'s deferred crown is "
+                      f"superseded by {hotkey}, a newer winner")
+            self.history.forfeit_crown()
+
+    def _settle_pending_crown(self) -> None:
+        """Retry a deferred coronation; crown on success, forfeit once the budget is spent."""
+        pending = self.history.pending_crown
+        if not pending:
+            return
+        if self.now() < float(pending.get("next_attempt_at", 0.0)):
+            return
+        if self.chain.metagraph().resolve(pending["hotkey"]) is None:
+            # Crowning it would append a coronation §5.5 reverts on the next refresh, and spend a
+            # pension slot on a hotkey that is gone.
+            self._log(f"window {pending['window']}: {pending['hotkey']} deregistered before its "
+                      f"model was public; the crown is forfeited")
+            self.history.forfeit_crown()
+            return
+        public_prefix, error = self._promote(pending)
+        if public_prefix is not None:
+            self.history.crown_promoted(self._crown_for(pending, public_prefix),
+                                        window=int(pending["window"]))
+            self._refresh_weights(self.chain.current_block(), force=True)
+            return
+        attempts = int(pending.get("attempts", 1)) + 1
+        if attempts >= PROMOTION_MAX_ATTEMPTS:
+            self._log(f"window {pending['window']}: {pending['hotkey']}'s crown is FORFEITED after "
+                      f"{attempts} failed promotions ({error}); a king whose weights nobody can "
+                      f"download would break D14")
+            self.history.forfeit_crown()
+            return
+        self.history.defer_crown({**pending, "attempts": attempts, "error": error,
+                                  "next_attempt_at": self._next_attempt_at(attempts)})
+
+    def _apply_retention(self) -> None:
+        """§8b.7: delete a loser's weights 14 days after it was judged, and keep its manifest.
+
+        Only JUDGED hotkeys are candidates, so a submission still waiting in the queue is never
+        touched, and nothing ever crowned — or waiting on its copy — is: the winner's private prefix
+        also holds the sealed OpenRouter key a reigning king defends on.
+        """
+        protected = set(self.history.coronations) | {self.history.crown.hotkey}
+        if self.history.pending_crown:
+            protected.add(self.history.pending_crown["hotkey"])
+        candidates = {f"submissions/{entry['registration_id']}/": float(entry["at"])
+                      for hotkey, entry in self.history.judged_at.items()
+                      if hotkey not in protected
+                      and entry["registration_id"] not in self.history.purged}
+        if not candidates:
+            return
+        plan = retention_plan(candidates, protected=(), now=self.now(), grace_seconds=GRACE_SECONDS)
+        if not plan.expired:
+            return
+        for prefix in plan.expired:
+            try:
+                freed = apply_retention(self.private_models,
+                                        Retention(kept=(), within_grace=(), expired=(prefix,)))
+            except Exception as exc:      # noqa: BLE001 — retried on the next poll
+                self._log(f"retention: could not delete {prefix} ({exc}); will retry")
+                continue
+            self.history.purged.add(prefix.split("/")[1])
+            self._log(f"retention: deleted {freed} bytes of weights under {prefix}; its manifest "
+                      f"is kept")
+        self.history.save()
 
     def _local_reveal(self, window: int) -> Path:
         return self.root / "reveals" / f"{int(window)}.json"
@@ -1839,7 +2065,8 @@ def _seen_split(results: Sequence[EpisodeResult], seen: Collection[str], failed:
 
 
 def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | None = None,
-            splits: Mapping[str, dict] | None = None) -> dict:
+            splits: Mapping[str, dict] | None = None, promotion: dict | None = None,
+            crown_model: dict | None = None) -> dict:
     """The reveal as JSON — including D15's full decision traces for the arms the OWNER paid for.
 
     The king's arm and the two reference arms, never a losing challenger's: D15 publishes the traces
@@ -1867,6 +2094,12 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
         "king": _arm_json(report.king),
         "outcomes": [_outcome_json(outcome) for outcome in report.outcomes],
         "crowned": report.crowned,
+        # Where the reigning king's weights can be downloaded (D14): the public models bucket, at
+        # the prefix named by the manifest digest the chain committed to. None while King0 reigns.
+        "crown_model": crown_model,
+        # This window's coronation and its public copy: promoted, or pending a copy that has not
+        # verified yet (the verdict stands; the crown waits). None when nobody won.
+        "promotion": promotion,
         "pensioners": list(report.pensioners),
         "weights": {str(uid): share for uid, share in sorted(report.weights.items())},
         "metagraph": {str(uid): hotkey for uid, hotkey in sorted(report.metagraph.items())},
@@ -2009,7 +2242,13 @@ def _parser() -> argparse.ArgumentParser:
                              "run -v` is resolved by the DAEMON; required when --sandbox-host names "
                              "another machine")
     parser.add_argument("--r2-endpoint", required=True)
-    parser.add_argument("--r2-bucket", required=True)
+    parser.add_argument("--r2-bucket", required=True,
+                        help="the PUBLIC store: window files, reveals and credential envelopes")
+    parser.add_argument("--r2-private-model-bucket", required=True, metavar="BUCKET",
+                        help="where every submission is uploaded and fetched from; must not be "
+                             "publicly readable")
+    parser.add_argument("--r2-public-model-bucket", required=True, metavar="BUCKET",
+                        help="where a winner's model is copied, content-addressed, once it has won")
     parser.add_argument("--per-benchmark", type=int, required=True,
                         help="tasks drawn per benchmark per window (§6.3b)")
     parser.add_argument("--minimum", type=int, required=True,
@@ -2076,6 +2315,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise AccessError(f"the validator daemon does not issue credentials (asked for {prefix})")
 
     args = _parser().parse_args(argv)
+    buckets = (args.r2_bucket, args.r2_private_model_bucket, args.r2_public_model_bucket)
+    if len(set(buckets)) != len(buckets):
+        sys.exit(f"thirtyspokes-validator: --r2-bucket, --r2-private-model-bucket and "
+                 f"--r2-public-model-bucket must be three distinct buckets, got {buckets}: a "
+                 f"submission in a public bucket is downloadable before it has won anything")
     os.environ[sandbox.DOCKER_HOST_ENV] = args.sandbox_host
     if args.grade_dir is not None:
         os.environ[sandbox.GRADE_DIR_ENV] = str(args.grade_dir)
@@ -2115,6 +2359,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     validator = Validator(
         pins=_load(args.world), reference=describe(args.reference_tree), chain=chain,
         store=r2_bucket(credential),
+        private_models=r2_bucket(replace(credential, bucket=args.r2_private_model_bucket)),
+        public_models=r2_bucket(replace(credential, bucket=args.r2_public_model_bucket)),
         mailbox=Mailbox(args.state / "mailbox.json", Signer(), never_mint),
         gateway=gateway,
         owner=Owner(ss58=wallet.hotkey.ss58_address, sign=wallet_signer(wallet),

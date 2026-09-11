@@ -55,7 +55,9 @@ from thirtyspokes.v3.openrouter import Completion
 from thirtyspokes.v3.scaffold import Scaffold
 from thirtyspokes.v3.simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED,
                                       _GraderGuard, learned_router)
-from thirtyspokes.v3.store import S3Bucket, build_manifest, upload_tree
+from thirtyspokes.v3.store import (GRACE_SECONDS, MANIFEST_NAME, S3Bucket, build_manifest,
+                                   public_model_prefix, upload_tree)
+import thirtyspokes.v3.store as store_module
 from thirtyspokes.v3.tools import PROTOCOL
 from thirtyspokes.v3.types import Catalog, CatalogEntry, EpisodeResult, TaskSpec
 from thirtyspokes.v3.window import task_order
@@ -87,6 +89,8 @@ DEAD = (MockBenchmark("flat-a", STRENGTH, n_tasks=4, difficulty=(2, 2), subgoals
         MockBenchmark("flat-b", STRENGTH, n_tasks=4, difficulty=(2, 2), subgoals=25))
 
 BUCKET = "v3-submissions"
+PRIVATE_BUCKET = "v3-private-models"
+PUBLIC_BUCKET = "v3-public-models"
 NETUID = 99
 # `window_blocks` must exceed MockChain's 100-block rate limit (§8b.6) and `immunity_blocks` must
 # cover three windows (§8b.1) — the two gates `check_launch` refuses a launch on.
@@ -131,6 +135,8 @@ class FakeS3:
         self.objects.pop(Key, None)
 
     def upload_file(self, Filename, Bucket, Key, ExtraArgs=None, Config=None) -> None:
+        if self.readonly:
+            raise ConnectionError("bucket is unreachable")
         self.objects[Key] = (Path(Filename).read_bytes(),
                              dict((ExtraArgs or {}).get("Metadata", {})))
 
@@ -243,6 +249,8 @@ class Harness:
     chain: MockChain
     client: FakeS3
     store: S3Bucket
+    private: S3Bucket
+    public: S3Bucket
     pool: Pool
     gateway: OwnerGateway
     owner_signer: object
@@ -270,8 +278,8 @@ class Harness:
         """Register, upload a tree, commit the ready signal, fund the allowance. Returns the hotkey.
 
         Every step is the production path: `store.build_manifest` + `upload_tree` put the bytes in
-        the bucket with `manifest.json` last, and `chain.commit_ready` writes the `r2ready:v1` slot
-        the validator reads the queue from.
+        the PRIVATE models bucket with `manifest.json` last, and `chain.commit_ready` writes the
+        `r2ready:v1` slot the validator reads the queue from.
         """
         hotkey = address(name)
         self.chain.block = register_at
@@ -280,7 +288,7 @@ class Harness:
                                     registration_block=register_at)
         tree = simulate._write_tree(self.root / "miners" / name, pickled=pickled)
         manifest = build_manifest(tree, registration, lambda body: _key(name).sign(body).hex())
-        upload_tree(tree, self.store, registration.prefix, manifest)
+        upload_tree(tree, self.private, registration.prefix, manifest)
         self.chain.block = block
         self.chain.commit_ready(hotkey, ReadySignal(registration_id=registration.registration_id,
                                                     manifest_sha256=manifest.sha256))
@@ -324,6 +332,9 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
 
     client = FakeS3()
     store = S3Bucket(client, BUCKET)
+    # Teutonic's three buckets: the public store, where miners upload, and where only a king lands.
+    private = S3Bucket(FakeS3(), PRIVATE_BUCKET)
+    public = S3Bucket(FakeS3(), PUBLIC_BUCKET)
     chain = MockChain(immunity=CADENCE.immunity_blocks)        # §8b.1: preflight reads it from here
     chain.register("burn")                                    # uid 0, the burn address (§5.7)
     pool = Pool(answers=worker_answers(STRENGTH), costs=COST, failures=failures)
@@ -342,7 +353,8 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
 
     validator = Validator(
         pins=pins, reference=describe(simulate._write_tree(root / "reference")), chain=chain,
-        store=store, mailbox=Mailbox(root / "mailbox.json", signing.Signer(), _never_mint),
+        store=store, private_models=private, public_models=public,
+        mailbox=Mailbox(root / "mailbox.json", signing.Signer(), _never_mint),
         gateway=gateway,
         owner=Owner(ss58=owner_signer.public_hex, sign=owner_signer.sign,
                     verify_sig=lambda data, sig, who: signing.verify(who, data, sig)),
@@ -352,7 +364,8 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
     # The owner commits the schedule root before any window opens (§6.3) — `preflight` refuses
     # otherwise, and a harness that skipped it would test a validator no owner could run.
     chain.commit_schedule(validator.manifest["root"])
-    return Harness(validator=validator, chain=chain, client=client, store=store, pool=pool,
+    return Harness(validator=validator, chain=chain, client=client, store=store, private=private,
+                   public=public, pool=pool,
                    gateway=gateway, owner_signer=owner_signer, root=root, tree=root / "reference",
                    registry=registry, nonces=nonces)
 
@@ -784,8 +797,8 @@ def test_a_swapped_shard_is_caught_at_duel_time_and_spends_the_shot(tmp_path):
     """
     h = harness(tmp_path)
     hopeful = h.enrol("hopeful", block=10, conductor=router(h))
-    key = next(k for k in h.client.objects if k.endswith("model.safetensors"))
-    h.client.objects[key] = (b"different bytes entirely", h.client.objects[key][1])
+    key = next(k for k in h.private.client.objects if k.endswith("model.safetensors"))
+    h.private.client.objects[key] = (b"different bytes entirely", h.private.client.objects[key][1])
 
     reveal = h.run(1)
 
@@ -2202,3 +2215,185 @@ def test_seen_and_unseen_scores_partition_every_arm_and_mark_what_an_earlier_rev
     assert split["seen"]["n_tasks"] + split["unseen"]["n_tasks"] == scored
     assert split["seen"]["n_tasks"] > 0, "a 12-task pool drawn 9 at a time repeats itself"
     assert split["seen"]["quality"] is not None and split["seen"]["final"] is not None
+
+
+# --- D14 as teutonic deploys it: private submissions, a public king ------------------------------
+
+
+def committed(h: Harness, hotkey: str) -> Commitment:
+    return next(c for c in h.chain.commitments() if c.hotkey == hotkey)
+
+
+def private_files(h: Harness, hotkey: str) -> list[str]:
+    prefix = f"submissions/{committed(h, hotkey).ready.registration_id}/"
+    return sorted(key[len(prefix):] for key in h.private.client.objects if key.startswith(prefix))
+
+
+def failing_promotions(h: Harness, monkeypatch) -> list[float]:
+    """The public models bucket refuses writes, and the wall clock is the test's to move."""
+    monkeypatch.setattr(store_module, "UPLOAD_BACKOFF_SECONDS", 0.0)
+    now = [1_000_000.0]
+    h.validator.now = lambda: now[0]
+    h.public.client.readonly = True
+    return now
+
+
+def test_only_the_crowned_winner_is_ever_public_and_it_is_the_tree_that_was_judged(tmp_path):
+    """Every challenger uploads to the private models bucket, and a verdict alone publishes nothing:
+    `weak` beat King0 here too and stays private, exactly as the copycat that lost does. Only the
+    champion is published — at the prefix its committed manifest names, byte for byte the tree the
+    daemon fetched — and the reveal says where."""
+    h = harness(tmp_path)
+    weak = h.enrol("router-a", block=10, conductor=router(h, rung="mock/heavy"))
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    copy = h.enrol("copycat", block=12, conductor=Copier(h.validator.pins.king_zero))
+
+    reveal = h.run(1)
+
+    assert outcome(reveal, weak).won and reveal.report.crowned == strong
+    king = public_model_prefix(committed(h, strong).ready.manifest_sha256)
+    assert h.validator.history.crown.public_prefix == king
+    source = f"submissions/{committed(h, strong).ready.registration_id}/"
+    assert sorted(key[len(king):] for key in h.public.client.objects) == private_files(h, strong)
+    for key, (body, _metadata) in h.public.client.objects.items():
+        assert key.startswith(king)
+        assert body == h.private.client.objects[source + key[len(king):]][0]
+    assert not any(key.startswith("submissions/") for key in h.client.objects)
+    assert private_files(h, weak) and private_files(h, copy)
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["promotion"] == {"hotkey": strong, "state": "promoted", "prefix": king}
+    assert record["crown_model"]["bucket"] == PUBLIC_BUCKET
+    assert record["crown_model"]["prefix"] == king
+
+
+def test_a_winner_whose_public_copy_fails_is_crowned_only_once_it_lands(tmp_path, monkeypatch):
+    """CROWN AFTER VERIFY. The verdict stands and the shot is spent, but the throne and the emission
+    stay where they were until the king's weights are downloadable — and the retry waits out
+    teutonic's backoff rather than hammering a bucket that is down."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    now = failing_promotions(h, monkeypatch)
+
+    reveal = h.run(1)
+
+    assert outcome(reveal, strong).won and strong in h.validator.history.judged
+    assert reveal.report.crowned is None and h.validator.history.crown.is_king_zero
+    assert h.validator.history.lineage().coronations == ()
+    assert h.validator.history.pending_crown["hotkey"] == strong
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["promotion"]["state"] == "pending" and record["crown_model"] is None
+    assert record["promotion"]["error"] == "ConnectionError"    # by type: the reveal is public
+
+    h.public.client.readonly = False
+    h.validator._settle_pending_crown()
+    assert h.validator.history.pending_crown is not None, "retried before the backoff elapsed"
+
+    now[0] += daemon.PROMOTION_RETRY_BASE_SECONDS
+    h.validator._settle_pending_crown()
+
+    king = public_model_prefix(committed(h, strong).ready.manifest_sha256)
+    assert h.validator.history.pending_crown is None
+    assert h.validator.history.crown.hotkey == strong
+    assert h.validator.history.crown.public_prefix == king
+    assert h.validator.history.lineage().coronations == (strong,)
+    assert h.validator.history.windows[1]["crowned"] == strong
+    assert king + MANIFEST_NAME in h.public.client.objects
+
+
+def test_a_crown_whose_public_copy_never_lands_is_forfeited_not_held_open(tmp_path, monkeypatch):
+    """A throne held open for a copy that never verifies would stall every later coronation."""
+    h = harness(tmp_path)
+    h.enrol("router-b", block=11, conductor=router(h))
+    now = failing_promotions(h, monkeypatch)
+    h.run(1)
+
+    retries = 0
+    while h.validator.history.pending_crown is not None:
+        now[0] += 3_600.0
+        h.validator._settle_pending_crown()
+        retries += 1
+        assert retries < daemon.PROMOTION_MAX_ATTEMPTS
+    assert retries == daemon.PROMOTION_MAX_ATTEMPTS - 1    # eight in all, the first in-window
+    assert h.validator.history.crown.is_king_zero
+    assert h.validator.history.lineage().coronations == ()
+    assert h.public.client.objects == {}
+
+
+def test_a_shard_replaced_after_judgment_never_reaches_the_public_king(tmp_path, monkeypatch):
+    """The window between a verdict and a late promotion is exactly where a replaced shard would
+    slip in if promotion read the private bucket. It reads the validator's verified tree."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    now = failing_promotions(h, monkeypatch)
+    h.run(1)
+    source = f"submissions/{committed(h, strong).ready.registration_id}/"
+    key = next(k for k in h.private.client.objects
+               if k.startswith(source) and k.endswith("model.safetensors"))
+    judged, metadata = h.private.client.objects[key]
+    h.private.client.objects[key] = (b"\x00swapped" + judged[9:], metadata)
+
+    h.public.client.readonly = False
+    now[0] += 3_600.0
+    h.validator._settle_pending_crown()
+
+    king = public_model_prefix(committed(h, strong).ready.manifest_sha256)
+    assert h.validator.history.crown.hotkey == strong
+    assert h.public.client.objects[king + key[len(source):]][0] == judged
+
+
+def test_losing_weights_go_fourteen_days_after_judgment_and_nothing_else_is_touched(tmp_path):
+    """§8b.7, wired at last: a loser keeps its manifest forever, its weights for the grace window.
+    The king's weights are never deleted, and neither is anything not yet judged."""
+    h = harness(tmp_path)
+    weak = h.enrol("router-a", block=10, conductor=router(h, rung="mock/heavy"))
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    copy = h.enrol("copycat", block=12, conductor=Copier(h.validator.pins.king_zero))
+    judged_at = 1_000_000.0
+    h.validator.now = lambda: judged_at
+    assert h.run(1).report.crowned == strong
+    waiting = "submissions/" + "ab" * 32 + "/model.safetensors"      # queued, never judged
+    h.private.client.objects[waiting] = (b"queued", {})
+    before = {hotkey: private_files(h, hotkey) for hotkey in (weak, strong, copy)}
+
+    h.validator.now = lambda: judged_at + GRACE_SECONDS - 1
+    h.validator._apply_retention()
+    assert {hotkey: private_files(h, hotkey) for hotkey in (weak, strong, copy)} == before
+
+    h.validator.now = lambda: judged_at + GRACE_SECONDS
+    h.validator._apply_retention()
+
+    assert private_files(h, weak) == [MANIFEST_NAME] and private_files(h, copy) == [MANIFEST_NAME]
+    assert private_files(h, strong) == before[strong]
+    assert waiting in h.private.client.objects
+
+
+def test_the_daemon_refuses_a_private_models_bucket_that_is_the_public_store(tmp_path):
+    """Every challenger's weights would be downloadable, and no window would look any different."""
+    h = harness(tmp_path)
+    h.validator.private_models = h.store
+    h.validator._preflighted = False
+
+    with pytest.raises(ValidatorError, match="distinct"):
+        h.validator.preflight()
+
+
+def test_a_deferred_crown_and_the_retention_clock_survive_a_restart(tmp_path):
+    path = tmp_path / "history.json"
+    history = History(path)
+    king = "models/sha256/" + "cd" * 32 + "/"
+    history.crown_to(Crown("5Cking", "/srv/king", "v3-5Cking@abc", king))
+    pending = {"window": 3, "hotkey": "5Cwin", "registration_id": "ab" * 32,
+               "manifest_sha256": "ef" * 32, "served_model": "v3-5Cwin@ef", "attempts": 2,
+               "next_attempt_at": 1_234.0}
+    history.defer_crown(pending)
+    history.settle(3, crowned=None, judged=["5Cwin", "5Close"], revealed=[],
+                   registrations={"5Cwin": "ab" * 32, "5Close": "12" * 32}, at=1_000.0)
+    history.purged.add("12" * 32)
+    history.save()
+
+    restored = History(path)
+    assert restored.crown == Crown("5Cking", "/srv/king", "v3-5Cking@abc", king)
+    assert restored.pending_crown == pending
+    assert restored.judged_at == {"5Cwin": {"registration_id": "ab" * 32, "at": 1_000.0},
+                                  "5Close": {"registration_id": "12" * 32, "at": 1_000.0}}
+    assert restored.purged == {"12" * 32}

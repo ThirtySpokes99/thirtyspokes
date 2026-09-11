@@ -81,6 +81,8 @@ from thirtyspokes.v3.window import window_path                                  
 
 NETUID = 99
 BUCKET = "v3-smoke"
+PRIVATE_BUCKET = "v3-smoke-private-models"
+PUBLIC_BUCKET = "v3-smoke-public-models"
 # One window, and a cadence `preflight` accepts: `window_blocks` must clear MockChain's 100-block
 # weight rate limit and `immunity_blocks` must cover three windows (§8b.1).
 CADENCE = Cadence(genesis_block=1_000, window_blocks=200, windows=(1,), immunity_blocks=600)
@@ -274,6 +276,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = args.out
     root.mkdir(parents=True, exist_ok=True)
     bucket = S3Bucket(DirectoryClient(root / "bucket"), BUCKET)
+    # The three buckets the daemon refuses to run without: the challenger uploads to the private
+    # one, and only a winner is published to the public one.
+    private_models = S3Bucket(DirectoryClient(root / "private-models"), PRIVATE_BUCKET)
+    public_models = S3Bucket(DirectoryClient(root / "public-models"), PUBLIC_BUCKET)
 
     benchmarks, tasks = build_benchmarks(args.benchmarks, args.tasks, NONCE)
     print(f"[smoke] {len(tasks)} tasks over {args.benchmarks}, {args.king0} on the throne")
@@ -297,6 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     validator = Validator(
         pins=pins, reference=describe(args.reference_tree), chain=chain, store=bucket,
+        private_models=private_models, public_models=public_models,
         mailbox=Mailbox(root / "state" / "mailbox.json", signing.Signer(), _never_mint),
         gateway=gateway,
         owner=Owner(ss58=owner_signer.public_hex, sign=owner_signer.sign,
@@ -314,10 +321,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 registration_block=500)
     manifest = build_manifest(args.model_dir, registration,
                               lambda body: signing_key.sign(body).hex())
-    committed = already_committed(bucket, registration.prefix, manifest)
+    committed = already_committed(private_models, registration.prefix, manifest)
     if committed is None:
         print(f"[smoke] uploading {len(manifest.files)} files under {registration.prefix}")
-        upload_tree(args.model_dir, bucket, registration.prefix, manifest)
+        upload_tree(args.model_dir, private_models, registration.prefix, manifest)
     else:
         print(f"[smoke] resuming: {registration.prefix} already holds this submission "
               f"({committed[:12]}…), not uploading twice")

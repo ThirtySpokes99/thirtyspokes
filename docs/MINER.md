@@ -234,6 +234,13 @@ uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" subm
     --model ./weights --reference ./reference
 ```
 
+**Your upload is private.** It goes to the subnet's private models bucket, readable only through
+your own scoped credential and by the validator — never by other miners, and not before or after
+your duel. Only if you **win the crown** does the validator publish the copy it verified to the
+public models bucket, at `models/sha256/<your manifest digest>/`; that copy is what D14 makes
+public, and it is never deleted. A losing submission's weights are deleted 14 days after it is
+judged, and its manifest is kept.
+
 In order, and it stops at the first refusal: re-runs the admission gate; refuses if this hotkey has
 already committed; fetches and opens your envelope (checks the owner's signature, your hotkey, your
 registration, the prefix and the expiry); builds and signs the manifest; uploads every file to your

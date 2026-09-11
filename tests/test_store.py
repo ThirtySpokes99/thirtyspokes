@@ -20,6 +20,7 @@ each one has a bug behind it:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
@@ -37,6 +38,7 @@ from thirtyspokes.v3.store import (
     MULTIPART_THRESHOLD,
     PART_SIZE,
     PART_STREAMS,
+    PUBLIC_MODEL_ROOT,
     Manifest,
     ManifestFile,
     S3Bucket,
@@ -46,6 +48,8 @@ from thirtyspokes.v3.store import (
     fetch_manifest,
     fetch_submission,
     inventory,
+    promote_submission,
+    public_model_prefix,
     retention_plan,
     tree_digest,
     upload_tree,
@@ -55,6 +59,7 @@ from thirtyspokes.v3.store import (
 MINER_SEED = bytes.fromhex("11" * 32)
 OTHER_SEED = bytes.fromhex("22" * 32)
 BUCKET = "v3-submissions"
+PUBLIC_BUCKET = "v3-public-models"
 
 
 def address(seed: bytes) -> str:
@@ -83,7 +88,8 @@ class FakeS3:
 
     PAGE = 3
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = BUCKET) -> None:
+        self.name = name
         self.objects: dict[str, tuple[bytes, dict[str, str]]] = {}
         self.fail_after: int | None = None
         # `fail_next` transient failures before the next transfer succeeds — the retry's case.
@@ -96,7 +102,7 @@ class FakeS3:
 
     # --- the seven calls S3Bucket makes ---
     def put_object(self, *, Bucket, Key, Body, Metadata=None, ContentType=None) -> None:
-        assert Bucket == BUCKET
+        assert Bucket == self.name
         self.objects[Key] = (bytes(Body), dict(Metadata or {}))
 
     def get_object(self, *, Bucket, Key):
@@ -432,3 +438,106 @@ def test_a_refused_credential_is_not_retried(tmp_path, bucket):
     with pytest.raises(ClientError):
         upload_tree(root, bucket, REGISTRATION.prefix, manifest)
     assert bucket.client.fail_next == 0 and REGISTRATION.prefix + MANIFEST_NAME not in bucket.list(REGISTRATION.prefix)
+
+
+# --- promotion: a winner's tree, published ------------------------------------------------------
+
+
+@pytest.fixture
+def public() -> S3Bucket:
+    return S3Bucket(FakeS3(PUBLIC_BUCKET), PUBLIC_BUCKET)
+
+
+def judged_tree(tmp_path: Path, bucket: S3Bucket) -> tuple[Path, Manifest]:
+    """A submission as the validator holds it after a duel: fetched, hashed, and marked verified."""
+    _, manifest = submission(tmp_path, bucket)
+    dest = tmp_path / "trees" / REGISTRATION.registration_id
+    fetch_submission(bucket, dest, commitment=commitment(manifest.sha256),
+                     registration=REGISTRATION)
+    return dest, manifest
+
+
+def test_a_promoted_king_is_the_verified_tree_under_the_digest_the_chain_committed(tmp_path, bucket,
+                                                                                   public):
+    """A name nobody chose — the committed manifest digest — holding exactly the committed tree,
+    and a `manifest.json` that hashes to what the chain names, so a downloaded king is checkable."""
+    dest, manifest = judged_tree(tmp_path, bucket)
+
+    prefix = promote_submission(dest, public, manifest=manifest)
+
+    assert prefix == public_model_prefix(manifest.sha256)
+    assert prefix == f"{PUBLIC_MODEL_ROOT}{manifest.sha256}/"
+    assert set(public.list(prefix)) == ({prefix + MANIFEST_NAME}
+                                        | {prefix + item.path for item in manifest.files})
+    for item in manifest.files:
+        assert public.get(prefix + item.path) == (dest / item.path).read_bytes()
+        assert public.head(prefix + item.path)["Metadata"]["sha256"] == item.sha256
+    assert hashlib.sha256(public.get(prefix + MANIFEST_NAME)).hexdigest() == manifest.sha256
+
+
+def test_bytes_replaced_in_the_private_bucket_after_judgment_are_never_published(tmp_path, bucket,
+                                                                                 public):
+    """Teutonic revokes the upload token so a judged submission cannot change. Promotion here does
+    not lean on that: it reads the tree from the validator's verified copy, so a same-size shard
+    swapped into the private bucket after the duel changes nothing that is published."""
+    dest, manifest = judged_tree(tmp_path, bucket)
+    shard = next(item for item in manifest.files if item.path.endswith(".safetensors"))
+    judged, metadata = bucket.client.objects[REGISTRATION.prefix + shard.path]
+    bucket.client.objects[REGISTRATION.prefix + shard.path] = (b"\xff" * len(judged), metadata)
+
+    prefix = promote_submission(dest, public, manifest=manifest)
+
+    assert public.get(prefix + shard.path) == judged
+
+
+def test_a_tree_this_validator_never_verified_is_not_published(tmp_path, bucket, public):
+    """The miner's directory has the right bytes and no marker: nothing unhashed is published."""
+    root, manifest = submission(tmp_path, bucket)
+
+    with pytest.raises(StoreError, match="not a tree this validator verified"):
+        promote_submission(root, public, manifest=manifest)
+    assert public.client.objects == {}
+
+
+def test_a_verified_tree_that_has_lost_a_file_since_is_not_published(tmp_path, bucket, public):
+    dest, manifest = judged_tree(tmp_path, bucket)
+    (dest / manifest.files[0].path).unlink()
+
+    with pytest.raises(StoreError, match="not a tree this validator verified"):
+        promote_submission(dest, public, manifest=manifest)
+    assert public.client.objects == {}
+
+
+def test_a_public_prefix_holding_other_bytes_is_a_collision_and_no_king_lands(tmp_path, bucket,
+                                                                            public):
+    """Content addressing is only worth something if the name cannot hold anything else."""
+    dest, manifest = judged_tree(tmp_path, bucket)
+    prefix = public_model_prefix(manifest.sha256)
+
+    public.put(prefix + "stray.bin", b"not this model")
+    with pytest.raises(StoreError, match="does not name"):
+        promote_submission(dest, public, manifest=manifest)
+
+    del public.client.objects[prefix + "stray.bin"]
+    item = manifest.files[0]
+    public.put(prefix + item.path, b"z" * item.size, digest="00" * 32)
+    with pytest.raises(StoreError, match="the manifest says"):
+        promote_submission(dest, public, manifest=manifest)
+    assert prefix + MANIFEST_NAME not in public.client.objects
+
+
+def test_an_interrupted_promotion_resumes_and_sends_each_file_once(tmp_path, bucket, public):
+    """A 70 GB king is an hour of upload; a retry that re-sent it all would never finish on a flaky
+    link. And until `manifest.json` lands last, the prefix is not a king anyone should download."""
+    dest, manifest = judged_tree(tmp_path, bucket)
+    prefix = public_model_prefix(manifest.sha256)
+    public.client.fail_after = 2
+    with pytest.raises(ConnectionError):
+        promote_submission(dest, public, manifest=manifest)
+    assert prefix + MANIFEST_NAME not in public.client.objects
+
+    public.client.fail_after = None
+    assert promote_submission(dest, public, manifest=manifest) == prefix
+    assert public.client.transfers == len(manifest.files)
+    assert promote_submission(dest, public, manifest=manifest) == prefix     # idempotent once whole
+    assert public.client.transfers == len(manifest.files)

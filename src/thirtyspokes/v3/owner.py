@@ -231,7 +231,12 @@ def _parser() -> argparse.ArgumentParser:
     issue_cmd.add_argument("--owner-hotkey", default="default",
                            help="the owner's own hotkey, used to read the chain")
     issue_cmd.add_argument("--r2-endpoint", required=True)
-    issue_cmd.add_argument("--r2-bucket", required=True)
+    issue_cmd.add_argument("--r2-bucket", required=True,
+                           help="the PUBLIC store the envelope is published to — the bucket behind "
+                                "the domain miners poll")
+    issue_cmd.add_argument("--r2-private-model-bucket", required=True, metavar="BUCKET",
+                           help="the PRIVATE bucket the credential grants upload access to; nobody "
+                                "but this miner and the validator can read what lands there")
     issue_cmd.add_argument("--ttl-seconds", type=int, default=CREDENTIAL_TTL_SECONDS)
     issue_cmd.add_argument("--key-only", action="store_true",
                            help="a credential for the miner's sealed OpenRouter key alone "
@@ -331,7 +336,11 @@ def main(argv: list[str] | None = None) -> None:
               f"re-commit deliberately if the world or the window count changes.")
         return
 
-    mint = owner_mint(endpoint=args.r2_endpoint, bucket=args.r2_bucket,
+    if args.r2_private_model_bucket == args.r2_bucket:
+        sys.exit("thirtyspokes-owner: --r2-private-model-bucket must not be the public store: a "
+                 "credential scoped there would put this miner's weights where anyone can download "
+                 "them before they have won anything")
+    mint = owner_mint(endpoint=args.r2_endpoint, bucket=args.r2_private_model_bucket,
                       account_id=os.environ["R2_ACCOUNT_ID"],
                       access_key_id=os.environ["R2_ACCESS_KEY_ID"],
                       secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],

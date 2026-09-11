@@ -126,6 +126,7 @@ def validator_root(root: Path, *, windows: int, per_benchmark: int, minimum: int
     """
     daemon = Validator(
         pins=production_world(), reference=None, chain=None, store=None, mailbox=None,
+        private_models=None, public_models=None,
         gateway=None, owner=None,
         cadence=Cadence(genesis_block=1, window_blocks=360, windows=tuple(range(1, windows + 1)),
                         immunity_blocks=1_080),
@@ -181,6 +182,10 @@ def wired(monkeypatch, chain, bucket) -> dict:
     return {"chain": built, "bucket": opened}
 
 
+# Where `issue` scopes a miner's credential. The envelope still goes to BUCKET, the public store.
+PRIVATE_BUCKET = "v3-private-models"
+
+
 def owner_argv(state: Path, *rest: str) -> list[str]:
     return ["--state", str(state), *rest]
 
@@ -189,7 +194,7 @@ def issue_argv(state: Path, hotkey: str = MINER) -> list[str]:
     return owner_argv(state, "issue", "--hotkey", hotkey, "--netuid", str(NETUID),
                       "--network", "test", "--wallet", "owner-wallet",
                       "--owner-hotkey", "owner-hot", "--r2-endpoint", ENDPOINT,
-                      "--r2-bucket", BUCKET)
+                      "--r2-bucket", BUCKET, "--r2-private-model-bucket", PRIVATE_BUCKET)
 
 
 # --- thirtyspokes-owner commit-schedule: the command that was dead on arrival -------------------
@@ -288,10 +293,27 @@ def test_issue_publishes_an_envelope_the_miner_can_actually_open(tmp_path, wired
     envelope = open_credential(bucket.get(key), MINER_SEED, owner_public_hex=owner_public_hex,
                                registration=registration, generation=1)
     credential = credential_from_envelope(envelope)
-    assert credential.bucket == BUCKET and credential.endpoint == ENDPOINT
+    # Published on the public store, but scoped to the PRIVATE models bucket: a miner's weights
+    # land where nobody can download them unless they win.
+    assert credential.bucket == PRIVATE_BUCKET and credential.endpoint == ENDPOINT
     # The operator is told where it went, and the parent credential really was the one from the env.
     assert key in printed and registration.prefix in printed
     assert wired["bucket"][0].access_key_id == "parent-key"
+
+
+def test_issue_refuses_to_scope_a_credential_to_the_public_store(tmp_path, wired, bucket):
+    """The one misconfiguration nothing downstream would notice: a credential scoped to the bucket
+    behind the public domain opens and uploads exactly like a private one, and every byte the miner
+    sends is then downloadable by anyone before it has won anything. Refused, and nothing published.
+    """
+    argv = issue_argv(tmp_path / "state")
+    argv[argv.index("--r2-private-model-bucket") + 1] = BUCKET
+
+    with pytest.raises(SystemExit) as caught:
+        owner_tool.main(argv)
+
+    assert "must not be the public store" in str(caught.value)
+    assert bucket.client.objects == {}
 
 
 def test_issue_refuses_an_unregistered_hotkey_with_a_message_and_a_nonzero_exit(tmp_path, wired,
@@ -671,6 +693,7 @@ def test_check_certifies_the_subnet_the_daemon_will_refuse_to_run_on(tmp_path, m
             "--immunity-blocks", "600",                # the owner claims 600
             "--world", "x:y", "--reference-tree", str(tmp_path), "--serve-url", "http://x",
             "--state", str(tmp_path), "--r2-endpoint", "http://x", "--r2-bucket", "b",
+            "--r2-private-model-bucket", "p", "--r2-public-model-bucket", "m",
             "--grade-dir", str(tmp_path), "--sandbox-host", "ssh://x",
             "--per-benchmark", "20", "--minimum", "5", "--check"]
 
@@ -678,6 +701,29 @@ def test_check_certifies_the_subnet_the_daemon_will_refuse_to_run_on(tmp_path, m
         validator_tool.main(argv)
 
     assert "immunity_period" in str(caught.value)
+
+
+def test_the_daemon_refuses_to_start_unless_its_three_buckets_are_distinct(tmp_path, monkeypatch):
+    """Private submissions are a deployment property, so the deployment is where it is refused: a
+    private models bucket that is the public store would publish every challenger, and a public
+    models bucket that is the private one would publish no king. Refused before dialling the chain.
+    """
+    monkeypatch.setattr(chain_module, "BittensorChain",
+                        lambda **kw: pytest.fail("the daemon reached the chain"))
+    monkeypatch.delenv(sandbox.DOCKER_HOST_ENV, raising=False)
+    monkeypatch.delenv(sandbox.GRADE_DIR_ENV, raising=False)
+    argv = ["--netuid", "99", "--wallet", "w", "--hotkey", "h", "--network", "finney",
+            "--genesis-block", "1000", "--window-blocks", "200", "--windows", "3",
+            "--immunity-blocks", "600", "--world", "x:y", "--reference-tree", str(tmp_path),
+            "--serve-url", "http://x", "--state", str(tmp_path), "--r2-endpoint", "http://x",
+            "--r2-bucket", "store", "--r2-private-model-bucket", "store",
+            "--r2-public-model-bucket", "kings", "--sandbox-host", "ssh://x",
+            "--per-benchmark", "20", "--minimum", "5", "--check"]
+
+    with pytest.raises(SystemExit) as caught:
+        validator_tool.main(argv)
+
+    assert "three distinct buckets" in str(caught.value)
 
 
 def test_credit_puts_money_where_the_daemon_will_look_for_it(tmp_path, capsys):

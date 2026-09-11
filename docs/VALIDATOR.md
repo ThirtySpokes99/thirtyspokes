@@ -144,7 +144,8 @@ thirtyspokes-validator \
   --world <module:attr> --reference-tree /srv/reference \
   --serve-host root@<serving-host> --serve-cards 0:8002,1:8003 --serve-trees /var/v3/trees \
   --sandbox-host unix:///run/v3/docker.sock --grade-dir /var/v3/grade \
-  --r2-endpoint <url> --r2-bucket <bucket> \
+  --r2-endpoint <url> --r2-bucket <store-bucket> \
+  --r2-private-model-bucket <private-bucket> --r2-public-model-bucket <public-models-bucket> \
   --per-benchmark <n> --minimum <n>
 ```
 
@@ -237,7 +238,7 @@ submission prefix from inside the loop that scores it. Issuing is `thirtyspokes-
 # A miner sends you their `identity` output. You need only the hotkey.
 thirtyspokes-owner --state /var/lib/v3 issue \
   --hotkey <miner ss58> --netuid <n> --wallet <owner-wallet> \
-  --r2-endpoint <url> --r2-bucket <bucket>
+  --r2-endpoint <url> --r2-bucket <store-bucket> --r2-private-model-bucket <private-bucket>
 
 # Who holds credentials, and which must now be revoked.
 thirtyspokes-owner --state /var/lib/v3 status
@@ -247,7 +248,7 @@ thirtyspokes-owner --state /var/lib/v3 status
 # their submission credential expired. Its own generation series; nothing to revoke on a spent shot.
 thirtyspokes-owner --state /var/lib/v3 issue --key-only \
   --hotkey <miner ss58> --netuid <n> --wallet <owner-wallet> \
-  --r2-endpoint <url> --r2-bucket <bucket>
+  --r2-endpoint <url> --r2-bucket <store-bucket> --r2-private-model-bucket <private-bucket>
 ```
 
 Miners poll `https://store.thirtyspokes.ai` — the custom domain connected to the production bucket
@@ -277,6 +278,56 @@ Two operational rules, both of which cost real money to get wrong:
   a miner able to destroy their own submission after committing it.
 
 ---
+
+## 3c. The three buckets — only a king is public
+
+Teutonic's layout, and the reason is D14: the king's weights are public so a derivative can be built
+on them, and **no other submission's weights are** (the whitepaper's exposure line: "exposure of
+other challengers' artifacts, which D14 makes public only for the king").
+
+| Bucket | Flag | Visibility | Holds |
+| --- | --- | --- | --- |
+| store | `--r2-bucket` | Public — the domain miners poll | window files, reveals, `v3/latest.json`, credential envelopes |
+| private models | `--r2-private-model-bucket` | **Private** — no custom domain, `r2.dev` off | every submission (`submissions/<registration_id>/`) and its sealed OpenRouter key |
+| public models | `--r2-public-model-bucket` | Public | winners only, content-addressed at `models/sha256/<manifest digest>/`, never deleted |
+
+The daemon refuses to start unless the three are distinct, and `thirtyspokes-owner issue` refuses to
+scope a credential to the store. Set them up in Cloudflare before the first miner uploads:
+
+1. **Private models** — public access **off**, no custom domain, and the bucket's `r2.dev` URL
+   disabled (it would bypass everything else).
+2. **Public models** — public access on; a custom domain if you want a stable download URL.
+3. **The R2 token** in `.env` — object read and write on all three buckets.
+
+**A winner is crowned only after its public copy verifies.** The validator uploads the tree from its
+own disk — the bytes `fetch_submission` hashed on arrival, the copy the king is served from — never
+a copy of whatever the private bucket holds by then, so nothing a miner replaces after judgment can
+be published. `manifest.json` goes last, written from the committed manifest, and the public prefix
+must then hold exactly the committed tree at every committed size and digest. This is host-routed,
+as teutonic's promotion is, and it has to be: R2 does not honour `x-amz-copy-source-if-match` on
+`UploadPartCopy`, so a server-side copy of a multi-GB shard could not be tied to the judged version.
+
+If the upload fails, the verdict stands and the shot is spent, but the crown waits. The daemon
+retries on teutonic's schedule — 30 s after the first failure, doubling each time — and after
+`PROMOTION_MAX_ATTEMPTS` (8, a little over an hour) forfeits the crown rather than hand it to a king
+whose weights nobody can download. A winner that deregisters first forfeits too, and a newer winner
+replaces a crown still waiting. The reveal records which happened (`promotion`) and where the
+reigning king's weights are (`crown_model`).
+
+**What a coronation costs.** The whole tree is uploaded once, from the validator host, inside the
+window that crowned it, and that window's reveal and weights wait for it. If uploads run at the ~16
+MiB/s this deployment's tree fetches ran at, a 70 GB king takes about 75 minutes; measure it before
+relying on that. Losing windows cost nothing extra.
+
+**Losers are deleted; winners are not.** A losing submission never leaves the private bucket, and
+its weights are deleted 14 days after it was judged (`store.GRACE_SECONDS`); its `manifest.json`
+stays. A submission not yet judged, anything ever crowned, and a crown still waiting on its copy are
+never deleted. A winner's private copy is kept as well: its sealed OpenRouter key lives under the
+same prefix, and a reigning king defends on it every window.
+
+**Not yet.** Teutonic also revokes each miner's upload token at the ready signal. That is a separate
+change, and it is not what keeps a published king honest here — publishing from the verified local
+tree is.
 
 ## 4. What is published, and what to watch
 

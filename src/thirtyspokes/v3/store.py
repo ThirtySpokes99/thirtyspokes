@@ -97,6 +97,10 @@ MANIFEST_NAME = "manifest.json"
 # against the committed manifest (`fetch_submission`); holds that manifest's digest. Beside, not
 # inside: `admission.admit` walks the tree and a file it does not expect is a refusal.
 VERIFIED_MARKER = ".verified"
+# Where a winning model is published in the public models bucket: content-addressed by the manifest
+# digest the chain committed to, so a published king is immutable by name and a repeated promotion
+# lands on the same keys.
+PUBLIC_MODEL_ROOT = "models/sha256/"
 
 # §8b.7's "published grace window" for a losing submission, DERIVED rather than chosen. The binding
 # floor is the queue: `MAX_QUEUE_DEPTH = 2 x MAX_DUELS_PER_WINDOW` means the back of the queue is
@@ -613,6 +617,74 @@ def _verified(marker: Path, manifest: Manifest, dest: Path) -> bool:
                for item in manifest.files)
 
 
+# --- promotion: a winner's tree, published (D14) -------------------------------------------------
+
+
+def public_model_prefix(manifest_sha256: str) -> str:
+    """Where a promoted model lives in the public models bucket."""
+    if not _is_digest(manifest_sha256):
+        raise StoreError(f"{manifest_sha256!r} is not a SHA-256 digest")
+    return f"{PUBLIC_MODEL_ROOT}{manifest_sha256}/"
+
+
+def promote_submission(tree: Path, public: S3Bucket, *, manifest: Manifest) -> str:
+    """Publish a winner's tree to the public models bucket, prove it arrived, return its prefix.
+
+    FROM THE VALIDATOR'S OWN DISK, NEVER FROM THE PRIVATE BUCKET. `tree` is the directory
+    `fetch_submission` hashed every byte of on arrival — the copy the king is served from — so what
+    is published is what was judged, whatever the private bucket holds by now. A server-side copy
+    could not promise that on R2: `UploadPartCopy`, which every multi-GB shard needs, does not
+    honour `x-amz-copy-source-if-match`, so the copy could not be tied to the judged version.
+    Teutonic's promotion is host-routed too, and refuses a server-side copy outright.
+
+    Three refusals, and none of them repairs anything:
+
+    * `tree` must carry this validator's verification marker for THIS manifest, every file at its
+      committed size (`_verified` — the same trust the resident-tree path already places in this
+      disk);
+    * the destination may hold nothing the manifest does not name, and nothing at a size or digest
+      the manifest does not give — a content-addressed prefix holding other bytes is a collision;
+    * after `upload_tree`, which resumes past files already in place and writes `manifest.json`
+      LAST, the prefix must hold exactly the committed tree, and its `manifest.json` must be the
+      committed manifest byte for byte, so it hashes to the digest the chain names.
+    """
+    marker = tree.parent / f"{tree.name}{VERIFIED_MARKER}"
+    if not _verified(marker, manifest, tree):
+        raise StoreError(f"{tree} is not a tree this validator verified against manifest "
+                         f"{manifest.sha256}; only verified bytes are published")
+    destination = public_model_prefix(manifest.sha256)
+    expected = {item.path: item for item in manifest.files}
+
+    def in_place(listing: Mapping[str, int]) -> set[str]:
+        """The committed paths already at the destination; raises on anything else there."""
+        present = set()
+        for key, size in listing.items():
+            path = key[len(destination):]
+            if path == MANIFEST_NAME:
+                continue
+            item = expected.get(path)
+            if item is None:
+                raise StoreError(f"{destination} holds {path}, which manifest {manifest.sha256} "
+                                 f"does not name")
+            digest = (public.head(key).get("Metadata") or {}).get("sha256")
+            if size != item.size or digest != item.sha256:
+                raise StoreError(f"{destination}{path} is {size} bytes at digest {digest}; the "
+                                 f"manifest says {item.size} at {item.sha256}")
+            present.add(path)
+        return present
+
+    listing = public.list(destination)
+    in_place(listing)
+    if destination + MANIFEST_NAME not in listing:
+        upload_tree(tree, public, destination, manifest)
+    arrived = public.list(destination)
+    if in_place(arrived) != set(expected) or destination + MANIFEST_NAME not in arrived:
+        raise StoreError(f"{destination} does not hold the whole committed tree after promotion")
+    if public.get(destination + MANIFEST_NAME) != manifest.as_bytes():
+        raise StoreError(f"{destination}{MANIFEST_NAME} is not the committed manifest")
+    return destination
+
+
 # --- storage accounting and retention (§8b.7) ----------------------------------------------------
 
 
@@ -692,6 +764,7 @@ __all__ = [
     "UPLOAD_ATTEMPTS", "UPLOAD_BACKOFF_SECONDS",
     "ManifestFile", "PART_SIZE", "PART_STREAMS", "Retention", "S3Bucket", "StoreError",
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
+    "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
     "inventory", "r2_bucket", "retention_plan", "sha256_file", "tree_digest", "upload_tree",
     "usage",
 ]

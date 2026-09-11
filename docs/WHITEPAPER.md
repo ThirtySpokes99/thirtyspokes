@@ -1112,10 +1112,13 @@ punish a king for the owner's outage.
 Every submission is ~70 GB held in owner R2. At a hundred entrants that is 7 TB (~$105/month at R2
 rates); at a thousand it is 70 TB. Unbounded retention is not a plan.
 
-Retention: **the reigning king and the five pensioners are kept indefinitely** — they are the public
-artifacts D14 makes derivable — and losing submissions are kept for a published grace window, then
-deleted. The manifest hash and the history entry are retained forever regardless, so the *record* of
-every submission is permanent even when its weights are not.
+Retention: **only a model that took the crown is ever public.** Submissions upload to a private
+bucket; a winner is published to a public, content-addressed bucket (`models/sha256/<manifest
+digest>/`) from the validator's own verified copy of its tree, and crowned only once that copy has
+arrived whole; a promoted model is never deleted — so the reigning king and every ex-king remain the
+public artifacts D14 makes derivable. A losing submission never leaves the private bucket, and its
+weights are deleted 14 days after it is judged. The manifest hash and the history entry are retained
+forever regardless, so the *record* of every submission is permanent even when its weights are not.
 
 ### 8b.8 Cold start
 

@@ -206,6 +206,13 @@ class WindowReport:
     # the stored-failure rate and the provider's real outlay. The STATS, never the table — D15
     # publishes the arms' traces, not the draw behind every key. None on a report that predates it.
     table: dict | None = None
+    # Does the best fixed policy hold the throne (§5.5)? STATED, not inferred. A reader used to
+    # deduce this from `king_hotkey` being the empty sentinel, which stopped being true the moment
+    # an owner ran `--king-zero-uid` and gave King0 a UID to be paid at — the throne then looked
+    # like a miner's, and the dashboard labelled the genesis policy "a miner's conductor". The
+    # answer belongs to the validator, which knows it outright, rather than to a heuristic on a
+    # field that means something else. Defaults False so a report that predates it is unchanged.
+    king_is_genesis: bool = False
 
     @property
     def scored(self) -> bool:

@@ -360,6 +360,21 @@ def reveal_path(window: int) -> str:
     return f"v3/reveal/{int(window)}.json"
 
 
+LATEST_PATH = "v3/latest.json"
+"""The newest settled window, so a reader finds the reveals without guessing.
+
+`reveal_path` is addressable but not DISCOVERABLE: a dashboard holding only the bucket has no way
+to learn which windows exist short of probing `1.json`, `2.json`, … until one 404s, which is N
+requests to render one page and races a window that settles mid-probe. The bucket cannot be listed
+(public read is object-scoped), so the pointer has to be published rather than derived.
+
+Deliberately NOT signed and deliberately carrying no verdict: it is a hint about where to look, and
+every claim a reader acts on still comes from the signed reveal it points at. That keeps this file
+outside the trust boundary — the worst a tampered pointer can do is name a window whose reveal then
+fails its own signature check.
+"""
+
+
 @dataclass(frozen=True)
 class ArmAudit:
     """One arm's metering, reconciled (M5 exit 1) — and the two numbers §5.8 will not let hide.
@@ -778,6 +793,12 @@ class Validator:
     key_seed: bytes | None = None
     provider_for: Callable[[str], Provider] | None = None
     burn_uid: int = 0
+    # §5.5's default is that King₀'s 0.85 BURNS, and `None` keeps it. An owner who wants the genesis
+    # king to appear as a reigning king rather than an absence sets this to the UID it reigns at;
+    # the reveal then names that UID's hotkey as `king_hotkey` and pays the crown there. Setting it
+    # to `burn_uid` leaves the on-chain slate bit-identical, because that UID was already collecting
+    # the same share as burn — it changes what the published record CLAIMS, not what is paid.
+    king_zero_uid: int | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
 
@@ -1696,11 +1717,28 @@ class Validator:
         metagraph = self.chain.metagraph()
         lineage = self.history.lineage()
         weights = emission_weights(lineage, self.history.crown.hotkey, metagraph.hotkey_of,
-                                   burn_uid=self.burn_uid)
+                                   burn_uid=self.burn_uid, king_zero_uid=self.king_zero_uid)
+        # §5.5, captured HERE and not from `self.history.crown`: `settle` has already run by this
+        # point and may have crowned a challenger, so reading the live crown would describe the
+        # END-of-window king while `king_hotkey` beside it documents the START-of-window one — the
+        # two fields would disagree in exactly the window where a coronation happened. At entry
+        # `king_hotkey` is still `crown.hotkey` from before the duels, and KING0 is the empty
+        # string, so this is that king and no other. Read before the mapping below overwrites it.
+        king_is_genesis = not king_hotkey
+        # DISPLAY ONLY, AND DELIBERATELY LATE. When King₀ reigns its hotkey is the empty sentinel,
+        # which publishes as an absence — a reader (and the dashboard) cannot tell "the genesis king
+        # holds the throne" from "this field was forgotten". With `king_zero_uid` set the reveal
+        # names that UID's hotkey instead, and `power.king_zero` beside it says which fixed policy
+        # that is. Computed here rather than at the call sites because every branch of `step` funnels
+        # through `_publish`, and because nothing downstream may read it back: `crown.is_king_zero`
+        # still decides whether an arm is served or paid (§8b.2, §8b.8), and it is unchanged.
+        if not king_hotkey and self.king_zero_uid is not None:
+            king_hotkey = metagraph.hotkey_of.get(self.king_zero_uid, king_hotkey)
         report = WindowReport(
             window=opened.epoch, nonce=opened.nonce, benchmarks=opened.benchmarks,
             n_tasks=len(opened.tasks), freshness=opened.record["freshness"], power=power,
             reference=arms, king_hotkey=king_hotkey, king=king_arm, king_results=king_results,
+            king_is_genesis=king_is_genesis,
             graders_failed=tuple(sorted(guard.failed)), outcomes=outcomes,
             crowned=None if crowned is None else crowned.hotkey,
             pensioners=lineage.pensioners(self.history.crown.hotkey), weights=weights,
@@ -1730,6 +1768,17 @@ class Validator:
         except Exception as exc:          # noqa: BLE001 — the reveal is the only thing lost
             self._log(f"window {window}: reveal not published ({exc}); will retry")
             return False
+        # After the reveal and never before it: the pointer must not name a window whose bytes are
+        # not there yet, or a reader that believes it fetches a 404 and reports an outage that does
+        # not exist. A failure to move the pointer leaves it on the PREVIOUS window, which shows a
+        # stale-but-real reveal — strictly better than pointing at nothing — so it is logged and
+        # swallowed rather than failing the publish that already succeeded.
+        try:
+            self.store.put(LATEST_PATH,
+                           json.dumps({"window": int(window)}, sort_keys=True).encode(),
+                           content_type="application/json")
+        except Exception as exc:          # noqa: BLE001 — a stale pointer is not a lost window
+            self._log(f"window {window}: latest pointer not moved ({exc}); reveal is published")
         return True
 
     def _republish(self, window: int) -> None:
@@ -1812,6 +1861,9 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
                   "by_benchmark": [list(row) for row in report.power.by_benchmark]},
         "graders_failed": list(report.graders_failed),
         "king_hotkey": report.king_hotkey,
+        # §5.5, stated rather than left to be inferred from `king_hotkey` being empty — see
+        # `WindowReport.king_is_genesis`. `power.king_zero` beside it names WHICH fixed policy.
+        "king_is_genesis": report.king_is_genesis,
         "king": _arm_json(report.king),
         "outcomes": [_outcome_json(outcome) for outcome in report.outcomes],
         "crowned": report.crowned,
@@ -1962,6 +2014,11 @@ def _parser() -> argparse.ArgumentParser:
                         help="tasks drawn per benchmark per window (§6.3b)")
     parser.add_argument("--minimum", type=int, required=True,
                         help="below this a benchmark is dropped and the window is NARROWED (§6.3b)")
+    parser.add_argument("--king-zero-uid", type=int, default=None, metavar="UID",
+                        help="pay King0's crown to this UID and name its hotkey as the reigning "
+                             "king in the reveal, instead of §5.5's default of burning it. Set it "
+                             "to the burn UID to leave the on-chain slate identical and change "
+                             "only what the published record claims")
     parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
     parser.add_argument("--check", action="store_true",
                         help="run the launch-time gates against the chain and exit, spending "
@@ -2065,6 +2122,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cadence=cadence, serve=serving,
         beacon=chain_beacon(chain._substrate, cadence), netuid=args.netuid, root=args.state,
         per_benchmark=args.per_benchmark, minimum=args.minimum,
+        king_zero_uid=args.king_zero_uid,
         # D18: the mailbox key's seed opens the keys miners sealed to `orchestra-owner key`.
         key_seed=mailbox_seed(args.state))
     validator.run_forever(poll_seconds=args.poll_seconds,

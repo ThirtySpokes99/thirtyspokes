@@ -392,7 +392,17 @@ spend; raise it only against a measured provider rate limit, since beyond that c
 429s rather than throughput.
 """
 
-MAX_DUELS_PER_WINDOW = 6
+# LOWERED 6 -> 3, 2026-09-11, because 6 was a number the clock could not honour. Windows 1 and 2 on
+# netuid 99 ran two 60-task reference arms in 26 and 36 minutes, which puts a 250-task served arm
+# near 1.5 h; against a 5.78 h window (the most `immunity_period = 5000` permits) the king's arm and
+# the two reference arms take ~2.1 h and leave ~2.5 duels. Claiming 6 made `check_launch` certify a
+# drain of two windows while the real one was nearly five — immunity covering 17 h against a 28 h
+# wait, which is §8b.1's trap with the gate reporting green.
+#
+# It is the CLAIM that was wrong, not the window: `MAX_QUEUE_DEPTH` is derived from this number, so
+# lowering it shortens the promised drain to something the clock delivers. Raise it again when the
+# window does — at `immunity_period >= 21600` a 7200-block window fits ~8.5 and 6 becomes true.
+MAX_DUELS_PER_WINDOW = 3
 
 # Challengers that may be queued at once — and what it is DERIVED FROM is the point of it.
 #

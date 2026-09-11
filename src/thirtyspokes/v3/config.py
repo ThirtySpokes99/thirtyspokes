@@ -533,3 +533,27 @@ RETEST_COST_TOLERANCE = 0.25
 # `--mailbox-url`. Not the bucket's r2.dev address — Cloudflare rate-limits that one and calls it
 # unfit for production, and the zone's bot protection refuses Python's default User-Agent on both.
 PUBLIC_STORE = "https://store.thirtyspokes.ai"
+
+# The owner's mailbox public key on netuid 99 — ed25519, hex. What `thirtyspokes-owner key` prints
+# from the seed in `<state>/mailbox-key.hex` (generated 2026-09-10), and the miner tools' default
+# `--owner-key` on the subnet named below.
+#
+# PINNED BECAUSE THE KEY A MINER SUPPLIES IS THEIR ENTIRE TRUST ANCHOR. `access.open_credential`
+# verifies an envelope against the key its caller passes and ignores the `owner_identity` the
+# envelope carries — correctly, since anyone can sign an envelope and name themselves in it. So
+# whoever hands a miner their owner key decides what that miner trusts: an impersonator's key makes
+# `submit` open the impersonator's envelope, and makes `register-key` seal the miner's funded
+# OpenRouter key to the impersonator and upload it to a store anyone can read. Handing the key out
+# one miner at a time is exactly the channel an impersonator can fake; shipped inside the code the
+# miner is already running, faking it means compromising this repository.
+#
+# PUBLIC, and safe to publish by construction. The secret is the SEED behind it, which never leaves
+# the owner's state directory: it opens every OpenRouter key ever sealed to this value.
+#
+# ONE-WAY IN PRACTICE. Rotating the seed orphans every key sealed to the old value (VALIDATOR.md
+# §3b), so this changes only together with every miner re-registering their key, in the same release.
+OWNER_MAILBOX_KEY = "ae6cea3711968cc229e79ce2d6e76ac789ad974e908974ac1fca55eb10ca3d21"
+# The subnet that key belongs to, as `(network, netuid)`. The default applies HERE ONLY: a testnet
+# rehearsal that forgot `--owner-key` would otherwise seal a miner's funded OpenRouter key to
+# netuid 99's owner without a word, so anywhere else the flag is required.
+OWNER_MAILBOX_SUBNET = ("finney", 99)

@@ -829,3 +829,33 @@ def test_the_miner_tools_poll_the_subnets_public_store_unless_told_otherwise():
     assert parser.parse_args([*common, "register-key", "--cap-usd", "5", "--owner-key", "ab",
                               "--mailbox-url", "https://x.example"]).mailbox_url == "https://x.example"
     assert PUBLIC_STORE == "https://store.thirtyspokes.ai"
+
+
+def test_the_owner_key_is_pinned_for_netuid_99_and_required_everywhere_else():
+    """A miner is never told the owner key, so there is nothing for an impersonator to substitute —
+    the key a miner supplies is the only thing `open_credential` trusts and what `register-key`
+    seals a funded OpenRouter key to. But a default that followed a miner onto a rehearsal would seal
+    a real key to netuid 99's owner without a word, so off that subnet the flag stays required."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from thirtyspokes.v3 import miner as miner_tool
+    from thirtyspokes.v3.config import OWNER_MAILBOX_KEY, OWNER_MAILBOX_SUBNET
+
+    # A malformed pin would make every submit on the subnet refuse every genuine envelope.
+    Ed25519PublicKey.from_public_bytes(bytes.fromhex(OWNER_MAILBOX_KEY))
+    assert OWNER_MAILBOX_SUBNET == ("finney", 99)
+
+    parser = miner_tool._parser()
+    on_99 = parser.parse_args(["--netuid", "99", "--wallet", "w",
+                               "submit", "--model", "m", "--reference", "r"])
+    assert miner_tool._owner_key(on_99) == OWNER_MAILBOX_KEY
+
+    override = parser.parse_args(["--netuid", "99", "--wallet", "w",
+                                  "register-key", "--cap-usd", "5", "--owner-key", "ab"])
+    assert miner_tool._owner_key(override) == "ab"
+
+    for where in (["--netuid", "526", "--network", "test"],   # the rehearsal subnet
+                  ["--netuid", "98"],                          # another finney subnet
+                  ["--netuid", "99", "--network", "test"]):    # netuid 99 is not unique across networks
+        rehearsal = parser.parse_args([*where, "--wallet", "w", "register-key", "--cap-usd", "5"])
+        with pytest.raises(SystemExit, match="--owner-key is required"):
+            miner_tool._owner_key(rehearsal)

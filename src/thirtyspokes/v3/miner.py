@@ -48,7 +48,7 @@ from .access import (
 )
 from .admission import describe
 from .chain import Chain, ReadySignal
-from .config import PUBLIC_STORE
+from .config import OWNER_MAILBOX_KEY, OWNER_MAILBOX_SUBNET, PUBLIC_STORE
 from .devkit import check_admission
 from .funding import KEY_NAME, seal_key
 from .store import S3Bucket, build_manifest, upload_tree
@@ -361,9 +361,11 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--mailbox-url", default=PUBLIC_STORE, metavar="URL",
                       help=f"the public store the owner publishes your envelope to "
                            f"(default: {PUBLIC_STORE}; a rehearsal passes its own)")
-    send.add_argument("--owner-key", required=True, metavar="HEX",
-                      help="the owner's ed25519 public key, hex — an envelope not signed by it is "
-                           "refused rather than opened")
+    send.add_argument("--owner-key", default=None, metavar="HEX",
+                      help=f"the owner's ed25519 public key, hex — an envelope not signed by it is "
+                           f"refused rather than opened (default on {OWNER_MAILBOX_SUBNET[0]} netuid "
+                           f"{OWNER_MAILBOX_SUBNET[1]}: the pinned owner key, {OWNER_MAILBOX_KEY[:8]}…; "
+                           f"required anywhere else)")
     send.add_argument("--generation", type=int, default=1,
                       help="which credential generation to open; raise it after a rotation")
 
@@ -376,14 +378,35 @@ def _parser() -> argparse.ArgumentParser:
                      help="the most one window may spend on this key (§6)")
     key.add_argument("--mailbox-url", default=PUBLIC_STORE, metavar="URL",
                      help=f"the public store (default: {PUBLIC_STORE})")
-    key.add_argument("--owner-key", required=True, metavar="HEX",
-                     help="the owner's ed25519 public key, hex — the key is sealed to it")
+    key.add_argument("--owner-key", default=None, metavar="HEX",
+                     help=f"the owner's ed25519 public key, hex — your key is sealed to it (default "
+                          f"on {OWNER_MAILBOX_SUBNET[0]} netuid {OWNER_MAILBOX_SUBNET[1]}: the pinned "
+                          f"owner key, {OWNER_MAILBOX_KEY[:8]}…; required anywhere else)")
     key.add_argument("--generation", type=int, default=1)
     key.add_argument("--key-credential", action="store_true",
                      help="open a KEY-ONLY credential the owner issued with `issue --key-only` "
                           "(its own generation series) — for rotating a key after the submission "
                           "credential expired and the shot is spent")
     return parser
+
+
+def _owner_key(args) -> str:
+    """`--owner-key`, or the pinned owner key — but only on the subnet it was pinned for.
+
+    The key a miner supplies is the only thing `open_credential` trusts, and the thing
+    `register-key` seals a funded OpenRouter key to, so a default that followed a miner onto the
+    wrong subnet would be the one mistake here that is silent: a testnet rehearsal would seal a real
+    key to netuid 99's owner. Off `config.OWNER_MAILBOX_SUBNET` the flag is therefore required.
+    """
+    if args.owner_key:
+        return args.owner_key
+    if (args.network, args.netuid) == OWNER_MAILBOX_SUBNET:
+        return OWNER_MAILBOX_KEY
+    network, netuid = OWNER_MAILBOX_SUBNET
+    raise SystemExit(
+        f"thirtyspokes-miner: --owner-key is required off {network} netuid {netuid}. The pinned key "
+        f"belongs to that subnet's owner; sealing your OpenRouter key to it from {args.network} "
+        f"netuid {args.netuid} would hand it to the wrong owner. Ask this subnet's owner for theirs.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -421,7 +444,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "register-key":
             print(register_key(chain, netuid=args.netuid, hotkey=address,
                                api_key=read_api_key(args.key_file), cap_usd=args.cap_usd,
-                               mailbox_url=args.mailbox_url, owner_public_hex=args.owner_key,
+                               mailbox_url=args.mailbox_url, owner_public_hex=_owner_key(args),
                                seed=hotkey_seed(wallet),
                                sign=lambda data: wallet.hotkey.sign(data).hex(),
                                open_bucket=r2_bucket, generation=args.generation,
@@ -429,7 +452,7 @@ def main(argv: list[str] | None = None) -> None:
             return
         print(submit(chain, netuid=args.netuid, hotkey=address, model=args.model,
                      reference=args.reference, mailbox_url=args.mailbox_url,
-                     owner_public_hex=args.owner_key, seed=hotkey_seed(wallet),
+                     owner_public_hex=_owner_key(args), seed=hotkey_seed(wallet),
                      sign=lambda data: wallet.hotkey.sign(data).hex(),
                      open_bucket=r2_bucket, generation=args.generation))
     except (MinerError, AccessError) as exc:

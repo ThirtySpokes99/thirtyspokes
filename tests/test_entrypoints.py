@@ -694,6 +694,7 @@ def test_check_certifies_the_subnet_the_daemon_will_refuse_to_run_on(tmp_path, m
             "--world", "x:y", "--reference-tree", str(tmp_path), "--serve-url", "http://x",
             "--state", str(tmp_path), "--r2-endpoint", "http://x", "--r2-bucket", "b",
             "--r2-private-model-bucket", "p", "--r2-public-model-bucket", "m",
+            "--public-model-base-url", "https://models.example.org",
             "--grade-dir", str(tmp_path), "--sandbox-host", "ssh://x",
             "--per-benchmark", "20", "--minimum", "5", "--check"]
 
@@ -718,12 +719,38 @@ def test_the_daemon_refuses_to_start_unless_its_three_buckets_are_distinct(tmp_p
             "--serve-url", "http://x", "--state", str(tmp_path), "--r2-endpoint", "http://x",
             "--r2-bucket", "store", "--r2-private-model-bucket", "store",
             "--r2-public-model-bucket", "kings", "--sandbox-host", "ssh://x",
+            "--public-model-base-url", "https://models.example.org",
             "--per-benchmark", "20", "--minimum", "5", "--check"]
 
     with pytest.raises(SystemExit) as caught:
         validator_tool.main(argv)
 
     assert "three distinct buckets" in str(caught.value)
+
+
+@pytest.mark.parametrize("url", ["http://models.example.org", "models.example.org",
+                                 "https://models.example.org/?token=x"])
+def test_the_daemon_refuses_a_public_model_base_url_that_is_not_plain_https(tmp_path, monkeypatch,
+                                                                            url):
+    """The address is published in every reveal as where anyone downloads the king: plain http can be
+    rewritten by any network in between, a bare host is not something a downloader can join a path
+    onto, and a query string would hand whatever it carries to everyone who reads the reveal."""
+    monkeypatch.setattr(chain_module, "BittensorChain",
+                        lambda **kw: pytest.fail("the daemon reached the chain"))
+    monkeypatch.delenv(sandbox.DOCKER_HOST_ENV, raising=False)
+    monkeypatch.delenv(sandbox.GRADE_DIR_ENV, raising=False)
+    argv = ["--netuid", "99", "--wallet", "w", "--hotkey", "h", "--network", "finney",
+            "--genesis-block", "1000", "--window-blocks", "200", "--windows", "3",
+            "--immunity-blocks", "600", "--world", "x:y", "--reference-tree", str(tmp_path),
+            "--serve-url", "http://x", "--state", str(tmp_path), "--r2-endpoint", "http://x",
+            "--r2-bucket", "store", "--r2-private-model-bucket", "private",
+            "--r2-public-model-bucket", "kings", "--public-model-base-url", url,
+            "--sandbox-host", "ssh://x", "--per-benchmark", "20", "--minimum", "5", "--check"]
+
+    with pytest.raises(SystemExit) as caught:
+        validator_tool.main(argv)
+
+    assert "--public-model-base-url must be a plain https:// address" in str(caught.value)
 
 
 def test_credit_puts_money_where_the_daemon_will_look_for_it(tmp_path, capsys):

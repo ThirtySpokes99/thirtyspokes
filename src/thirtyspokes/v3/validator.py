@@ -103,8 +103,8 @@ from .score import ArmScore, best_possible_final, score_arm
 from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
                        _exhausted, _GraderGuard, _pairs, _why, format_window, priced)
-from .store import (GRACE_SECONDS, Retention, S3Bucket, apply_retention, fetch_manifest,
-                    fetch_submission, promote_submission, retention_plan)
+from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, apply_retention,
+                    fetch_manifest, fetch_submission, promote_submission, retention_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
 from .window import Window, WindowError, exclude, schedule, window_path
 from .worker import WorkerError
@@ -866,6 +866,9 @@ class Validator:
     # Wall-clock seconds for anything PERSISTED (judgment times retention counts from). Not `clock`,
     # which is monotonic and means nothing across a restart.
     now: Callable[[], float] = time.time
+    # The public https:// address `public_models` is served at (its custom domain). A reveal names the
+    # reigning king's download URL under it; left empty, it names only the bucket and the prefix.
+    public_model_base_url: str = ""
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -1871,12 +1874,21 @@ class Validator:
                      served_model=pending["served_model"], public_prefix=public_prefix)
 
     def _crown_model(self) -> dict | None:
-        """Where the reigning king's weights can be downloaded — None for King0."""
+        """Where the reigning king's weights can be downloaded — None for King0.
+
+        `manifest_url` is the one address a downloader needs. The `manifest.json` there must hash to
+        `manifest_sha256`, which this signed reveal carries, and it lists every file with its size and
+        digest, each at `url` + its path. A bucket behind a custom domain cannot be listed, so the
+        manifest, not a directory index, is how the tree is found.
+        """
         crown = self.history.crown
         if crown.is_king_zero or not crown.public_prefix:
             return None
+        base = self.public_model_base_url.rstrip("/")
+        url = f"{base}/{crown.public_prefix}" if base else None
         return {"bucket": self.public_models.bucket, "prefix": crown.public_prefix,
-                "manifest_sha256": crown.public_prefix.rstrip("/").rsplit("/", 1)[-1]}
+                "manifest_sha256": crown.public_prefix.rstrip("/").rsplit("/", 1)[-1],
+                "url": url, "manifest_url": None if url is None else url + MANIFEST_NAME}
 
     def _promote(self, pending: Mapping) -> tuple[str | None, str | None]:
         """Publish a winner's tree to the public models bucket: (prefix, None), or (None, error).
@@ -2095,7 +2107,8 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
         "outcomes": [_outcome_json(outcome) for outcome in report.outcomes],
         "crowned": report.crowned,
         # Where the reigning king's weights can be downloaded (D14): the public models bucket, at
-        # the prefix named by the manifest digest the chain committed to. None while King0 reigns.
+        # the prefix named by the manifest digest the chain committed to, and its `url` and
+        # `manifest_url` under --public-model-base-url. None while King0 reigns.
         "crown_model": crown_model,
         # This window's coronation and its public copy: promoted, or pending a copy that has not
         # verified yet (the verdict stands; the crown waits). None when nobody won.
@@ -2248,7 +2261,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="where every submission is uploaded and fetched from; must not be "
                              "publicly readable")
     parser.add_argument("--r2-public-model-bucket", required=True, metavar="BUCKET",
-                        help="where a winner's model is copied, content-addressed, once it has won")
+                        help="where a winner's model is published, content-addressed, once it has won")
+    parser.add_argument("--public-model-base-url", required=True, metavar="URL",
+                        help="the public https:// address of --r2-public-model-bucket (its custom "
+                             "domain); every reveal names the king's download URL under it")
     parser.add_argument("--per-benchmark", type=int, required=True,
                         help="tasks drawn per benchmark per window (§6.3b)")
     parser.add_argument("--minimum", type=int, required=True,
@@ -2296,6 +2312,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     import os
     import sys
     from datetime import datetime, timedelta, timezone
+    from urllib.parse import urlsplit
 
     from ..gateway.signing import Signer
     from ..koth.reference import keypair_verifier, wallet_signer
@@ -2320,6 +2337,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(f"thirtyspokes-validator: --r2-bucket, --r2-private-model-bucket and "
                  f"--r2-public-model-bucket must be three distinct buckets, got {buckets}: a "
                  f"submission in a public bucket is downloadable before it has won anything")
+    base_url = urlsplit(args.public_model_base_url)
+    if base_url.scheme != "https" or not base_url.netloc or base_url.query or base_url.fragment:
+        sys.exit(f"thirtyspokes-validator: --public-model-base-url must be a plain https:// address "
+                 f"(e.g. https://models.thirtyspokes.ai), got {args.public_model_base_url!r}: every "
+                 f"reveal publishes it as where anyone downloads the king")
     os.environ[sandbox.DOCKER_HOST_ENV] = args.sandbox_host
     if args.grade_dir is not None:
         os.environ[sandbox.GRADE_DIR_ENV] = str(args.grade_dir)
@@ -2361,6 +2383,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         store=r2_bucket(credential),
         private_models=r2_bucket(replace(credential, bucket=args.r2_private_model_bucket)),
         public_models=r2_bucket(replace(credential, bucket=args.r2_public_model_bucket)),
+        public_model_base_url=args.public_model_base_url,
         mailbox=Mailbox(args.state / "mailbox.json", Signer(), never_mint),
         gateway=gateway,
         owner=Owner(ss58=wallet.hotkey.ss58_address, sign=wallet_signer(wallet),

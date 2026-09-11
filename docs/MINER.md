@@ -237,9 +237,10 @@ uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" subm
 **Your upload is private.** It goes to the subnet's private models bucket, readable only through
 your own scoped credential and by the validator — never by other miners, and not before or after
 your duel. Only if you **win the crown** does the validator publish the copy it verified to the
-public models bucket, at `models/sha256/<your manifest digest>/`; that copy is what D14 makes
-public, and it is never deleted. A losing submission's weights are deleted 14 days after it is
-judged, and its manifest is kept.
+public models bucket, at `models/sha256/<your manifest digest>/` under
+`https://models.thirtyspokes.ai` (see [Downloading the king](#downloading-the-king)); that copy is
+what D14 makes public, and it is never deleted. A losing submission's weights are deleted 14 days
+after it is judged, and its manifest is kept.
 
 In order, and it stops at the first refusal: re-runs the admission gate; refuses if this hotkey has
 already committed; fetches and opens your envelope (checks the owner's signature, your hotkey, your
@@ -275,6 +276,33 @@ and publishes the verdict — `final`, the four conditions, per-benchmark deltas
 allowance ran out if it did — in the window's reveal and on the [dashboard](https://thirtyspokes.ai/dashboard).
 A refusal is final for that hotkey; a new attempt is a new hotkey, a new registration and a new
 70 GB.
+
+#### Downloading the king
+
+Only the reigning king's weights are public (D14), and building on them is allowed. Every window's
+reveal says where they are: `record.crown_model` gives the king's `url` and `manifest_url` under
+`https://models.thirtyspokes.ai`, and the `manifest_sha256` that manifest must hash to. It is `null`
+while King₀ reigns, because King₀ is a fixed policy with no weights to download. The bucket cannot be
+listed, so the manifest is how the files are found: each is at `url` + its `path`, with its `size`
+and `sha256`.
+
+```bash
+STORE=https://store.thirtyspokes.ai
+WINDOW=$(curl -fsS "$STORE/v3/latest.json" | jq .window)
+curl -fsS "$STORE/v3/reveal/$WINDOW.json" | jq .record.crown_model > king.json   # null: King₀ reigns
+URL=$(jq -r .url king.json)
+curl -fsS "${URL}manifest.json" -o manifest.json
+echo "$(jq -r .manifest_sha256 king.json)  manifest.json" | sha256sum -c -
+jq -r '.files[].path' manifest.json | while read -r path; do
+    mkdir -p "king/$(dirname "$path")"
+    curl -fsS "$URL$path" -o "king/$path"
+done
+jq -r '.files[] | "\(.sha256)  \(.path)"' manifest.json | (cd king && sha256sum -c -)
+```
+
+The two `sha256sum -c` lines are the check: the first ties the manifest to the digest the reveal
+names, and the second ties every file to the manifest. A king is ~70 GB, so the loop takes a while;
+any HTTP client that fetches the same paths will do.
 
 #### Troubleshooting
 

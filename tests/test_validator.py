@@ -354,6 +354,7 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
     validator = Validator(
         pins=pins, reference=describe(simulate._write_tree(root / "reference")), chain=chain,
         store=store, private_models=private, public_models=public,
+        public_model_base_url="https://models.example.org/",
         mailbox=Mailbox(root / "mailbox.json", signing.Signer(), _never_mint),
         gateway=gateway,
         owner=Owner(ss58=owner_signer.public_hex, sign=owner_signer.sign,
@@ -2264,6 +2265,9 @@ def test_only_the_crowned_winner_is_ever_public_and_it_is_the_tree_that_was_judg
     assert record["promotion"] == {"hotkey": strong, "state": "promoted", "prefix": king}
     assert record["crown_model"]["bucket"] == PUBLIC_BUCKET
     assert record["crown_model"]["prefix"] == king
+    # Where a miner downloads it: under the base URL, its trailing slash not doubled.
+    assert record["crown_model"]["url"] == f"https://models.example.org/{king}"
+    assert record["crown_model"]["manifest_url"] == f"https://models.example.org/{king}{MANIFEST_NAME}"
 
 
 def test_a_winner_whose_public_copy_fails_is_crowned_only_once_it_lands(tmp_path, monkeypatch):

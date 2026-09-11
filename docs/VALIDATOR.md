@@ -146,6 +146,7 @@ thirtyspokes-validator \
   --sandbox-host unix:///run/v3/docker.sock --grade-dir /var/v3/grade \
   --r2-endpoint <url> --r2-bucket <store-bucket> \
   --r2-private-model-bucket <private-bucket> --r2-public-model-bucket <public-models-bucket> \
+  --public-model-base-url https://<public-models-domain> \
   --per-benchmark <n> --minimum <n>
 ```
 
@@ -296,7 +297,9 @@ scope a credential to the store. Set them up in Cloudflare before the first mine
 
 1. **Private models** — public access **off**, no custom domain, and the bucket's `r2.dev` URL
    disabled (it would bypass everything else).
-2. **Public models** — public access on; a custom domain if you want a stable download URL.
+2. **Public models** — public access on, through a custom domain (this subnet's is
+   `models.thirtyspokes.ai`). Pass that address to the daemon as `--public-model-base-url`: every
+   reveal's `crown_model` names the king's `url` and `manifest_url` under it.
 3. **The R2 token** in `.env` — object read and write on all three buckets.
 
 **A winner is crowned only after its public copy verifies.** The validator uploads the tree from its
@@ -363,6 +366,8 @@ nothing; it is never carried to the next window and never published. Three thing
 | `metering[].own_key` | whether the arm ran on the miner's registered key (D18) rather than a credited allowance |
 | `metering[].endpoints` | per model the arm bought live, which endpoint answered (`provider`, or `provider:served_model` when the response named a different model) |
 | `metering[].drift` | the `model@endpoint` pairs a miner-key arm was served by that no arm on YOUR key was served by that window — §11-1's residual made visible; evidence, not a gate |
+| `crown_model` | where the reigning king's weights are: `bucket`, `prefix`, `manifest_sha256`, and the `url` and `manifest_url` under `--public-model-base-url`; `null` while King₀ reigns |
+| `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `null` when nobody won |
 
 Arms run reference → king → challengers, so your allowance pays the fills for the cascade's rungs
 and a challenger that agrees with the king pays for its agreement without the provider being asked

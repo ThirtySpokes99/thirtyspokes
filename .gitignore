@@ -36,3 +36,5 @@ m3a-*.log
 
 # transient agent worktrees — never part of the tree
 .claude/worktrees/
+
+server.config

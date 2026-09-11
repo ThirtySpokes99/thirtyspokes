@@ -493,7 +493,7 @@ class Mailbox:
         hotkeys those were without reading the ledger file by eye — and an obligation whose input is
         a JSON file an operator parses by hand is an obligation that quietly stops being met.
 
-        Sorted by hotkey so two runs of `orchestra-owner status` are diffable.
+        Sorted by hotkey so two runs of `thirtyspokes-owner status` are diffable.
         """
         return tuple(sorted(
             (Outstanding(hotkey=hotkey, registration_id=str(record["registration_id"]),
@@ -511,7 +511,7 @@ class Mailbox:
         and `_persist` writes the WHOLE in-memory view — so an `issue` landing between the daemon's
         startup read and its next `consume` was silently dropped.
 
-        Measured 2026-09-02, before `orchestra-owner` existed, which is exactly what had kept it
+        Measured 2026-09-02, before `thirtyspokes-owner` existed, which is exactly what had kept it
         unreachable: with one writer the stale copy is always current. Two harms follow, and the
         second is the serious one. A rotation re-mints **generation 1** over the same mailbox key,
         so a miner polling that key can be handed a different envelope than the one they began with.

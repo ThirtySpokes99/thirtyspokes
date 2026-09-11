@@ -1,4 +1,4 @@
-"""The owner's submission desk — `orchestra-owner` (§7 steps 2-3, the build plan M6).
+"""The owner's submission desk — `thirtyspokes-owner` (§7 steps 2-3, the build plan M6).
 
 WHY THIS IS A SEPARATE PROGRAM FROM THE VALIDATOR, which is the only real decision in the file.
 `validator.main` wires its mailbox with a minter that always raises, and `never_mint`'s docstring
@@ -84,7 +84,7 @@ def format_balances(balances: Mapping[str, float]) -> str:
                 "  every arm would run at $0 and score zero on every task, and the window would "
                 "publish that as if the corpus carried no spread\n"
                 "  credit the owner account for the reference arms, and each miner for theirs: "
-                "orchestra-owner --state DIR credit --hotkey SS58 --usd N")
+                "thirtyspokes-owner --state DIR credit --hotkey SS58 --usd N")
     rows = "\n".join(f"  {hotkey:<52} ${usd:.4f}"
                      for hotkey, usd in sorted(balances.items(), key=lambda kv: -kv[1]))
     return f"{len(balances)} allowance(s)\n{rows}"
@@ -214,7 +214,7 @@ def format_status(mailbox: Mailbox) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="orchestra-owner",
+        prog="thirtyspokes-owner",
         description="Issue submission credentials and read the one-shot ledger (v3 §7).")
     parser.add_argument("--state", type=Path, required=True, metavar="DIR",
                         help="the validator's OWN --state directory: the one-shot ledger lives at "
@@ -349,7 +349,7 @@ def main(argv: list[str] | None = None) -> None:
         print(issue(chain, Mailbox(args.state / "mailbox.json", signer, mint),
                     bucket.put, netuid=args.netuid, hotkey=args.hotkey, key_only=args.key_only))
     except AccessError as exc:
-        sys.exit(f"orchestra-owner: {exc}")
+        sys.exit(f"thirtyspokes-owner: {exc}")
 
 
 def _no_mint(prefix: str) -> Credential:

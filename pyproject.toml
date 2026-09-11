@@ -63,6 +63,25 @@ serve = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.27", "openai>=1.40", "cert
          "scikit-learn>=1.3"]
 
 [project.scripts]
+# The commands are named for the subnet. `orchestra-*` was the mechanism's working name and it
+# outlived the rename: the package installs as `thirtyspokes` and the product is Thirty Spokes, so a
+# miner who followed the guide typed `pip install thirtyspokes` and then `orchestra-miner`, which
+# reads like the wrong package at the one moment onboarding cannot afford a doubt.
+thirtyspokes-enclave = "thirtyspokes.serve.enclave_cli:main"
+thirtyspokes-serving-governance = "thirtyspokes.serve.governance:main"
+thirtyspokes-dev = "thirtyspokes.v3.devkit:main"
+thirtyspokes-sim = "thirtyspokes.v3.simulate:main"
+thirtyspokes-validator = "thirtyspokes.v3.validator:main"
+thirtyspokes-miner = "thirtyspokes.v3.miner:main"
+thirtyspokes-owner = "thirtyspokes.v3.owner:main"
+thirtyspokes-serve = "thirtyspokes.serve.cli:main"
+thirtyspokes-serve-train = "thirtyspokes.serve.escalate:main"
+
+# TRANSITIONAL ALIASES, and they are not decoration. A running validator is launched from a script
+# on disk (`--state`'s launch.sh) and miners are reading guides that were published with the old
+# names; dropping them in the same release as the rename turns a cosmetic change into an outage for
+# anyone who does not redeploy first. Remove them once the deployment and the published guides have
+# both moved — nothing in the tree refers to them after this commit.
 orchestra-enclave = "thirtyspokes.serve.enclave_cli:main"
 orchestra-serving-governance = "thirtyspokes.serve.governance:main"
 orchestra-dev = "thirtyspokes.v3.devkit:main"

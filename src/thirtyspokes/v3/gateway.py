@@ -169,7 +169,7 @@ class DuelLedger:
 def allowance_journal(state: Path) -> Path:
     """Where the gateway's allowances live, derived from `--state` so nobody has to pass it twice.
 
-    The owner credits with `orchestra-owner credit`; the validator replays the same file when it
+    The owner credits with `thirtyspokes-owner credit`; the validator replays the same file when it
     builds its gateway. Deriving both from `--state` is what stops the two naming different files
     and the daemon starting with a wallet the owner believes it filled.
     """
@@ -261,7 +261,7 @@ class OwnerGateway:
     def refresh(self) -> None:
         """Apply movements another process appended since this one last looked.
 
-        WITHOUT THIS A CREDIT IS INVISIBLE UNTIL A RESTART. `orchestra-owner credit` builds its
+        WITHOUT THIS A CREDIT IS INVISIBLE UNTIL A RESTART. `thirtyspokes-owner credit` builds its
         own gateway, appends a row and exits; the daemon replayed the file once at construction and
         never again. So an owner topping up a miner mid-run — which is exactly what the miner guide
         tells them to do, and what the validator's own refusal message asks for — changed nothing

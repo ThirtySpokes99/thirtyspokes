@@ -34,8 +34,8 @@ first-generation mechanism was retired on 2026-09-07 and removed from this tree.
 uv venv --python 3.12 && uv pip install -e ".[dev]"
 
 uv run pytest -q                 # the invariant suite
-uv run orchestra-sim         # one window against the archetype cast, nothing mocked in the mechanism
-uv run orchestra-dev --help  # the miner's dev kit: the validator's own gate and scaffold, locally
+uv run thirtyspokes-sim         # one window against the archetype cast, nothing mocked in the mechanism
+uv run thirtyspokes-dev --help  # the miner's dev kit: the validator's own gate and scaffold, locally
 ```
 
 The live window, on real benchmarks with an `OPENROUTER_API_KEY`:
@@ -74,8 +74,8 @@ runs/           the pinned λ table, the M3a report, the first live window's sig
 
 ## Command-line tools
 
-`orchestra-miner` (`hotkey` · `identity` · `check` · `register-key` · `submit`), `orchestra-owner` (`issue` ·
-`credit` · `balances` · `status` · `key` · `commit-schedule`), `orchestra-validator`,
-`orchestra-dev`, `orchestra-sim`; `orchestra-serve`, `orchestra-enclave`,
-`orchestra-serving-governance`. Every seam of the validator is a required argument — there is no
+`thirtyspokes-miner` (`hotkey` · `identity` · `check` · `register-key` · `submit`), `thirtyspokes-owner` (`issue` ·
+`credit` · `balances` · `status` · `key` · `commit-schedule`), `thirtyspokes-validator`,
+`thirtyspokes-dev`, `thirtyspokes-sim`; `thirtyspokes-serve`, `thirtyspokes-enclave`,
+`thirtyspokes-serving-governance`. Every seam of the validator is a required argument — there is no
 offline default that could set weights on a real subnet from a simulation.

@@ -156,7 +156,7 @@ def gate(report: dict, min_auc: float = MIN_AUC) -> tuple[bool, str]:
 
 
 def main() -> None:
-    """`orchestra-serve-train` — turn a request log into a servable escalate predictor."""
+    """`thirtyspokes-serve-train` — turn a request log into a servable escalate predictor."""
     from .policy import TIER_CHEAP
     ap = argparse.ArgumentParser(description="train the escalate predictor from a request log")
     ap.add_argument("--log", required=True, help="requests.jsonl written with --log-features")
@@ -174,7 +174,7 @@ def main() -> None:
         raise SystemExit(f"NOT PROMOTED: {why}")
     Path(args.out).write_bytes(weights)
     Path(args.out + ".report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"PROMOTED: {why}\nwrote {args.out} — serve with: orchestra-serve --escalate-weights {args.out}")
+    print(f"PROMOTED: {why}\nwrote {args.out} — serve with: thirtyspokes-serve --escalate-weights {args.out}")
 
 
 if __name__ == "__main__":

@@ -1,18 +1,18 @@
-"""`orchestra-serve` — run the beta routing API.
+"""`thirtyspokes-serve` — run the beta routing API.
 
     export OPENROUTER_API_KEY=sk-or-...
 
     # the recommended beta pipeline: two tiers + learning loop + data flywheel
-    orchestra-serve --tiered --log requests.jsonl --log-features \\
+    thirtyspokes-serve --tiered --log requests.jsonl --log-features \\
                     --shadow-rate 0.02 --shadow-budget-usd 5
 
     # once enough traffic is logged, train + promote the escalate predictor:
-    orchestra-serve-train --log requests.jsonl --out escalate.npz
-    orchestra-serve --tiered --escalate-weights escalate.npz --log requests.jsonl --log-features
+    thirtyspokes-serve-train --log requests.jsonl --out escalate.npz
+    thirtyspokes-serve --tiered --escalate-weights escalate.npz --log requests.jsonl --log-features
 
     # the two A/B arms it is judged against:
-    orchestra-serve --baseline-only               # always the cheap reliable model
-    orchestra-serve --weights head.npz            # a subnet miner's 7-way head
+    thirtyspokes-serve --baseline-only               # always the cheap reliable model
+    thirtyspokes-serve --weights head.npz            # a subnet miner's 7-way head
 
 The product claim is a comparison — "the pipeline beats calling the cheap reliable model directly" —
 so run the arms over the same traffic and compare /stats.
@@ -67,7 +67,7 @@ def main() -> None:
 
     tiered = ap.add_argument_group("tiered options")
     tiered.add_argument("--escalate-weights",
-                        help="escalate predictor from orchestra-serve-train; omit to run "
+                        help="escalate predictor from thirtyspokes-serve-train; omit to run "
                              "cheap-first + escalate-on-failure only")
     tiered.add_argument("--threshold", type=float, default=0.5,
                         help="p(escalate) above which an ask enters at the strong tier")
@@ -87,7 +87,7 @@ def main() -> None:
                       help="log prompt TEXT, not just its hash. Requires consent from whoever "
                            "sent the traffic — logged prompts can end up in a published corpus")
     logs.add_argument("--log-features", action="store_true",
-                      help="log the prompt EMBEDDING (needed by orchestra-serve-train). No text, "
+                      help="log the prompt EMBEDDING (needed by thirtyspokes-serve-train). No text, "
                            "but semantic — keep the log private")
     logs.add_argument("--shadow-rate", type=float, default=0.0,
                       help="fraction of requests replayed across the rest of the pool in the "

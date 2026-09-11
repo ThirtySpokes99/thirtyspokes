@@ -1,4 +1,4 @@
-"""The miner's submission tool — `orchestra-miner` (§7 steps 2-5, the build plan M6).
+"""The miner's submission tool — `thirtyspokes-miner` (§7 steps 2-5, the build plan M6).
 
 Every piece this drives already existed and none of them were joined: `access` seals and opens the
 envelope, `store` hashes and uploads the tree, `chain` writes the ready signal, `admission` says
@@ -218,7 +218,7 @@ def fetch_envelope(mailbox_url: str, key: str) -> bytes:  # pragma: no cover —
             return response.read()
     except Exception as exc:                # noqa: BLE001 — every failure here means "not yet"
         raise MinerError(
-            f"no envelope at {url}: {exc}. The owner publishes it after `orchestra-owner issue` "
+            f"no envelope at {url}: {exc}. The owner publishes it after `thirtyspokes-owner issue` "
             f"— send them this hotkey and wait, or ask for a rotation if a previous one expired.")
 
 
@@ -282,7 +282,7 @@ def register_key(chain: Chain, *, netuid: int, hotkey: str, api_key: str, cap_us
     Uses the same prefix-scoped credential `submit` opens, so it needs no second grant from the
     owner and can run before or after the commit for as long as that credential is valid. Once it
     has expired and the shot is spent, `key_credential` opens instead a KEY-ONLY credential the
-    owner issued with `orchestra-owner issue --key-only` — scoped to the `openrouter/` sub-prefix,
+    owner issued with `thirtyspokes-owner issue --key-only` — scoped to the `openrouter/` sub-prefix,
     so it can rotate the key and touch nothing of the tree. Nothing here is irreversible:
     re-running it overwrites the record, which is how a key is rotated or a cap moved. The key
     itself never leaves this machine in the clear — it is sealed to the owner's key before the
@@ -337,7 +337,7 @@ def format_identity(registration: Registration, *, generations: int = 3) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="orchestra-miner",
+        prog="thirtyspokes-miner",
         description="Submit a Conductor: check it, upload it, commit it (v3 §7).")
     parser.add_argument("--netuid", type=int, required=True)
     parser.add_argument("--network", default="finney")
@@ -433,7 +433,7 @@ def main(argv: list[str] | None = None) -> None:
                      sign=lambda data: wallet.hotkey.sign(data).hex(),
                      open_bucket=r2_bucket, generation=args.generation))
     except (MinerError, AccessError) as exc:
-        sys.exit(f"orchestra-miner: {exc}")
+        sys.exit(f"thirtyspokes-miner: {exc}")
 
 
 if __name__ == "__main__":  # pragma: no cover

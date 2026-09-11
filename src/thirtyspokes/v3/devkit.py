@@ -1,8 +1,8 @@
-"""The miner's local dev kit — `orchestra-dev` (the build plan M6b; the "Kind" property).
+"""The miner's local dev kit — `thirtyspokes-dev` (the build plan M6b; the "Kind" property).
 
 A miner gets ONE submission per hotkey (§7) and an invalid artifact spends it. Without a local kit
 the only way to discover that a model fails admission, emits unparseable actions, or loops until the
-step cap is to burn a registration finding out. `orchestra-koth-dev` existed for exactly this reason
+step cap is to burn a registration finding out. the retired first-generation dev kit existed for exactly this reason
 in the previous design and its promise has to survive into v3:
 
     what I see locally is what the validator scores.
@@ -286,7 +286,7 @@ def mock_world() -> LocalWorld:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="orchestra-dev",
+        prog="thirtyspokes-dev",
         description="Score your Conductor locally with the validator's own code, before you spend "
                     "your one submission. No R2 credential, no chain connection, no network.")
     parser.add_argument("--model-tree", type=Path, metavar="DIR",

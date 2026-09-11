@@ -782,7 +782,7 @@ def test_a_funded_allowance_still_runs_expensive_calls_concurrently():
 def test_a_credit_made_while_the_daemon_runs_reaches_it(tmp_path):
     """The instruction and the behaviour disagreed.
 
-    `orchestra-owner credit` builds its own gateway, appends a row and exits. The daemon
+    `thirtyspokes-owner credit` builds its own gateway, appends a row and exits. The daemon
     replayed the journal once at construction and never again — so an owner topping up a miner
     mid-run, which is exactly what the miner guide says to do and what the validator's own refusal
     message asks for, changed nothing until somebody restarted the validator.

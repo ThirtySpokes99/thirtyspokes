@@ -53,7 +53,7 @@ would punish a king for the owner's outage. The only way to express "we do nothi
 have nothing here that could do something, so the only write is `_write_weights`, and nothing calls
 it on a schedule of its own.
 
-**THIS MODULE IS NEVER RUN AGAINST A LIVE NETWORK BY ITS TESTS.** `orchestra-validator` builds
+**THIS MODULE IS NEVER RUN AGAINST A LIVE NETWORK BY ITS TESTS.** `thirtyspokes-validator` builds
 real seams from real credentials; the tests drive the identical `Validator` over `chain.MockChain`, a
 `store.S3Bucket` on an in-memory client, and an `OwnerGateway` over a scripted provider — the
 production classes with only the far side replaced.
@@ -836,7 +836,7 @@ class Validator:
         if committed is None:
             raise ValidatorError(
                 "no schedule root is committed on chain under this validator's own hotkey (§6.3). "
-                "Publish it with `orchestra-owner commit-schedule` before opening a window, and "
+                "Publish it with `thirtyspokes-owner commit-schedule` before opening a window, and "
                 "pass it the SAME --owner-hotkey as this daemon's --hotkey: the root is read back "
                 "from the signing key's own commitment slot, so a root committed under a different "
                 "hotkey is indistinguishable here from no root at all. Uncommitted, the owner could "
@@ -873,7 +873,7 @@ class Validator:
         fixed by crediting the account, and a daemon that had to be restarted to notice would turn a
         recoverable outage into an operator's problem.
         """
-        # Pick up anything `orchestra-owner credit` appended while this daemon was running,
+        # Pick up anything `thirtyspokes-owner credit` appended while this daemon was running,
         # before deciding whether anyone is funded.
         self.gateway.refresh()
         if self.gateway.balance(self.owner_account) <= 0.0:
@@ -881,9 +881,9 @@ class Validator:
                 f"the owner account {self.owner_account!r} has no allowance (§4). The reference "
                 f"arms and, while King zero reigns, the king's arm are paid by the owner, so every "
                 f"one of them would spend nothing, score zero on every task, and publish a window "
-                f"that reads as a corpus with no spread. Credit it with `orchestra-owner "
+                f"that reads as a corpus with no spread. Credit it with `thirtyspokes-owner "
                 f"--state DIR credit --hotkey {self.owner_account} --usd N`, and check the rest "
-                f"with `orchestra-owner --state DIR balances`.")
+                f"with `thirtyspokes-owner --state DIR balances`.")
 
     # --- the loop ---------------------------------------------------------------------------
 
@@ -1956,11 +1956,11 @@ def _outcome_json(outcome: Outcome) -> dict:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="orchestra-validator",
+        prog="thirtyspokes-validator",
         description="Run the owner-run v3 validator: open the committed window, gate it, admit the "
                     "queue, measure the king ONCE, duel every challenger, crown, set weights and "
                     "publish the reveal. Needs a chain, an R2 bucket, an owner wallet, a funded "
-                    "gateway and a served model. The offline path is `orchestra-sim`.")
+                    "gateway and a served model. The offline path is `thirtyspokes-sim`.")
     parser.add_argument("--state", type=Path, required=True, metavar="DIR",
                         help="where history, checkpoints, model trees and local reveals live")
     parser.add_argument("--netuid", type=int, required=True)
@@ -2027,11 +2027,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """`orchestra-validator`. **Wiring only, and it refuses to guess anything that spends.**
+    """`thirtyspokes-validator`. **Wiring only, and it refuses to guess anything that spends.**
 
     Every seam is a required argument or a required environment variable and there is no offline
     default anywhere in it: a validator that silently fell back to a mock chain, an unfunded gateway
-    or a stand-in corpus would set weights on a real subnet from a simulation. `orchestra-sim` is
+    or a stand-in corpus would set weights on a real subnet from a simulation. `thirtyspokes-sim` is
     a different program on purpose.
 
     It carries no logic, exactly as `store.r2_bucket` carries none, and for the same reason — the
@@ -2098,7 +2098,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
         session_token=os.environ.get("R2_SESSION_TOKEN", ""),
         expires_at=datetime.now(timezone.utc) + timedelta(days=1))
-    # The journal is derived from --state, the same path `orchestra-owner credit` writes, so
+    # The journal is derived from --state, the same path `thirtyspokes-owner credit` writes, so
     # the two cannot name different files and the daemon cannot start against a wallet the owner
     # believes is full. Without it the balances are process memory and one restart zeroes every
     # allowance while the checkpoint's `<arm>.budget` still claims the money is there.
@@ -2108,7 +2108,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.serve_url:
         serving = local_serving(args.serve_url)
     else:
-        sys.exit("orchestra-validator: one of --serve-url (operator-managed serving) or "
+        sys.exit("thirtyspokes-validator: one of --serve-url (operator-managed serving) or "
                  "--serve-host (validator-managed serving) is required")
     gateway = OwnerGateway(OpenRouterClient(os.environ["OPENROUTER_API_KEY"]),
                            journal=allowance_journal(args.state))
@@ -2123,7 +2123,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         beacon=chain_beacon(chain._substrate, cadence), netuid=args.netuid, root=args.state,
         per_benchmark=args.per_benchmark, minimum=args.minimum,
         king_zero_uid=args.king_zero_uid,
-        # D18: the mailbox key's seed opens the keys miners sealed to `orchestra-owner key`.
+        # D18: the mailbox key's seed opens the keys miners sealed to `thirtyspokes-owner key`.
         key_seed=mailbox_seed(args.state))
     validator.run_forever(poll_seconds=args.poll_seconds,
                           on_reveal=lambda reveal: print(format_reveal(reveal)))

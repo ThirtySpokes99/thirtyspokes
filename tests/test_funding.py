@@ -215,7 +215,9 @@ def enrol_with_key(h, name: str, *, cap_usd: float = 50.0, pool: KeyedPool) -> t
     hotkey = h.enrol(name, block=10, conductor=router(h), budget_usd=0.0)
     uid = h.chain.metagraph().resolve(hotkey).uid
     reg = Registration(netuid=NETUID, uid=uid, hotkey=hotkey, registration_block=500)
-    h.store.put(reg.prefix + KEY_NAME, sealed(name, cap_usd=cap_usd, reg=reg).to_bytes())
+    # Beside the tree in the PRIVATE models bucket — where the miner's credential writes, and
+    # the only bucket the daemon's funding step reads a key record from.
+    h.private.put(reg.prefix + KEY_NAME, sealed(name, cap_usd=cap_usd, reg=reg).to_bytes())
     h.validator.key_seed = OWNER_SEED
     providers = getattr(h.validator, "_test_providers", {})
     providers[API_KEY] = pool

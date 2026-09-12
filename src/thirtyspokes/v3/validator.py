@@ -900,6 +900,8 @@ class Validator:
         self._last_weight_block: int | None = None
         # What the published queue last said, so an unchanged queue is not rewritten every poll.
         self._queue_published: str | None = None
+        # What the last write to the chain did, published in the reveal beside the slate.
+        self._weights_state: dict | None = None
         self._preflighted = False
         # `(window, arm) -> attempts made in THIS process`. Only the gateway's ledger identity needs
         # it; the money it protects is on disk in the checkpoint, which is what makes a retry cheap.
@@ -1880,6 +1882,12 @@ class Validator:
         self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
                                                     encoding="utf-8")
         written = self._write_weights(weights, metagraph.block)
+        # FILLED IN AFTER THE WRITE, and the local copy is rewritten with it. §8 step 5's order is
+        # persist, then weights, then publish — so the traces are on disk before the chain is
+        # touched — which leaves this the one field that cannot be known when the body is built.
+        body["weights_set"] = self._weights_state
+        self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
+                                                    encoding="utf-8")
         published = self._put_reveal(opened.epoch, body)
         if published:
             self.history.mark_published(opened.epoch)
@@ -2099,9 +2107,36 @@ class Validator:
             self.chain.set_weights(weights, force=True)
         except WeightRateLimited as exc:
             self._log(f"weights rejected by the rate limit, the previous slate stands: {exc}")
+            self._weights_state = {"written": False, "block": int(block),
+                                   "blocks_since_update": self._weights_age(),
+                                   "note": f"rate-limited: {exc}"}
+            return False
+        except Exception as exc:          # noqa: BLE001 — a failed write must not lose the window
+            # §8 step 5 persists the verdicts, writes the weights, then publishes the reveal. A write
+            # that RAISED took the last step with it: `run_forever` caught it, the window was settled
+            # but unpublished, and the record only reached readers when the next poll re-published
+            # it. Measured on netuid 99 on 2026-09-12: 21 stale-nonce rejections, each one taking a
+            # window's reveal off the air for a poll for a reason that has nothing to do with it.
+            # The slate is retried on the next refresh either way; the reveal should not wait for it.
+            self._log(f"weights not set, the previous slate stands: {type(exc).__name__}: {exc}")
+            self._weights_state = {"written": False, "block": int(block),
+                                   "blocks_since_update": self._weights_age(),
+                                   "note": f"{type(exc).__name__}: {exc}"}
             return False
         self._last_weight_block = block
+        # Included is not the same as landed: read back how stale the chain says this hotkey's slate
+        # is, so a reveal claims the weights are on chain only when the chain agrees.
+        self._weights_state = {"written": True, "block": int(block),
+                               "blocks_since_update": self._weights_age(), "note": None}
         return True
+
+    def _weights_age(self) -> int | None:
+        """How stale the chain says our slate is, or None when it cannot be read."""
+        try:
+            return self.chain.blocks_since_weight_update()
+        except Exception as exc:          # noqa: BLE001 — a diagnostic, never a gate
+            self._log(f"could not read the weight age: {type(exc).__name__}: {exc}")
+            return None
 
     def _refresh_weights(self, block: int, *, force: bool = False) -> bool:
         """Re-submit the CURRENT slate between windows (see `WEIGHT_REFRESH_BLOCKS`).
@@ -2142,7 +2177,7 @@ def _seen_split(results: Sequence[EpisodeResult], seen: Collection[str], failed:
 
 def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | None = None,
             splits: Mapping[str, dict] | None = None, promotion: dict | None = None,
-            crown_model: dict | None = None) -> dict:
+            crown_model: dict | None = None, weights_set: dict | None = None) -> dict:
     """The reveal as JSON — including D15's full decision traces for the arms the OWNER paid for.
 
     The king's arm and the two reference arms, never a losing challenger's: D15 publishes the traces
@@ -2174,6 +2209,9 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
         # the prefix named by the manifest digest the chain committed to, and its `url` and
         # `manifest_url` under --public-model-base-url. None while King0 reigns.
         "crown_model": crown_model,
+        # What the write to the chain actually did: whether it was included, and how stale the
+        # chain says this hotkey's slate is afterwards. `weights` above is what was COMPUTED.
+        "weights_set": weights_set,
         # This window's coronation and its public copy: promoted, or pending a copy that has not
         # verified yet (the verdict stands; the crown waits). None when nobody won.
         "promotion": promotion,

@@ -61,6 +61,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import re
 import sys
 import time
 from collections.abc import Collection, Iterable, Mapping
@@ -92,6 +93,17 @@ UPLOAD_BACKOFF_SECONDS = 20.0
 # The commit marker (docstring point 1). Reserved: a tree may not contain a file of this name,
 # because that file would be overwritten by the marker and the manifest would then describe a file
 # whose bytes it does not name.
+MODEL_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{2,39}$")
+"""What a miner may call their model: 3–40 chars, lowercase, no spaces.
+
+An identifier rather than a title, because it is published beside a king and read back by tooling.
+Lowercase and a fixed alphabet so two names cannot differ by something a reader cannot see, and the
+`thirtyspokes-` prefix is REFUSED below: the subnet names the genesis king `thirtyspokes-genesis`
+(`config.KING_ZERO_NAME`), and a submission that could take that name could claim to be it.
+"""
+
+RESERVED_NAME_PREFIX = "thirtyspokes-"
+
 MANIFEST_NAME = "manifest.json"
 # Written BESIDE a fetched tree's directory (`<dest>.verified`) once every file has been hashed
 # against the committed manifest (`fetch_submission`); holds that manifest's digest. Beside, not
@@ -176,14 +188,25 @@ class Manifest:
     signature: str
     protocol_version: int = 1
     signature_scheme: str = "ed25519"
+    # What the miner calls this model (protocol 2). None for a protocol 1 manifest, whose signing
+    # payload must stay byte-identical or every submission made before names existed stops verifying.
+    model_name: str | None = None
 
     def signing_payload(self) -> bytes:
-        """The bytes the hotkey signs: everything except the signature, canonically ordered."""
-        return json.dumps({
+        """The bytes the hotkey signs: everything except the signature, canonically ordered.
+
+        THE NAME IS SIGNED, and therefore covered by the digest the chain commits to. A name outside
+        the signature would be a label anyone holding the prefix could rewrite after the commit —
+        the one field of a submission its own miner did not vouch for.
+        """
+        payload: dict[str, Any] = {
             "files": [item.as_dict() for item in self.files], "hotkey": self.hotkey,
             "protocol_version": self.protocol_version, "registration_id": self.registration_id,
             "signature_scheme": self.signature_scheme, "tree_digest": self.tree_digest,
-        }, sort_keys=True, separators=(",", ":")).encode()
+        }
+        if self.model_name is not None:
+            payload["model_name"] = self.model_name
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
     def as_bytes(self) -> bytes:
         return json.dumps({**json.loads(self.signing_payload()), "signature": self.signature},
@@ -214,12 +237,23 @@ class Manifest:
             raise StoreError(f"manifest is not valid JSON: {exc}") from exc
         required = {"protocol_version", "signature_scheme", "registration_id", "hotkey", "files",
                     "tree_digest", "signature"}
+        version = value.get("protocol_version") if isinstance(value, dict) else None
+        # Protocol 2 adds ONE field, and only the field it adds: a manifest that carries a name must
+        # say it is a 2, and one that says it is a 1 must not carry one. Otherwise the same bytes
+        # could be read as either version, and "which payload did the hotkey sign" stops having an
+        # answer — the signature covers the version too.
+        if version == 2:
+            required = required | {"model_name"}
         if not isinstance(value, dict) or set(value) != required:
             seen = value if isinstance(value, dict) else {}
             missing = sorted(required.symmetric_difference(seen))
-            raise StoreError(f"manifest fields differ from the v1 contract: {missing}")
-        if value["protocol_version"] != 1 or value["signature_scheme"] != "ed25519":
-            raise StoreError("manifest requires protocol version 1 with ed25519")
+            raise StoreError(f"manifest fields differ from the v{version if version in (1, 2) else 1} "
+                             f"contract: {missing}")
+        if version not in (1, 2) or value["signature_scheme"] != "ed25519":
+            raise StoreError("manifest requires protocol version 1 or 2 with ed25519")
+        name = value.get("model_name")
+        if version == 2:
+            check_model_name(name)
         registration = value["registration_id"]
         if not isinstance(registration, str) or not _is_digest(registration):
             raise StoreError("manifest registration_id is not a SHA-256 digest")
@@ -234,7 +268,8 @@ class Manifest:
             raise StoreError("manifest signature is required")
         manifest = cls(registration_id=value["registration_id"], hotkey=value["hotkey"],
                        files=files, tree_digest=value["tree_digest"],
-                       signature=value["signature"])
+                       signature=value["signature"], protocol_version=version,
+                       model_name=None if version == 1 else str(name))
         if tree_digest(files) != manifest.tree_digest:
             raise StoreError("manifest tree_digest does not match its own file inventory")
         return manifest
@@ -306,12 +341,25 @@ def inventory(root: Path) -> tuple[ManifestFile, ...]:
         return tuple(sorted(executor.map(inspect, paths)))
 
 
-def build_manifest(root: Path, registration: Registration,
-                   sign: Callable[[bytes], str]) -> Manifest:
+def check_model_name(name: object) -> str:
+    """A miner's name for their model, or a refusal saying exactly what is wrong with it."""
+    if not isinstance(name, str) or not MODEL_NAME.fullmatch(name):
+        raise StoreError(f"model name {name!r} must be 3-40 characters of lowercase letters, "
+                         f"digits, dot, dash or underscore, starting with a letter or digit")
+    if name.startswith(RESERVED_NAME_PREFIX):
+        raise StoreError(f"model name {name!r} is reserved: {RESERVED_NAME_PREFIX}* names belong to "
+                         f"the subnet itself, and one of them is the genesis king")
+    return name
+
+
+def build_manifest(root: Path, registration: Registration, sign: Callable[[bytes], str],
+                   *, model_name: str | None = None) -> Manifest:
     """Hash and sign a local tree. `sign` is the miner's hotkey signer, `(bytes) -> signature`."""
     files = inventory(root)
     unsigned = Manifest(registration_id=registration.registration_id, hotkey=registration.hotkey,
-                        files=files, tree_digest=tree_digest(files), signature="unsigned")
+                        files=files, tree_digest=tree_digest(files), signature="unsigned",
+                        protocol_version=1 if model_name is None else 2,
+                        model_name=None if model_name is None else check_model_name(model_name))
     return replace(unsigned, signature=sign(unsigned.signing_payload()))
 
 
@@ -765,6 +813,7 @@ __all__ = [
     "ManifestFile", "PART_SIZE", "PART_STREAMS", "Retention", "S3Bucket", "StoreError",
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
     "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
+    "MODEL_NAME", "RESERVED_NAME_PREFIX", "check_model_name",
     "inventory", "r2_bucket", "retention_plan", "sha256_file", "tree_digest", "upload_tree",
     "usage",
 ]

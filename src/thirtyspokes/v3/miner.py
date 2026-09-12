@@ -237,7 +237,7 @@ def preflight(model: Path, reference: Path) -> None:
 
 def submit(chain: Chain, *, netuid: int, hotkey: str, model: Path, reference: Path,
            mailbox_url: str, owner_public_hex: str, seed: bytes, sign: Callable[[bytes], str],
-           open_bucket: OpenBucket, generation: int = 1,
+           open_bucket: OpenBucket, generation: int = 1, model_name: str | None = None,
            fetch: Callable[[str, str], bytes] = fetch_envelope) -> Submitted:
     """The whole of §7 steps 2-5, in the order the module docstring argues for."""
     registration = registration_of(chain, netuid, hotkey)
@@ -255,7 +255,9 @@ def submit(chain: Chain, *, netuid: int, hotkey: str, model: Path, reference: Pa
                               registration=registration, generation=generation)
     credential = credential_from_envelope(envelope)
 
-    manifest = build_manifest(model, registration, sign)
+    # Checked before a byte moves: a name the validator would refuse is worth a refusal here,
+    # where nothing has been spent, rather than at admission with the shot already gone.
+    manifest = build_manifest(model, registration, sign, model_name=model_name)
     bucket = open_bucket(credential)
     report = upload_tree(model, bucket, registration.prefix, manifest)
 
@@ -368,6 +370,9 @@ def _parser() -> argparse.ArgumentParser:
                            f"required anywhere else)")
     send.add_argument("--generation", type=int, default=1,
                       help="which credential generation to open; raise it after a rotation")
+    send.add_argument("--name", default=None, metavar="NAME",
+                      help="what to call this model: 3-40 lowercase characters, published only "
+                           "if it takes the crown (the subnet reserves thirtyspokes-*)")
 
     key = sub.add_parser("register-key",
                          help="seal your own OpenRouter key to the owner and put it beside your "
@@ -454,7 +459,8 @@ def main(argv: list[str] | None = None) -> None:
                      reference=args.reference, mailbox_url=args.mailbox_url,
                      owner_public_hex=_owner_key(args), seed=hotkey_seed(wallet),
                      sign=lambda data: wallet.hotkey.sign(data).hex(),
-                     open_bucket=r2_bucket, generation=args.generation))
+                     open_bucket=r2_bucket, generation=args.generation,
+                     model_name=args.name))
     except (MinerError, AccessError) as exc:
         sys.exit(f"thirtyspokes-miner: {exc}")
 

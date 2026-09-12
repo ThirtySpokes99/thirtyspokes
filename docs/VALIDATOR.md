@@ -375,7 +375,7 @@ nothing; it is never carried to the next window and never published. Three thing
 | `metering[].drift` | the `model@endpoint` pairs a miner-key arm was served by that no arm on YOUR key was served by that window — §11-1's residual made visible; evidence, not a gate |
 | `crown_model` | where the reigning king's weights are: `bucket`, `prefix`, `manifest_sha256`, and the `url` and `manifest_url` under `--public-model-base-url`; `null` while King₀ reigns |
 | `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `superseded` names a pending winner this one passed over; `null` when nobody won |
-| `reign` | the throne once this window settled: `number`, `genesis`, `hotkey`, `name` (`thirtyspokes-genesis` for King₀), `since_window`, `windows`, and `previous` with the window and reason the last reign ended — `dethroned`, `deregistered` (§5.5's reversion) or `could not fund its arm`. `king_hotkey` above is the START-of-window king the duels faced; this is the throne after them |
+| `reign` | the throne once this window settled: `number`, `genesis`, `hotkey`, `name` (`thirtyspokes-genesis` for King₀, the miner's own name for a miner king, `null` for one submitted before names existed), `since_window`, `windows`, and `previous` with the window and reason the last reign ended — `dethroned`, `deregistered` (§5.5's reversion) or `could not fund its arm`. `king_hotkey` above is the START-of-window king the duels faced; this is the throne after them |
 
 Arms run reference → king → challengers, so your allowance pays the fills for the cascade's rungs
 and a challenger that agrees with the king pays for its agreement without the provider being asked

@@ -231,8 +231,10 @@ what the key reports it can still spend.
 
 ```bash
 uv run thirtyspokes-miner --netuid 99 --wallet "$WALLET" --hotkey "$HOTKEY" submit \
-    --model ./weights --reference ./reference
+    --model ./weights --reference ./reference --name my-router
 ```
+
+`--name` is optional and 3–40 lowercase characters (letters, digits, `.`, `-`, `_`); `thirtyspokes-*` is reserved, because the subnet calls the genesis king `thirtyspokes-genesis` and a submission that could take that name could claim to be it. The name rides inside the signed manifest, so the digest the chain commits to covers it — and, like your weights, it is **published only if you take the crown**. A losing submission's name never appears in a reveal.
 
 **Your upload is private.** It goes to the subnet's private models bucket, readable only through
 your own scoped credential and by the validator — never by other miners, and not before or after

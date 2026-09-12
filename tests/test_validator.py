@@ -275,7 +275,8 @@ class Harness:
 
     # --- a miner's side -----------------------------------------------------------------
     def enrol(self, name: str, *, block: int, conductor: Conductor, pickled: bool = False,
-              budget_usd: float = 100.0, register_at: int = 500) -> str:
+              budget_usd: float = 100.0, register_at: int = 500,
+              model_name: str | None = None) -> str:
         """Register, upload a tree, commit the ready signal, fund the allowance. Returns the hotkey.
 
         Every step is the production path: `store.build_manifest` + `upload_tree` put the bytes in
@@ -288,7 +289,8 @@ class Harness:
         registration = Registration(netuid=NETUID, uid=uid, hotkey=hotkey,
                                     registration_block=register_at)
         tree = simulate._write_tree(self.root / "miners" / name, pickled=pickled)
-        manifest = build_manifest(tree, registration, lambda body: _key(name).sign(body).hex())
+        manifest = build_manifest(tree, registration, lambda body: _key(name).sign(body).hex(),
+                                  model_name=model_name)
         upload_tree(tree, self.private, registration.prefix, manifest)
         self.chain.block = block
         self.chain.commit_ready(hotkey, ReadySignal(registration_id=registration.registration_id,
@@ -2436,7 +2438,7 @@ def test_a_coronation_closes_the_reign_before_it_and_says_why(tmp_path):
     assert reign["number"] == 2 and reign["genesis"] is False and reign["hotkey"] == strong
     assert reign["since_window"] == 1
     assert reign["previous"] == {"number": 1, "genesis": True, "hotkey": "",
-                                 "ended_window": 1, "reason": "dethroned"}
+                                 "name": KING_ZERO_NAME, "ended_window": 1, "reason": "dethroned"}
 
 
 def test_a_king_that_deregisters_ends_its_reign_as_a_reversion_not_a_dethroning(tmp_path):
@@ -2492,3 +2494,46 @@ def test_a_pending_crown_passed_over_by_a_later_winner_is_named_in_the_reveal(tm
     assert promotion["state"] == "promoted" and promotion["hotkey"] == second
     assert promotion["superseded"] == {"hotkey": first, "window": 1}
     assert h.validator.history.pending_crown is None
+
+
+# --- the name a miner gives their model -----------------------------------------------------------
+
+
+def test_only_a_crowned_model_is_named_and_a_loser_never_is(tmp_path):
+    """D14 makes a submission public only if it wins, and a name is part of the submission. A losing
+    miner's name appearing in a signed, permanent reveal would publish what the weights do not."""
+    h = harness(tmp_path)
+    h.enrol("router-a", block=10, conductor=router(h, rung="mock/heavy"), model_name="cheap-router")
+    strong = h.enrol("router-b", block=11, conductor=router(h), model_name="fast-router")
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["reign"]["name"] == "fast-router"
+    assert record["crown_model"]["name"] == "fast-router"
+    assert "cheap-router" not in json.dumps(record), "a loser's name is never published"
+    assert h.validator.history.crown.model_name == "fast-router"
+
+
+def test_an_unnamed_king_is_published_without_a_name_rather_than_a_guess(tmp_path):
+    """Protocol 1 submissions carry no name, and inventing one would put a label on a king its miner
+    never chose."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["reign"]["name"] is None and record["crown_model"]["name"] is None
+
+
+def test_the_kings_name_survives_a_restart(tmp_path):
+    path = tmp_path / "history.json"
+    history = History(path)
+    history.crown_to(Crown("5Cking", "/srv/king", "v3-5Cking@abc", "models/sha256/cd/", "fast-router"),
+                     window=3)
+
+    assert History(path).crown.model_name == "fast-router"
+    assert History(path).reigns[-1]["name"] == "fast-router"

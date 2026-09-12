@@ -503,6 +503,9 @@ class Crown:
     # Where D14 makes this king's weights public: `models/sha256/<manifest>/` in the public models
     # bucket, set only once that copy has verified. Empty for King0, which has no weights.
     public_prefix: str = ""
+    # What its miner called it, from the signed manifest (protocol 2). Empty for a king submitted
+    # before names existed, and for King0 — which the subnet names itself (`KING_ZERO_NAME`).
+    model_name: str = ""
 
     @property
     def is_king_zero(self) -> bool:
@@ -607,8 +610,8 @@ class History:
             open_reign["to_window"] = window
             open_reign["ended"] = reason
         self.reigns.append({"number": len(self.reigns) + 1, "hotkey": crown.hotkey,
-                            "genesis": crown.is_king_zero, "from_window": window,
-                            "to_window": None, "ended": None})
+                            "genesis": crown.is_king_zero, "name": crown.model_name or None,
+                            "from_window": window, "to_window": None, "ended": None})
 
     def crown_to(self, crown: Crown, *, window: int | None = None,
                  reason: str = "dethroned") -> None:
@@ -646,7 +649,8 @@ class History:
             "coronations": list(self.coronations),
             "crown": {"hotkey": self.crown.hotkey, "model_dir": self.crown.model_dir,
                       "served_model": self.crown.served_model,
-                      "public_prefix": self.crown.public_prefix},
+                      "public_prefix": self.crown.public_prefix,
+                      "model_name": self.crown.model_name},
             "revealed": sorted(self.revealed),
             "windows": {str(w): body for w, body in sorted(self.windows.items())},
             "pending_crown": self.pending_crown,
@@ -926,6 +930,8 @@ class Validator:
         self.manifest = holdout_feed.manifest(entries)
         self._last_weight_block: int | None = None
         self._preflighted = False
+        # hotkey -> the name on the manifest admitted this window, for the one that is crowned.
+        self._admitted_names: dict[str, str] = {}
         # `(window, arm) -> attempts made in THIS process`. Only the gateway's ledger identity needs
         # it; the money it protects is on disk in the checkpoint, which is what makes a retry cheap.
         self._attempts: dict[tuple[int, str], int] = {}
@@ -1522,9 +1528,12 @@ class Validator:
         our failure.
         """
         dest = self.root / "trees" / queued.registration.registration_id
-        fetch_submission(self.private_models, dest, commitment=queued.commitment,
-                         registration=queued.registration)
+        manifest = fetch_submission(self.private_models, dest, commitment=queued.commitment,
+                                    registration=queued.registration)
         admit(dest, self.reference)
+        # Kept, not published: §7's name is the miner's, and D14 makes a submission public only if
+        # it wins. It reaches a reveal through the crown and nowhere else.
+        self._admitted_names[queued.hotkey] = manifest.model_name or ""
         return self.serve(dest, served_name(queued.commitment))
 
     def _king_conductor(self, crown: Crown) -> Conductor:
@@ -1850,7 +1859,8 @@ class Validator:
             pending = {"window": opened.epoch, "hotkey": crowned.hotkey,
                        "registration_id": entry.registration.registration_id,
                        "manifest_sha256": entry.commitment.ready.manifest_sha256,
-                       "served_model": served_name(entry.commitment), "attempts": 1}
+                       "served_model": served_name(entry.commitment), "attempts": 1,
+                       "model_name": self._admitted_names.get(crowned.hotkey, "")}
             public_prefix, error = self._promote(pending)
             if public_prefix is not None:
                 superseded = self._supersede_pending(crowned.hotkey)
@@ -1918,7 +1928,8 @@ class Validator:
     def _crown_for(self, pending: Mapping, public_prefix: str) -> Crown:
         return Crown(hotkey=pending["hotkey"],
                      model_dir=str(self.root / "trees" / pending["registration_id"]),
-                     served_model=pending["served_model"], public_prefix=public_prefix)
+                     served_model=pending["served_model"], public_prefix=public_prefix,
+                     model_name=str(pending.get("model_name") or ""))
 
     def _reign_record(self, window: int) -> dict | None:
         """Which reign this is, and what ended the one before it — as of this window settling.
@@ -1940,12 +1951,13 @@ class Validator:
             "hotkey": current["hotkey"],
             # The genesis king is a policy, so it has no manifest and no miner to name it; the
             # subnet names it instead. A miner king is named by its own submission (nothing yet).
-            "name": KING_ZERO_NAME if current["genesis"] else None,
+            "name": KING_ZERO_NAME if current["genesis"] else current.get("name"),
             "since_window": since,
             "windows": None if since is None else int(window) - int(since) + 1,
             "previous": None if previous is None else {
                 "number": previous["number"], "genesis": bool(previous["genesis"]),
                 "hotkey": previous["hotkey"], "ended_window": previous.get("to_window"),
+                "name": KING_ZERO_NAME if previous["genesis"] else previous.get("name"),
                 "reason": previous.get("ended"),
             },
         }
@@ -1964,6 +1976,7 @@ class Validator:
         base = self.public_model_base_url.rstrip("/")
         url = f"{base}/{crown.public_prefix}" if base else None
         return {"bucket": self.public_models.bucket, "prefix": crown.public_prefix,
+                "name": crown.model_name or None,
                 "manifest_sha256": crown.public_prefix.rstrip("/").rsplit("/", 1)[-1],
                 "url": url, "manifest_url": None if url is None else url + MANIFEST_NAME}
 

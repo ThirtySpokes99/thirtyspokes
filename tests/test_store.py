@@ -541,3 +541,45 @@ def test_an_interrupted_promotion_resumes_and_sends_each_file_once(tmp_path, buc
     assert public.client.transfers == len(manifest.files)
     assert promote_submission(dest, public, manifest=manifest) == prefix     # idempotent once whole
     assert public.client.transfers == len(manifest.files)
+
+
+# --- protocol 2: the name a miner gives their model -----------------------------------------------
+
+
+def test_a_named_model_is_a_protocol_2_manifest_and_the_name_is_signed(tmp_path):
+    """Outside the signature the name would be the one field of a submission its miner did not vouch
+    for — rewritable by anyone holding the prefix, after the chain had committed to the digest."""
+    root = tree(tmp_path / "model")
+    named = build_manifest(root, REGISTRATION, sign_with(MINER_SEED), model_name="my-router")
+
+    assert named.protocol_version == 2 and named.model_name == "my-router"
+    assert b'"model_name":"my-router"' in named.signing_payload()
+    assert Manifest.from_bytes(named.as_bytes()) == named
+
+
+def test_a_manifest_with_no_name_signs_exactly_what_protocol_1_signed(tmp_path):
+    """Names must not invalidate a submission made before they existed."""
+    root = tree(tmp_path / "model")
+    plain = build_manifest(root, REGISTRATION, sign_with(MINER_SEED))
+
+    assert plain.protocol_version == 1 and plain.model_name is None
+    assert b"model_name" not in plain.signing_payload()
+    assert Manifest.from_bytes(plain.as_bytes()) == plain
+
+
+@pytest.mark.parametrize("name", ["ab", "A-Router", "my router", "x" * 41, "-leading",
+                                  "thirtyspokes-genesis", "thirtyspokes-anything"])
+def test_a_name_that_could_be_misread_or_impersonate_the_subnet_is_refused(tmp_path, name):
+    root = tree(tmp_path / "model")
+    with pytest.raises(StoreError):
+        build_manifest(root, REGISTRATION, sign_with(MINER_SEED), model_name=name)
+
+
+def test_a_manifest_that_carries_a_name_while_claiming_version_1_is_refused(tmp_path):
+    """The version is signed too, so the same bytes must not be readable as either protocol."""
+    root = tree(tmp_path / "model")
+    named = build_manifest(root, REGISTRATION, sign_with(MINER_SEED), model_name="my-router")
+    tampered = {**json.loads(named.as_bytes()), "protocol_version": 1}
+
+    with pytest.raises(StoreError, match="contract"):
+        Manifest.from_bytes(json.dumps(tampered).encode())

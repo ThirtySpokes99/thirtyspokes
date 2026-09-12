@@ -322,3 +322,25 @@ def test_the_owner_signing_key_survives_the_process_that_issued(tmp_path, chain,
                                owner_public_hex=later.public_hex,
                                registration=issued.registration, generation=1)
     assert (state / "mailbox-key.hex").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_miner_names_their_model_and_the_chain_commits_to_the_name(chain, mailbox, bucket, model,
+                                                                     reference):
+    """The name rides inside the signed manifest, so the digest on chain covers it."""
+    issued = owner_tool.issue(chain, mailbox, bucket.put, netuid=0, hotkey=MINER)
+
+    done = submit(chain, mailbox, bucket, model, reference, model_name="my-router")
+
+    written = json.loads(bucket.get(issued.registration.prefix + MANIFEST_NAME))
+    assert written["model_name"] == "my-router" and written["protocol_version"] == 2
+    assert done.manifest_sha256 == chain.commitments()[0].ready.manifest_sha256
+
+
+def test_a_name_the_validator_would_refuse_is_refused_before_a_byte_moves(chain, mailbox, bucket,
+                                                                          model, reference):
+    owner_tool.issue(chain, mailbox, bucket.put, netuid=0, hotkey=MINER)
+
+    with pytest.raises(Exception, match="reserved|lowercase"):
+        submit(chain, mailbox, bucket, model, reference, model_name="thirtyspokes-genesis")
+
+    assert not chain.commitments(), "the shot must still be there"

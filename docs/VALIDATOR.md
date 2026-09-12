@@ -302,6 +302,13 @@ scope a credential to the store. Set them up in Cloudflare before the first mine
    reveal's `crown_model` names the king's `url` and `manifest_url` under it.
 3. **The R2 token** in `.env` — object read and write on all three buckets.
 
+**A winner passed over by a later one.** Crown-after-verify means a winner whose upload fails is not on
+the throne, so the next window's challengers duel the king it beat — and if one of them wins and its
+copy verifies first, it takes the crown having never faced the pending winner. Teutonic re-runs a
+challenge whose king changed underneath it; a single validator cannot, without stalling every duel on
+a store outage. The older claim is forfeited and the reveal names it in `promotion.superseded`, rather
+than a crown moving for a reason nothing published.
+
 **A winner is crowned only after its public copy verifies.** The validator uploads the tree from its
 own disk — the bytes `fetch_submission` hashed on arrival, the copy the king is served from — never
 a copy of whatever the private bucket holds by then, so nothing a miner replaces after judgment can
@@ -367,7 +374,8 @@ nothing; it is never carried to the next window and never published. Three thing
 | `metering[].endpoints` | per model the arm bought live, which endpoint answered (`provider`, or `provider:served_model` when the response named a different model) |
 | `metering[].drift` | the `model@endpoint` pairs a miner-key arm was served by that no arm on YOUR key was served by that window — §11-1's residual made visible; evidence, not a gate |
 | `crown_model` | where the reigning king's weights are: `bucket`, `prefix`, `manifest_sha256`, and the `url` and `manifest_url` under `--public-model-base-url`; `null` while King₀ reigns |
-| `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `null` when nobody won |
+| `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `superseded` names a pending winner this one passed over; `null` when nobody won |
+| `reign` | the throne once this window settled: `number`, `genesis`, `hotkey`, `name` (`thirtyspokes-genesis` for King₀), `since_window`, `windows`, and `previous` with the window and reason the last reign ended — `dethroned`, `deregistered` (§5.5's reversion) or `could not fund its arm`. `king_hotkey` above is the START-of-window king the duels faced; this is the throne after them |
 
 Arms run reference → king → challengers, so your allowance pays the fills for the cascade's rungs
 and a challenger that agrees with the king pays for its agreement without the provider being asked

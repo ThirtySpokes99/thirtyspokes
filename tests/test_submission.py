@@ -344,3 +344,75 @@ def test_a_name_the_validator_would_refuse_is_refused_before_a_byte_moves(chain,
         submit(chain, mailbox, bucket, model, reference, model_name="thirtyspokes-genesis")
 
     assert not chain.commitments(), "the shot must still be there"
+
+
+# --- the watcher: nobody waits on the owner reading a message -------------------------------------
+
+
+OTHER_SEED = bytes.fromhex("44" * 32)
+OTHER = encode_ss58(Ed25519PrivateKey.from_private_bytes(OTHER_SEED).public_key().public_bytes_raw())
+
+
+def a_round(chain, mailbox, bucket, seen, now=0.0, rotate_after=3600.0, limit=8, generations=5,
+            skip=(), registered_after=0):
+    return owner_tool.issue_round(chain, mailbox, bucket.put, netuid=0, seen=seen, now=now,
+                                  rotate_after=rotate_after, limit=limit, generations=generations,
+                                  skip=skip, registered_after=registered_after)
+
+
+def test_the_watcher_issues_to_every_registered_hotkey_holding_none(chain, mailbox, bucket):
+    """A credential is the one step of §7 a miner cannot take alone. Until it is automatic, every
+    miner waits on the owner reading a message — and they register at three in the morning."""
+    chain.register(OTHER)
+    seen: dict = {}
+
+    made = a_round(chain, mailbox, bucket, seen)
+
+    assert sorted(row.hotkey for row in made) == sorted([MINER, OTHER])
+    assert {row.generation for row in made} == {1}
+    assert a_round(chain, mailbox, bucket, seen, now=60.0) == [], "nobody is due a rotation yet"
+
+
+def test_a_credential_is_rotated_before_it_expires_but_not_forever(chain, mailbox, bucket):
+    """It expires in about a day and a 70 GB upload can outlast it, so a miner who has not committed
+    gets another. A hotkey that never uploads would otherwise be re-issued to for good."""
+    seen: dict = {}
+    a_round(chain, mailbox, bucket, seen, now=0.0, generations=2)
+
+    rotated = a_round(chain, mailbox, bucket, seen, now=3_600.0, generations=2)
+    assert [row.generation for row in rotated] == [2]
+
+    assert a_round(chain, mailbox, bucket, seen, now=7_200.0, generations=2) == []
+
+
+def test_a_hotkey_that_has_committed_is_never_issued_to_again(chain, mailbox, bucket, model,
+                                                              reference):
+    """It has what it needed, and a rotation now hands write access to a prefix the chain names."""
+    owner_tool.issue(chain, mailbox, bucket.put, netuid=0, hotkey=MINER)
+    submit(chain, mailbox, bucket, model, reference)
+
+    assert a_round(chain, mailbox, bucket, {}, rotate_after=0.0) == []
+
+
+def test_the_owners_own_hotkey_is_skipped(chain, mailbox, bucket):
+    assert a_round(chain, mailbox, bucket, {}, skip={MINER}) == []
+
+
+def test_a_pass_issues_no_more_than_its_limit(chain, mailbox, bucket):
+    """A mass registration must not turn into hundreds of R2 writes in one pass."""
+    chain.register(OTHER)
+
+    assert len(a_round(chain, mailbox, bucket, {}, limit=1)) == 1
+
+
+def test_the_uids_that_were_already_there_are_left_alone(chain, mailbox, bucket):
+    """A running subnet's metagraph is full of hotkeys from before — squatters, a retired
+    mechanism's miners. Issuing to all of them hands out a ~70 GB prefix each to people who are not
+    coming."""
+    opened_at = chain.block + 1        # the block the subnet opened for entries
+    chain.advance(1_000)
+    chain.register(OTHER)
+
+    made = a_round(chain, mailbox, bucket, {}, registered_after=opened_at)
+
+    assert [row.hotkey for row in made] == [OTHER], "only the hotkey that turned up afterwards"

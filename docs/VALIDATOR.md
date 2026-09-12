@@ -252,6 +252,35 @@ thirtyspokes-owner --state /var/lib/v3 issue --key-only \
   --r2-endpoint <url> --r2-bucket <store-bucket> --r2-private-model-bucket <private-bucket>
 ```
 
+**Or let it issue itself.** Doing this by hand is the one step of §7 a miner cannot take alone, so
+until it is automatic every miner waits on the owner reading a message — and they register at three in
+the morning.
+
+```bash
+thirtyspokes-owner --state /var/lib/v3 watch --netuid 99 --network finney \
+  --wallet <owner-wallet> --owner-hotkey <owner-hotkey> \
+  --r2-endpoint <url> --r2-bucket <store-bucket> \
+  --r2-private-model-bucket <private-bucket> --registered-after <block>
+```
+
+It polls the metagraph and issues to every registered hotkey holding no credential; rotates one every
+`--rotate-after-hours` (12 by default) for a miner who has not committed yet, because a credential
+lives about a day and a 70 GB upload can outlast it; and stops after `--max-generations` so a hotkey
+that never uploads is not re-issued to forever. It never issues to a spent hotkey, one that has already
+committed, or the owner's own. `--registered-after BLOCK` leaves the UIDs that were already there
+alone — a running subnet's metagraph is full of hotkeys from before, and each would otherwise get write
+access to a ~70 GB prefix.
+
+**It runs beside the daemon and never inside it.** The validator is wired with a minter that refuses
+(`never_mint`): the process that scores submissions must not be able to hand out write access to the
+prefixes it scores.
+
+**What pays for that.** Automatic issuing means any registered hotkey can park ~70 GB in the owner's
+bucket, and §8b.7's fortnight only covers uploads that were JUDGED — one that never commits never is.
+The daemon now sweeps a prefix the chain never named once nobody has touched it for
+`UNCLAIMED_GRACE_SECONDS` (7 days), measured from the last object WRITTEN, so a slow upload keeps
+resetting its own clock and is never deleted mid-flight.
+
 Miners poll `https://store.thirtyspokes.ai` — the custom domain connected to the production bucket
 (2026-09-08) — and the dashboard reads reveals from it, so `--r2-bucket` here and on the daemon must
 name the bucket behind that domain, with public access on. Not the bucket's r2.dev address: Cloudflare

@@ -72,6 +72,7 @@ from typing import Any, Callable
 from . import access
 from .access import AccessError, Registration
 from .access import KEY_PREFIX
+from .config import UNCLAIMED_GRACE_SECONDS
 from .chain import Commitment
 
 # The transfer profile (docstring point 3), and §11-8's "multipart upload is mandatory". The two
@@ -413,6 +414,29 @@ class S3Bucket:
             page = self.client.list_objects_v2(**request)
             for item in page.get("Contents", ()):
                 found[item["Key"]] = int(item["Size"])
+            if not page.get("IsTruncated"):
+                return found
+            token = page["NextContinuationToken"]
+
+    def listing(self, prefix: str) -> dict[str, tuple[int, float]]:
+        """Every object under `prefix`, with its size and when it was last written.
+
+        `list` answers resume's question — is this object here, at this size — and callers that only
+        need that keep using it. Retention asks a different one: how long has nobody touched this,
+        which is the only thing that tells an abandoned upload from one still arriving.
+        """
+        found: dict[str, tuple[int, float]] = {}
+        token: str | None = None
+        while True:
+            request: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+            if token is not None:
+                request["ContinuationToken"] = token
+            page = self.client.list_objects_v2(**request)
+            for item in page.get("Contents", ()):
+                modified = item.get("LastModified")
+                found[item["Key"]] = (int(item["Size"]),
+                                      modified.timestamp() if hasattr(modified, "timestamp")
+                                      else float(modified or 0.0))
             if not page.get("IsTruncated"):
                 return found
             token = page["NextContinuationToken"]
@@ -802,6 +826,44 @@ def apply_retention(bucket: S3Bucket, plan: Retention) -> int:
     return freed
 
 
+def unclaimed_plan(bucket: S3Bucket, *, committed: Collection[str], now: float,
+                   grace_seconds: float = UNCLAIMED_GRACE_SECONDS,
+                   prefix: str = "submissions/") -> tuple[str, ...]:
+    """Prefixes holding bytes no ready signal ever named, untouched for the grace window.
+
+    KEYED OFF THE OBJECTS, NOT THE CREDENTIAL LEDGER. An upload still arriving keeps moving its own
+    newest timestamp, so a 70 GB transfer spread over two days is never swept mid-flight, while a
+    prefix abandoned after one shard is. A ledger-based rule would have to guess at both.
+
+    `committed` is the registration ids the chain names. A prefix among them is out of scope here
+    whatever its age: it is a submission, and §8b.7's grace applies to it once it has been judged.
+    """
+    newest: dict[str, float] = {}
+    for key, (_size, modified) in bucket.listing(prefix).items():
+        rest = key[len(prefix):]
+        if "/" not in rest:
+            continue
+        registration = rest.split("/", 1)[0]
+        newest[registration] = max(newest.get(registration, 0.0), modified)
+    return tuple(sorted(f"{prefix}{registration}/"
+                        for registration, seen in newest.items()
+                        if registration not in committed and now - seen >= grace_seconds))
+
+
+def delete_prefix(bucket: S3Bucket, prefix: str) -> int:
+    """Delete everything under one prefix. Returns the bytes freed.
+
+    Unlike `apply_retention` this keeps no `manifest.json`: that record exists so a JUDGED
+    submission stays auditable forever, and nothing here was ever judged — there is no verdict for a
+    manifest to be the evidence of.
+    """
+    freed = 0
+    for key, size in sorted(bucket.list(prefix).items()):
+        bucket.delete(key)
+        freed += size
+    return freed
+
+
 def _is_digest(value: str) -> bool:
     return (len(value) == _HEX_DIGEST_LENGTH
             and all(char in "0123456789abcdef" for char in value))
@@ -814,6 +876,7 @@ __all__ = [
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
     "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
     "MODEL_NAME", "RESERVED_NAME_PREFIX", "check_model_name",
+    "UNCLAIMED_GRACE_SECONDS", "delete_prefix", "unclaimed_plan",
     "inventory", "r2_bucket", "retention_plan", "sha256_file", "tree_digest", "upload_tree",
     "usage",
 ]

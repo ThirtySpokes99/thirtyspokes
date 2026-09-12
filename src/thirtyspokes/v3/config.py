@@ -402,6 +402,22 @@ spend; raise it only against a measured provider rate limit, since beyond that c
 # It is the CLAIM that was wrong, not the window: `MAX_QUEUE_DEPTH` is derived from this number, so
 # lowering it shortens the promised drain to something the clock delivers. Raise it again when the
 # window does — at `immunity_period >= 21600` a 7200-block window fits ~8.5 and 6 becomes true.
+UNCLAIMED_GRACE_SECONDS = 7 * 86_400
+"""How long bytes nobody ever committed to are kept (§8b.7's gap, reachable once credentials issue
+themselves).
+
+§8b.7 deletes a LOSER's weights a fortnight after judgment, which presumes every upload is judged.
+An upload that never gets a ready signal never is: it is not in any queue, no window ever sees it,
+and nothing deletes it. That was tolerable while a credential took an owner's attention per miner;
+with issuing automatic, every registered hotkey can park ~70 GB in a bucket the owner pays for, and
+256 uids makes that ~18 TB nobody is accountable for.
+
+Seven days rather than the fortnight a judged loser gets, because the two are not the same promise:
+a judged submission earned its grace by being scored, and this one is a prefix somebody started
+filling and walked away from. It is measured from the last object WRITTEN, so a 70 GB upload that
+takes two days keeps resetting its own clock and is never swept mid-flight.
+"""
+
 KING_ZERO_NAME = "thirtyspokes-genesis"
 """What King₀ is CALLED, as against `V3_KING0` which is the policy that implements it.
 

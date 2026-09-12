@@ -88,6 +88,67 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+### Surviving a reboot
+
+Nothing above is any use if a reboot leaves it down. Four units, and the ORDER is the point: the
+daemon refuses to start without the mounts rather than running without them, because a window that
+cannot fetch a challenger REFUSES it (§8b.2) — and that spends a miner's one shot on our broken
+mount. No windows at all is the honest failure.
+
+```ini
+# /etc/systemd/system/var-lib-v3-trees.mount   (and var-v3-grade.mount, the same shape)
+[Unit]
+After=network-online.target
+Wants=network-online.target
+[Mount]
+What=root@<gpu-ip>:/var/v3/trees
+Where=/var/lib/v3/trees
+Type=fuse.sshfs
+Options=_netdev,allow_other,reconnect,port=<port>,IdentityFile=/root/.ssh/<key>,IdentitiesOnly=yes,StrictHostKeyChecking=yes,UserKnownHostsFile=/root/.ssh/known_hosts,ServerAliveInterval=15,ServerAliveCountMax=3
+TimeoutSec=90
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/thirtyspokes-validator.service
+[Unit]
+After=network-online.target v3-docker-tunnel.service var-v3-grade.mount var-lib-v3-trees.mount
+Wants=network-online.target
+Requires=v3-docker-tunnel.service var-v3-grade.mount var-lib-v3-trees.mount
+StartLimitIntervalSec=900
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/workspace/thirtyspokes
+Environment=HOME=/root
+ExecStart=/var/lib/v3/launch.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+StandardOutput=append:/var/lib/v3/validator.log
+StandardError=append:/var/lib/v3/validator.log
+[Install]
+WantedBy=multi-user.target
+```
+
+`thirtyspokes-watch.service` is the same with `ExecStart=/var/lib/v3/watch.sh`, `Restart=always`, and
+none of the mounts: it talks only to the chain and the store, and a miner waiting on a credential is
+the one failure nobody else can work around. `Restart=on-failure` for the daemon and not `always`,
+because `preflight` refusing a misconfigured launch is a stop the operator has to see.
+
+```bash
+systemctl daemon-reload
+systemctl enable --now var-v3-grade.mount var-lib-v3-trees.mount \
+                       thirtyspokes-validator.service thirtyspokes-watch.service
+# then prove the MOUNT UNITS, not just the hand-made mounts they inherited:
+systemctl stop thirtyspokes-validator && systemctl restart var-lib-v3-trees.mount var-v3-grade.mount
+mountpoint -q /var/lib/v3/trees && ls /var/v3/grade >/dev/null && systemctl start thirtyspokes-validator
+```
+
+That last step matters: a mount made by hand keeps working while the unit that is supposed to
+recreate it at boot has never run. The first time it runs would otherwise be the reboot.
+
 Then prove it, on the box that will grade:
 
 ```bash

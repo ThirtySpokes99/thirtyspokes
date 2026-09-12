@@ -2269,8 +2269,8 @@ def _seen_split(results: Sequence[EpisodeResult], seen: Collection[str], failed:
 
 def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | None = None,
             splits: Mapping[str, dict] | None = None, promotion: dict | None = None,
-            crown_model: dict | None = None, weights_set: dict | None = None) -> dict:
-            crown_model: dict | None = None, reign: dict | None = None) -> dict:
+            crown_model: dict | None = None, weights_set: dict | None = None,
+            reign: dict | None = None) -> dict:
     """The reveal as JSON — including D15's full decision traces for the arms the OWNER paid for.
 
     The king's arm and the two reference arms, never a losing challenger's: D15 publishes the traces

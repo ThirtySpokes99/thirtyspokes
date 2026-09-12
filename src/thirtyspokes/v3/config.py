@@ -402,6 +402,16 @@ spend; raise it only against a measured provider rate limit, since beyond that c
 # It is the CLAIM that was wrong, not the window: `MAX_QUEUE_DEPTH` is derived from this number, so
 # lowering it shortens the promised drain to something the clock delivers. Raise it again when the
 # window does — at `immunity_period >= 21600` a 7200-block window fits ~8.5 and 6 becomes true.
+KING_ZERO_NAME = "thirtyspokes-genesis"
+"""What King₀ is CALLED, as against `V3_KING0` which is the policy that implements it.
+
+Two names because they answer different questions and drift apart the moment either moves: the
+policy id (`cascade`) selects an arm and belongs to the world the validator was pinned against, while
+this is the identity a reader sees on the throne. A dashboard that printed the policy id was telling
+miners the genesis king is a routing strategy, which is true and useless — they need to know which
+king they have to beat.
+"""
+
 MAX_DUELS_PER_WINDOW = 3
 
 # Challengers that may be queued at once — and what it is DERIVED FROM is the point of it.

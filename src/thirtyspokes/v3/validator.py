@@ -87,7 +87,8 @@ from .config import (
     RETEST_MAX_KEYS,
     RETEST_MAX_USD,
     DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS, EPISODE_CONCURRENCY, EPS,
-                     EXCLUDED_REASON, FUTILE_REASON, MAX_DUELS_PER_WINDOW, MAX_QUEUE_DEPTH, MIN_SLICE_REACHED)
+                     EXCLUDED_REASON, FUTILE_REASON, KING_ZERO_NAME, MAX_DUELS_PER_WINDOW,
+                     MAX_QUEUE_DEPTH, MIN_SLICE_REACHED)
 from .duel import Contender, champion, duel
 from .emissions import KING0, Lineage, emission_weights
 from .funding import KEY_NAME, SealedKey, open_key
@@ -541,6 +542,10 @@ class History:
         self.judged_at: dict[str, dict] = {}
         # registration ids whose weights retention has already deleted.
         self.purged: set[str] = set()
+        # Every reign, oldest first; the last one is the open one. APPEND-ONLY and explicit,
+        # because a reign inferred from the per-window king cannot say WHY the last one ended —
+        # §5.5's reversion and a dethroning look identical from the outside, and they are not.
+        self.reigns: list[dict] = []
         self._restore()
 
     # --- reads ------------------------------------------------------------------------------
@@ -580,7 +585,36 @@ class History:
         self.windows.setdefault(window, {"crowned": None})["published"] = True
         self.save()
 
-    def crown_to(self, crown: Crown) -> None:
+    def reign(self) -> dict | None:
+        """The open reign, or None before the first window opens one."""
+        return self.reigns[-1] if self.reigns else None
+
+    def ensure_reign(self, window: int) -> None:
+        """Open the first reign — whoever holds the crown when the first window settles."""
+        if not self.reigns:
+            self._begin_reign(self.crown, window=window, reason=None)
+
+    def _begin_reign(self, crown: Crown, *, window: int | None, reason: str | None) -> None:
+        """Close the open reign with the reason it ended, and open the new one.
+
+        `window` is None for a change between windows — §5.5 reverts the crown the moment a king
+        stops resolving, which is a weight refresh and not a window. Recorded as None rather than
+        guessed at: a reign that claims a window it did not reign through is worse than one that
+        admits the crown moved between them.
+        """
+        open_reign = self.reign()
+        if open_reign is not None:
+            open_reign["to_window"] = window
+            open_reign["ended"] = reason
+        self.reigns.append({"number": len(self.reigns) + 1, "hotkey": crown.hotkey,
+                            "genesis": crown.is_king_zero, "from_window": window,
+                            "to_window": None, "ended": None})
+
+    def crown_to(self, crown: Crown, *, window: int | None = None,
+                 reason: str = "dethroned") -> None:
+        """Move the crown. `reason` describes why the reign it ENDS ended."""
+        if crown.hotkey != self.crown.hotkey:
+            self._begin_reign(crown, window=window, reason=reason)
         self.crown = crown
         self.save()
 
@@ -591,6 +625,8 @@ class History:
 
     def crown_promoted(self, crown: Crown, *, window: int) -> None:
         """Finish a deferred coronation once its copy verified on a later poll."""
+        if crown.hotkey != self.crown.hotkey:
+            self._begin_reign(crown, window=window, reason="dethroned")
         self.crown = crown
         self.coronations.append(crown.hotkey)
         self.windows.setdefault(window, {"crowned": None})["crowned"] = crown.hotkey
@@ -616,6 +652,7 @@ class History:
             "pending_crown": self.pending_crown,
             "judged_at": {hotkey: dict(entry) for hotkey, entry in sorted(self.judged_at.items())},
             "purged": sorted(self.purged),
+            "reigns": [dict(reign) for reign in self.reigns],
         }, sort_keys=True), encoding="utf-8")
         temporary.replace(self.path)
 
@@ -631,6 +668,11 @@ class History:
         self.pending_crown = state.get("pending_crown")
         self.judged_at = {str(k): dict(v) for k, v in state.get("judged_at", {}).items()}
         self.purged = set(state.get("purged", ()))
+        self.reigns = [dict(reign) for reign in state.get("reigns", ())]
+        if not self.reigns and self.windows:
+            # A state file written before reigns were recorded. The crown it carries is reign 1, and
+            # the earliest settled window is the earliest window it can honestly claim.
+            self._begin_reign(self.crown, window=min(self.windows), reason=None)
 
 
 class Checkpoint:
@@ -1058,7 +1100,7 @@ class Validator:
         # Every queued hotkey's registration, for §8b.7's retention: taken from the whole queue
         # here because two of `_publish`'s callers pass it no `queued` mapping at all.
         registrations = {entry.hotkey: entry.registration.registration_id for entry in queue}
-        self._resolve_reign(metagraph)
+        self._resolve_reign(metagraph, window=window)
         crown = self.history.crown
         king_hotkey = crown.hotkey            # the START-OF-WINDOW king; every duel faces this one
 
@@ -1185,7 +1227,7 @@ class Validator:
                 self._log(f"window {opened.epoch}: the king's arm reached {king_reached} of "
                           f"{len(king_results)} tasks before its allowance ran out; §4 ends the "
                           f"reign rather than letting an unfunded king defend for nothing")
-                self.history.crown_to(Crown())
+                self.history.crown_to(Crown(), window=opened.epoch, reason="could not fund its arm")
                 crown = self.history.crown
 
         # PHASE 5 — every challenger's arm. Splitting arms from verdicts is what makes the exclusion
@@ -1752,7 +1794,7 @@ class Validator:
                     f"unmetered baseline, so none is scored and no shot is spent")
         return None
 
-    def _resolve_reign(self, metagraph: Metagraph) -> None:
+    def _resolve_reign(self, metagraph: Metagraph, window: int | None = None) -> None:
         """§5.5: the crown reverts to King₀ the moment the reigning hotkey stops resolving.
 
         The bug this closes is invisible in the burn total, which is why it survived: a deregistered
@@ -1767,7 +1809,7 @@ class Validator:
         """
         crown = self.history.crown
         if not crown.is_king_zero and metagraph.resolve(crown.hotkey) is None:
-            self.history.crown_to(Crown())
+            self.history.crown_to(Crown(), window=window, reason="deregistered")
 
     # --- §8 step 5: persist, set weights, publish ---------------------------------------------
 
@@ -1798,6 +1840,9 @@ class Validator:
         # CROWN AFTER VERIFY. A winner's weights must be public before the crown is theirs (D14), so
         # the coronation waits on `_promote`; a copy that fails leaves the verdict standing and the
         # shot spent, and the crown pending for `step` to retry.
+        # Whoever holds the crown when the first window settles is reign 1; every later change
+        # closes the open reign with the reason it ended (§5.5's reversion is not a dethroning).
+        self.history.ensure_reign(opened.epoch)
         promotion: dict | None = None
         crowned_hotkey: str | None = None
         if crowned is not None:
@@ -1808,16 +1853,18 @@ class Validator:
                        "served_model": served_name(entry.commitment), "attempts": 1}
             public_prefix, error = self._promote(pending)
             if public_prefix is not None:
-                self._supersede_pending(crowned.hotkey)
-                self.history.crown_to(self._crown_for(pending, public_prefix))
+                superseded = self._supersede_pending(crowned.hotkey)
+                self.history.crown_to(self._crown_for(pending, public_prefix),
+                                      window=opened.epoch, reason="dethroned")
                 crowned_hotkey = crowned.hotkey
-                promotion = {"hotkey": crowned.hotkey, "state": "promoted", "prefix": public_prefix}
+                promotion = {"hotkey": crowned.hotkey, "state": "promoted", "prefix": public_prefix,
+                             "superseded": superseded}
             else:
-                self._supersede_pending(crowned.hotkey)
+                superseded = self._supersede_pending(crowned.hotkey)
                 self.history.defer_crown({**pending, "error": error,
                                           "next_attempt_at": self._next_attempt_at(1)})
                 promotion = {"hotkey": crowned.hotkey, "state": "pending", "attempts": 1,
-                             "error": error}
+                             "error": error, "superseded": superseded}
         self.history.settle(opened.epoch, crowned=crowned_hotkey,
                             judged=judged,
                             revealed=[task.task_id for task in opened.tasks]
@@ -1855,7 +1902,7 @@ class Validator:
             metagraph=metagraph.hotkey_of, table=None if table is None else table.stats())
 
         body = _record(report, meters, retest=retest, splits=splits, promotion=promotion,
-                       crown_model=self._crown_model())
+                       crown_model=self._crown_model(), reign=self._reign_record(opened.epoch))
         self._local_reveal(opened.epoch).parent.mkdir(parents=True, exist_ok=True)
         self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
                                                     encoding="utf-8")
@@ -1872,6 +1919,36 @@ class Validator:
         return Crown(hotkey=pending["hotkey"],
                      model_dir=str(self.root / "trees" / pending["registration_id"]),
                      served_model=pending["served_model"], public_prefix=public_prefix)
+
+    def _reign_record(self, window: int) -> dict | None:
+        """Which reign this is, and what ended the one before it — as of this window settling.
+
+        PUBLISHED RATHER THAN INFERRED. A reader with only the per-window king can count reigns, but
+        it cannot tell a dethroning from §5.5's reversion, and it has to guess whether the king named
+        beside a coronation is the one that was beaten or the one that won. Both questions are
+        answered here, by the only party that knows: `king_hotkey` stays the START-of-window king the
+        duels were fought against, and this is the throne as it stands once they are settled.
+        """
+        reigns = self.history.reigns
+        if not reigns:
+            return None
+        current, previous = reigns[-1], (reigns[-2] if len(reigns) > 1 else None)
+        since = current.get("from_window")
+        return {
+            "number": current["number"],
+            "genesis": bool(current["genesis"]),
+            "hotkey": current["hotkey"],
+            # The genesis king is a policy, so it has no manifest and no miner to name it; the
+            # subnet names it instead. A miner king is named by its own submission (nothing yet).
+            "name": KING_ZERO_NAME if current["genesis"] else None,
+            "since_window": since,
+            "windows": None if since is None else int(window) - int(since) + 1,
+            "previous": None if previous is None else {
+                "number": previous["number"], "genesis": bool(previous["genesis"]),
+                "hotkey": previous["hotkey"], "ended_window": previous.get("to_window"),
+                "reason": previous.get("ended"),
+            },
+        }
 
     def _crown_model(self) -> dict | None:
         """Where the reigning king's weights can be downloaded — None for King0.
@@ -1919,7 +1996,7 @@ class Validator:
     def _next_attempt_at(self, attempts: int) -> float:
         return self.now() + PROMOTION_RETRY_BASE_SECONDS * 2 ** max(0, min(attempts - 1, 8))
 
-    def _supersede_pending(self, hotkey: str) -> None:
+    def _supersede_pending(self, hotkey: str) -> dict | None:
         """A newer winner replaces an older crown still waiting on its copy.
 
         The older winner never duelled the newer one, and its claim was conditional on a public copy
@@ -1931,6 +2008,8 @@ class Validator:
             self._log(f"window {pending['window']}: {pending['hotkey']}'s deferred crown is "
                       f"superseded by {hotkey}, a newer winner")
             self.history.forfeit_crown()
+            return {"hotkey": pending["hotkey"], "window": pending["window"]}
+        return None
 
     def _settle_pending_crown(self) -> None:
         """Retry a deferred coronation; crown on success, forfeit once the budget is spent."""
@@ -2051,7 +2130,7 @@ class Validator:
         if not (force or due):
             return False
         metagraph = self.chain.metagraph()
-        self._resolve_reign(metagraph)
+        self._resolve_reign(metagraph, window=self.cadence.window_at(block))
         return self._write_weights(
             emission_weights(self.history.lineage(), self.history.crown.hotkey,
                              metagraph.hotkey_of, burn_uid=self.burn_uid), block)
@@ -2078,7 +2157,7 @@ def _seen_split(results: Sequence[EpisodeResult], seen: Collection[str], failed:
 
 def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | None = None,
             splits: Mapping[str, dict] | None = None, promotion: dict | None = None,
-            crown_model: dict | None = None) -> dict:
+            crown_model: dict | None = None, reign: dict | None = None) -> dict:
     """The reveal as JSON — including D15's full decision traces for the arms the OWNER paid for.
 
     The king's arm and the two reference arms, never a losing challenger's: D15 publishes the traces
@@ -2110,6 +2189,9 @@ def _record(report: WindowReport, meters: Sequence[ArmAudit], *, retest: dict | 
         # the prefix named by the manifest digest the chain committed to, and its `url` and
         # `manifest_url` under --public-model-base-url. None while King0 reigns.
         "crown_model": crown_model,
+        # Which reign this is and what ended the one before it (`Validator._reign_record`). The
+        # per-window king above says who the duels faced; this says what the throne has been.
+        "reign": reign,
         # This window's coronation and its public copy: promoted, or pending a copy that has not
         # verified yet (the verdict stands; the crown waits). None when nobody won.
         "promotion": promotion,

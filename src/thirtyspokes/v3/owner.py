@@ -24,9 +24,11 @@ hold in each file separately while being false overall. That sharing is also wha
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Mapping
@@ -188,6 +190,104 @@ def issue(chain: Chain, mailbox: Mailbox, publish: Publish, *, netuid: int, hotk
                   key_only=key_only)
 
 
+def issue_round(chain: Chain, mailbox: Mailbox, publish: Publish, *, netuid: int,
+                seen: dict[str, dict], now: float, rotate_after: float, limit: int,
+                generations: int = 5, skip: Collection[str] = (),
+                registered_after: int = 0) -> list[Issued]:
+    """One pass of the watcher: issue to whoever holds nothing, rotate whoever is about to expire.
+
+    WHY THIS EXISTS AT ALL. A credential is the one step of §7 a miner cannot take alone, so until
+    it is automatic every miner waits on the owner reading a message — and the owner reads messages
+    in office hours while miners register at three in the morning.
+
+    THREE HOTKEYS ARE NEVER ISSUED TO, for three different reasons:
+
+    * one whose shot is spent — §7 gives one submission ever, and `Mailbox.issue` refuses it anyway;
+      skipping first keeps that refusal out of the log every minute;
+    * one that has already committed — it has what it needed, and a rotation now would hand write
+      access to a prefix the chain already names;
+    * the owner's own, which has no submission to make.
+
+    `registered_after` is the blunt instrument for the UIDs that were already there. A subnet that
+    has been running has a metagraph full of hotkeys from before — squatters, a retired mechanism's
+    miners — and issuing to all of them hands out write access to one ~70 GB prefix each for people
+    who are not coming. Set it to the block the subnet opened for entries and only the hotkeys that
+    turn up afterwards are served.
+
+    A rotation is capped at `generations`. Credentials expire in about a day, so a hotkey that
+    registered and never uploaded would otherwise be re-issued forever: a slow drip of credentials
+    and R2 writes for somebody who is not coming.
+    """
+    committed = {commitment.hotkey for commitment in chain.commitments()}
+    spent = {row.hotkey for row in mailbox.outstanding() if row.spent}
+    metagraph = chain.metagraph()
+    made: list[Issued] = []
+    for _uid, hotkey in sorted(metagraph.hotkey_of.items()):
+        if len(made) >= limit:
+            break
+        if hotkey in skip or hotkey in spent or hotkey in committed:
+            continue
+        neuron = metagraph.resolve(hotkey)
+        if neuron is None or neuron.registered_at is None or neuron.registered_at < registered_after:
+            continue
+        record = seen.get(hotkey, {})
+        if record.get("refused") and now - float(record.get("at", 0.0)) < rotate_after:
+            continue
+        if record.get("issued_at") is not None:
+            stale = now - float(record["issued_at"]) >= rotate_after
+            if not stale or int(record.get("generation", 0)) >= generations:
+                continue
+        try:
+            issued = issue(chain, mailbox, publish, netuid=netuid, hotkey=hotkey)
+        except AccessError:
+            # Registered without a registration block yet, or spent in a way the ledger did not
+            # know. Remembered so the next poll does not ask again, and retried after `rotate_after`
+            # so a neuron the chain was still catching up on is not written off forever.
+            seen[hotkey] = {"refused": True, "at": now}
+            continue
+        seen[hotkey] = {"generation": issued.generation, "issued_at": now}
+        made.append(issued)
+    return made
+
+
+def watch(chain: Chain, mailbox: Mailbox, publish: Publish, *, netuid: int, state: Path,
+          poll_seconds: float, rotate_after: float, limit: int, generations: int, once: bool,
+          registered_after: int = 0, skip: Collection[str] = (),
+          clock: Callable[[], float] = time.time,
+          sleep: Callable[[float], None] = time.sleep) -> None:
+    """Poll the metagraph and keep every registered hotkey holding a live credential.
+
+    Its own small ledger (`<state>/watch.json`) records WHEN each hotkey was last issued to, which
+    the mailbox does not: the mailbox counts generations, and rotation needs a clock. A lost file
+    costs one extra credential per hotkey, which is a rotation and not a second shot.
+    """
+    seen: dict[str, dict] = {}
+    if state.exists():
+        try:
+            seen = json.loads(state.read_text(encoding="utf-8"))
+        except ValueError:
+            print(f"{state} is not readable JSON; starting a fresh watch ledger", flush=True)
+    print(f"watching netuid {netuid}: a credential for every registered hotkey that holds none, "
+          f"rotated every {rotate_after / 3600:.0f}h up to {generations} generations, "
+          f"{limit} per pass", flush=True)
+    while True:
+        try:
+            made = issue_round(chain, mailbox, publish, netuid=netuid, seen=seen, now=clock(),
+                               rotate_after=rotate_after, limit=limit, generations=generations,
+                               skip=skip, registered_after=registered_after)
+        except Exception as exc:      # noqa: BLE001 — a chain read or an R2 write; keep watching
+            print(f"pass failed ({type(exc).__name__}: {exc}); retrying", flush=True)
+            made = []
+        for issued in made:
+            print(f"issued generation {issued.generation} to {issued.hotkey} at "
+                  f"{issued.mailbox_key}", flush=True)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps(seen, sort_keys=True), encoding="utf-8")
+        if once:
+            return
+        sleep(poll_seconds)
+
+
 def format_status(mailbox: Mailbox) -> str:
     """The revocation list, which is the operator obligation `access.py` says it cannot discharge.
 
@@ -242,6 +342,34 @@ def _parser() -> argparse.ArgumentParser:
                            help="a credential for the miner's sealed OpenRouter key alone "
                                 "(`openrouter/` under their prefix), issued to a SPENT hotkey too "
                                 "— the rotation path (D18); it can write nothing of the tree")
+
+    watch_cmd = sub.add_parser("watch", help="issue credentials automatically, so no miner waits "
+                                            "on the owner reading a message")
+    watch_cmd.add_argument("--netuid", type=int, required=True)
+    watch_cmd.add_argument("--network", default="finney")
+    watch_cmd.add_argument("--wallet", required=True, help="the owner's wallet name")
+    watch_cmd.add_argument("--owner-hotkey", default="default",
+                           help="the owner's own hotkey: used to read the chain, and never issued to")
+    watch_cmd.add_argument("--r2-endpoint", required=True)
+    watch_cmd.add_argument("--r2-bucket", required=True,
+                           help="the PUBLIC store the envelopes are published to")
+    watch_cmd.add_argument("--r2-private-model-bucket", required=True, metavar="BUCKET",
+                           help="the PRIVATE bucket the credentials grant upload access to")
+    watch_cmd.add_argument("--ttl-seconds", type=int, default=CREDENTIAL_TTL_SECONDS)
+    watch_cmd.add_argument("--poll-seconds", type=float, default=60.0)
+    watch_cmd.add_argument("--rotate-after-hours", type=float, default=12.0,
+                           help="re-issue for a hotkey that has not committed yet, so a credential "
+                                "does not expire under a 70 GB upload (default: 12)")
+    watch_cmd.add_argument("--max-generations", type=int, default=5,
+                           help="stop rotating for a hotkey that never uploads (default: 5)")
+    watch_cmd.add_argument("--max-per-poll", type=int, default=8,
+                           help="how many credentials one pass may issue (default: 8)")
+    watch_cmd.add_argument("--registered-after", type=int, default=0, metavar="BLOCK",
+                           help="only serve hotkeys registered at or after this block, so the UIDs "
+                                "that were already there do not each get a 70 GB prefix (default: "
+                                "every registered hotkey)")
+    watch_cmd.add_argument("--once", action="store_true",
+                           help="one pass, then exit — for a cron, or a dry run")
 
     # THE MONEY PATH. `OwnerGateway` implements the whole allowance machinery — balances,
     # exhaustion, per-duel ledgers, signed receipts — and until this command existed nothing could
@@ -354,11 +482,27 @@ def main(argv: list[str] | None = None) -> None:
     bucket = r2_bucket(parent)
     chain = BittensorChain(netuid=args.netuid, wallet_name=args.wallet, network=args.network,
                            hotkey=args.owner_hotkey)
+    mailbox = Mailbox(args.state / "mailbox.json", signer, mint)
+    if args.command == "watch":
+        watch(chain, mailbox, bucket.put, netuid=args.netuid, state=args.state / "watch.json",
+              poll_seconds=args.poll_seconds, rotate_after=args.rotate_after_hours * 3600.0,
+              limit=args.max_per_poll, generations=args.max_generations, once=args.once,
+              registered_after=args.registered_after, skip=_own_hotkey(args))
+        return
     try:
-        print(issue(chain, Mailbox(args.state / "mailbox.json", signer, mint),
-                    bucket.put, netuid=args.netuid, hotkey=args.hotkey, key_only=args.key_only))
+        print(issue(chain, mailbox, bucket.put, netuid=args.netuid, hotkey=args.hotkey,
+                    key_only=args.key_only))
     except AccessError as exc:
         sys.exit(f"thirtyspokes-owner: {exc}")
+
+
+def _own_hotkey(args: argparse.Namespace) -> frozenset[str]:
+    """The owner's own hotkey, which has no submission to make and needs no credential."""
+    try:
+        from bittensor_wallet import Wallet          # noqa: PLC0415 — optional at import time
+        return frozenset({Wallet(name=args.wallet, hotkey=args.owner_hotkey).hotkey.ss58_address})
+    except Exception:                                # noqa: BLE001 — a courtesy, not a gate
+        return frozenset()
 
 
 def _no_mint(prefix: str) -> Credential:

@@ -47,7 +47,10 @@ from thirtyspokes.v3.store import (
     build_manifest,
     fetch_manifest,
     fetch_submission,
+    UNCLAIMED_GRACE_SECONDS,
+    delete_prefix,
     inventory,
+    unclaimed_plan,
     promote_submission,
     public_model_prefix,
     retention_plan,
@@ -91,6 +94,10 @@ class FakeS3:
     def __init__(self, name: str = BUCKET) -> None:
         self.name = name
         self.objects: dict[str, tuple[bytes, dict[str, str]]] = {}
+        # When each object was written, and the clock a test moves to age them:
+        # retention asks how long nobody has touched a prefix.
+        self.written: dict[str, float] = {}
+        self.now: float = 0.0
         self.fail_after: int | None = None
         # `fail_next` transient failures before the next transfer succeeds — the retry's case.
         self.fail_next = 0
@@ -104,6 +111,7 @@ class FakeS3:
     def put_object(self, *, Bucket, Key, Body, Metadata=None, ContentType=None) -> None:
         assert Bucket == self.name
         self.objects[Key] = (bytes(Body), dict(Metadata or {}))
+        self.written[Key] = self.now
 
     def get_object(self, *, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[Key][0]),
@@ -117,7 +125,9 @@ class FakeS3:
         keys = sorted(key for key in self.objects if key.startswith(Prefix))
         start = keys.index(ContinuationToken) if ContinuationToken else 0
         page = keys[start:start + self.PAGE]
-        response = {"Contents": [{"Key": key, "Size": len(self.objects[key][0])} for key in page]}
+        response = {"Contents": [{"Key": key, "Size": len(self.objects[key][0]),
+                                  "LastModified": self.written.get(key, 0.0)}
+                                 for key in page]}
         if start + self.PAGE < len(keys):
             response["IsTruncated"] = True
             response["NextContinuationToken"] = keys[start + self.PAGE]
@@ -138,6 +148,7 @@ class FakeS3:
             self.transfers += 1
             self.objects[Key] = (Path(Filename).read_bytes(),
                                  dict((ExtraArgs or {}).get("Metadata", {})))
+        self.written[Key] = self.now
 
     def download_file(self, Bucket, Key, Filename, Config=None) -> None:
         Path(Filename).write_bytes(self.objects[Key][0])
@@ -583,3 +594,40 @@ def test_a_manifest_that_carries_a_name_while_claiming_version_1_is_refused(tmp_
 
     with pytest.raises(StoreError, match="contract"):
         Manifest.from_bytes(json.dumps(tampered).encode())
+
+
+# --- bytes nobody ever committed to ---------------------------------------------------------------
+
+
+def test_an_upload_no_ready_signal_names_is_swept_once_nobody_has_touched_it(tmp_path, bucket):
+    """The gap automatic issuing opens: §8b.7 deletes a JUDGED loser's weights, and an upload that
+    never commits is never judged — no queue holds it, no window sees it, nothing deletes it."""
+    bucket.client.now = 1_000.0
+    submission(tmp_path, bucket)
+    prefix = REGISTRATION.prefix
+
+    assert unclaimed_plan(bucket, committed=(), now=1_000.0 + UNCLAIMED_GRACE_SECONDS - 1) == ()
+    assert unclaimed_plan(bucket, committed=(), now=1_000.0 + UNCLAIMED_GRACE_SECONDS) == (prefix,)
+
+    freed = delete_prefix(bucket, prefix)
+    assert freed > 0 and bucket.list(prefix) == {}, "an unjudged prefix keeps no manifest either"
+
+
+def test_a_submission_the_chain_names_is_never_unclaimed(tmp_path, bucket):
+    """It is a submission, and §8b.7's fortnight is the promise it earned by being judged."""
+    bucket.client.now = 1_000.0
+    submission(tmp_path, bucket)
+
+    assert unclaimed_plan(bucket, committed=[REGISTRATION.registration_id],
+                          now=1_000.0 + 10 * UNCLAIMED_GRACE_SECONDS) == ()
+
+
+def test_an_upload_still_arriving_keeps_resetting_its_own_clock(tmp_path, bucket):
+    """70 GB takes hours to days. A sweep that counted from the FIRST byte would delete a transfer
+    out from under the miner making it."""
+    bucket.client.now = 1_000.0
+    submission(tmp_path, bucket)
+    bucket.client.now = 1_000.0 + UNCLAIMED_GRACE_SECONDS - 5
+    bucket.put(REGISTRATION.prefix + "model-late.safetensors", b"the next shard")
+
+    assert unclaimed_plan(bucket, committed=(), now=1_000.0 + UNCLAIMED_GRACE_SECONDS) == ()

@@ -166,8 +166,10 @@ upload prefix      submissions/3f9c…a12e/
     generation 2: …
 ```
 
-Send the owner the hotkey (the rest they re-derive from the chain — nothing you type can change
-where your credential is scoped to). They run `thirtyspokes-owner issue`, which publishes your
+**On this subnet you do not have to send anything**: the owner runs the credential watcher, so your
+envelope is published within about a minute of your registration finalising, and `submit` polls for it
+by default. Send the owner the hotkey only if it has not appeared (the rest they re-derive from the
+chain — nothing you type can change where your credential is scoped to). They run `thirtyspokes-owner issue`, which publishes your
 envelope on the subnet's public store, `https://store.thirtyspokes.ai` — the tools poll it by
 default. **You don't need anything back from the owner.** Their ed25519 public key is pinned in the
 tools (`config.OWNER_MAILBOX_KEY`, `ae6cea37…3d21`), and `submit` refuses any envelope not signed by

@@ -57,6 +57,7 @@ from thirtyspokes.v3.scaffold import Scaffold
 from thirtyspokes.v3.simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED,
                                       _GraderGuard, learned_router)
 from thirtyspokes.v3.store import (GRACE_SECONDS, MANIFEST_NAME, S3Bucket, build_manifest,
+                                   UNCLAIMED_GRACE_SECONDS,
                                    public_model_prefix, upload_tree)
 import thirtyspokes.v3.store as store_module
 from thirtyspokes.v3.tools import PROTOCOL
@@ -109,12 +110,17 @@ class FakeS3:
 
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, dict[str, str]]] = {}
+        # When each object was written, and the clock a test moves to age them:
+        # retention asks how long nobody has touched a prefix.
+        self.written: dict[str, float] = {}
+        self.now: float = 0.0
         self.readonly = False
 
     def put_object(self, *, Bucket, Key, Body, Metadata=None, ContentType=None) -> None:
         if self.readonly:
             raise ConnectionError("bucket is unreachable")
         self.objects[Key] = (bytes(Body), dict(Metadata or {}))
+        self.written[Key] = self.now
 
     def get_object(self, *, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[Key][0]), "Metadata": dict(self.objects[Key][1])}
@@ -127,7 +133,9 @@ class FakeS3:
         keys = sorted(key for key in self.objects if key.startswith(Prefix))
         start = keys.index(ContinuationToken) if ContinuationToken else 0
         page = keys[start:start + self.PAGE]
-        response = {"Contents": [{"Key": k, "Size": len(self.objects[k][0])} for k in page]}
+        response = {"Contents": [{"Key": k, "Size": len(self.objects[k][0]),
+                                  "LastModified": self.written.get(k, 0.0)}
+                                 for k in page]}
         if start + self.PAGE < len(keys):
             response["IsTruncated"] = True
             response["NextContinuationToken"] = keys[start + self.PAGE]
@@ -141,6 +149,7 @@ class FakeS3:
             raise ConnectionError("bucket is unreachable")
         self.objects[Key] = (Path(Filename).read_bytes(),
                              dict((ExtraArgs or {}).get("Metadata", {})))
+        self.written[Key] = self.now
 
     def download_file(self, Bucket, Key, Filename, Config=None) -> None:
         Path(Filename).write_bytes(self.objects[Key][0])
@@ -2360,8 +2369,9 @@ def test_losing_weights_go_fourteen_days_after_judgment_and_nothing_else_is_touc
     judged_at = 1_000_000.0
     h.validator.now = lambda: judged_at
     assert h.run(1).report.crowned == strong
-    waiting = "submissions/" + "ab" * 32 + "/model.safetensors"      # queued, never judged
-    h.private.client.objects[waiting] = (b"queued", {})
+    # A REAL queued submission: committed on chain, uploaded, and not judged in any window yet.
+    # (A prefix with no commitment is an abandoned upload, and `_sweep_unclaimed` handles that.)
+    waiting = h.enrol("late-arrival", block=20, conductor=router(h))
     before = {hotkey: private_files(h, hotkey) for hotkey in (weak, strong, copy)}
 
     h.validator.now = lambda: judged_at + GRACE_SECONDS - 1
@@ -2373,7 +2383,7 @@ def test_losing_weights_go_fourteen_days_after_judgment_and_nothing_else_is_touc
 
     assert private_files(h, weak) == [MANIFEST_NAME] and private_files(h, copy) == [MANIFEST_NAME]
     assert private_files(h, strong) == before[strong]
-    assert waiting in h.private.client.objects
+    assert len(private_files(h, waiting)) > 1, "a queued submission is never touched"
 
 
 def test_the_daemon_refuses_a_private_models_bucket_that_is_the_public_store(tmp_path):
@@ -2657,3 +2667,26 @@ def test_the_kings_name_survives_a_restart(tmp_path):
 
     assert History(path).crown.model_name == "fast-router"
     assert History(path).reigns[-1]["name"] == "fast-router"
+
+
+def test_an_upload_nobody_committed_to_is_swept_and_a_real_submission_is_not(tmp_path):
+    """Automatic issuing lets any registered hotkey park ~70 GB in the owner's bucket. §8b.7's
+    fortnight only covers uploads that were JUDGED; this covers the ones that never got that far."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    abandoned = "submissions/" + "ab" * 32 + "/model.safetensors"
+    h.private.client.now = 1_000.0
+    h.private.client.objects[abandoned] = (b"bytes nobody committed to", {})
+    h.private.client.written[abandoned] = 1_000.0
+    committed = f"submissions/{committed_of(h, hopeful)}/"
+
+    h.validator.now = lambda: 1_000.0 + UNCLAIMED_GRACE_SECONDS
+    h.validator._apply_retention()
+
+    assert abandoned not in h.private.client.objects, "the abandoned upload is swept"
+    assert any(key.startswith(committed) for key in h.private.client.objects), \
+        "a submission the chain names is never swept, whatever its age"
+
+
+def committed_of(h: Harness, hotkey: str) -> str:
+    return next(c.ready.registration_id for c in h.chain.commitments() if c.hotkey == hotkey)

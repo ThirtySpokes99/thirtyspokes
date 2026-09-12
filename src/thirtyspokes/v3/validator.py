@@ -88,7 +88,7 @@ from .config import (
     RETEST_MAX_USD,
     DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS, EPISODE_CONCURRENCY, EPS,
                      EXCLUDED_REASON, FUTILE_REASON, KING_ZERO_NAME, MAX_DUELS_PER_WINDOW,
-                     MAX_QUEUE_DEPTH, MIN_SLICE_REACHED)
+                     MAX_QUEUE_DEPTH, MIN_SLICE_REACHED, UNCLAIMED_GRACE_SECONDS)
 from .duel import Contender, champion, duel
 from .emissions import KING0, Lineage, emission_weights
 from .funding import KEY_NAME, SealedKey, open_key
@@ -105,7 +105,8 @@ from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
                        _exhausted, _GraderGuard, _pairs, _why, format_window, priced)
 from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, apply_retention,
-                    fetch_manifest, fetch_submission, promote_submission, retention_plan)
+                    delete_prefix, fetch_manifest, fetch_submission, promote_submission,
+                    retention_plan, unclaimed_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
 from .window import Window, WindowError, exclude, schedule, window_path
 from .worker import WorkerError
@@ -2083,6 +2084,40 @@ class Validator:
                                   "next_attempt_at": self._next_attempt_at(attempts)})
 
     def _apply_retention(self) -> None:
+        """§8b.7's two sweeps: a judged loser's weights, and bytes nobody ever committed to."""
+        self._retire_judged()
+        self._sweep_unclaimed()
+
+    def _sweep_unclaimed(self) -> None:
+        """Delete an upload no ready signal ever named, once nobody has touched it for a week.
+
+        THE GAP AUTOMATIC ISSUING OPENS. §8b.7 deletes a judged loser's weights, which presumes
+        every upload is judged; one that never commits never is — no queue holds it, no window sees
+        it, and nothing deletes it. While a credential cost the owner a decision per miner that was
+        a rounding error. With issuing automatic, every registered hotkey can park ~70 GB in the
+        owner's bucket, and 256 uids makes that ~18 TB nobody is accountable for.
+
+        Nothing the chain names is swept, whatever its age: that is a submission, and §8b.7's
+        fortnight is the promise it earned by being judged.
+        """
+        try:
+            committed = {c.ready.registration_id for c in self.chain.commitments()}
+            expired = unclaimed_plan(self.private_models, committed=committed, now=self.now())
+        except Exception as exc:      # noqa: BLE001 — a chain read and a listing; retried next poll
+            self._log(f"retention: could not survey unclaimed uploads "
+                      f"({type(exc).__name__}: {exc})")
+            return
+        for prefix in expired:
+            try:
+                freed = delete_prefix(self.private_models, prefix)
+            except Exception as exc:  # noqa: BLE001 — retried on the next poll
+                self._log(f"retention: could not sweep {prefix} ({exc}); will retry")
+                continue
+            self._log(f"retention: swept {prefix} — {freed} bytes uploaded against a credential and "
+                      f"never committed, untouched for "
+                      f"{int(UNCLAIMED_GRACE_SECONDS // 86_400)} days")
+
+    def _retire_judged(self) -> None:
         """§8b.7: delete a loser's weights 14 days after it was judged, and keep its manifest.
 
         Only JUDGED hotkeys are candidates, so a submission still waiting in the queue is never

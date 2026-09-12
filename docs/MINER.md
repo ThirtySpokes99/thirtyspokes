@@ -269,8 +269,10 @@ rebuilt identically, and the commit happens once.
 
 #### 8. What happens next
 
-You are in the queue in `(commit block, hotkey)` order; six challengers are judged per window and
-the wait is published. When your window runs, the validator downloads your tree, re-hashes every
+You are in the queue in `(commit block, hotkey)` order; three challengers are judged per window
+and the wait is published. `https://store.thirtyspokes.ai/v3/queue.json` lists everyone
+committed and not yet judged, so your position is visible before the window that judges you
+runs — and so is a commit that landed past the queue's depth cap. When your window runs, the validator downloads your tree, re-hashes every
 file against your manifest, admits it, serves it, runs the king's arm and yours on the same slice,
 and publishes the verdict — `final`, the four conditions, per-benchmark deltas, and where your
 allowance ran out if it did — in the window's reveal and on the [dashboard](https://thirtyspokes.ai/dashboard).

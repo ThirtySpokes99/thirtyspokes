@@ -45,6 +45,7 @@ from thirtyspokes.v3.chain import Commitment, MockChain, ReadySignal
 import thirtyspokes.v3.validator as validator_module
 from thirtyspokes.v3.conductor import Conductor, MockConductor
 from thirtyspokes.v3.config import (DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS,
+                                     KING_ZERO_NAME,
                                      EPISODE_CONCURRENCY,
                                      EXCLUDED_REASON,
                                      MAX_DUELS_PER_WINDOW, MAX_QUEUE_DEPTH, FUTILE_REASON)
@@ -2263,7 +2264,8 @@ def test_only_the_crowned_winner_is_ever_public_and_it_is_the_tree_that_was_judg
     assert not any(key.startswith("submissions/") for key in h.client.objects)
     assert private_files(h, weak) and private_files(h, copy)
     record = json.loads(h.store.get(reveal_path(1)))["record"]
-    assert record["promotion"] == {"hotkey": strong, "state": "promoted", "prefix": king}
+    assert record["promotion"] == {"hotkey": strong, "state": "promoted", "prefix": king,
+                                   "superseded": None}
     assert record["crown_model"]["bucket"] == PUBLIC_BUCKET
     assert record["crown_model"]["prefix"] == king
     # Where a miner downloads it: under the base URL, its trailing slash not doubled.
@@ -2523,3 +2525,90 @@ def test_a_rate_limited_write_says_so_in_the_reveal_rather_than_claiming_the_sla
     assert reveal.weights_written is False
     written = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
     assert written["written"] is False and "rate-limited" in written["note"]
+# --- the reign, published rather than inferred ----------------------------------------------------
+
+
+def reign_of(h: Harness, window: int) -> dict:
+    return json.loads(h.store.get(reveal_path(window)))["record"]["reign"]
+
+
+def test_the_first_window_opens_a_named_genesis_reign(tmp_path):
+    """King₀ is a policy, so no miner names it and no manifest carries a name — the subnet does."""
+    h = harness(tmp_path)
+
+    h.run(1)
+
+    reign = reign_of(h, 1)
+    assert reign["number"] == 1 and reign["genesis"] is True
+    assert reign["name"] == KING_ZERO_NAME == "thirtyspokes-genesis"
+    assert reign["since_window"] == 1 and reign["windows"] == 1 and reign["previous"] is None
+
+
+def test_a_coronation_closes_the_reign_before_it_and_says_why(tmp_path):
+    """The question a per-window king cannot answer: did the last reign END, or was it never there."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong
+    reign = reign_of(h, 1)
+    assert reign["number"] == 2 and reign["genesis"] is False and reign["hotkey"] == strong
+    assert reign["since_window"] == 1
+    assert reign["previous"] == {"number": 1, "genesis": True, "hotkey": "",
+                                 "ended_window": 1, "reason": "dethroned"}
+
+
+def test_a_king_that_deregisters_ends_its_reign_as_a_reversion_not_a_dethroning(tmp_path):
+    """§5.5 hands the crown back to King₀ when a king stops resolving. That is not a coronation, and
+    a reader that cannot tell the two apart is reading the pension wrong: nothing was beaten."""
+    h = harness(tmp_path)
+    king = h.crown("king", router(h))
+    h.chain.deregister(king)
+
+    h.run(1)
+
+    reign = reign_of(h, 1)
+    assert reign["genesis"] is True and reign["name"] == KING_ZERO_NAME
+    assert reign["previous"]["hotkey"] == king
+    assert reign["previous"]["reason"] == "deregistered"
+    assert h.validator.history.lineage().coronations == (king,), "a reversion is not a coronation"
+
+
+def test_a_state_file_from_before_reigns_were_recorded_opens_one_at_its_earliest_window(tmp_path):
+    """The live daemon has settled windows and no reign ledger; it must not start at reign 0."""
+    path = tmp_path / "history.json"
+    history = History(path)
+    history.settle(4, crowned=None, judged=[], revealed=[])
+    history.settle(5, crowned=None, judged=[], revealed=[])
+    state = json.loads(path.read_text())
+    del state["reigns"]
+    path.write_text(json.dumps(state))
+
+    restored = History(path)
+
+    assert [r["number"] for r in restored.reigns] == [1]
+    assert restored.reigns[0]["from_window"] == 4 and restored.reigns[0]["genesis"] is True
+
+
+def test_a_pending_crown_passed_over_by_a_later_winner_is_named_in_the_reveal(tmp_path, monkeypatch):
+    """THE STALE-KING CASE. Crown-after-verify means a winner whose copy fails is not on the throne,
+    so the next window's challengers duel the king it beat — and a later winner can take the crown
+    having never faced it. Teutonic re-runs against the new king; a single-validator window cannot
+    without stalling the subnet on a store outage, so the reveal says who was passed over."""
+    h = harness(tmp_path)
+    first = h.enrol("router-b", block=11, conductor=router(h))
+    now = failing_promotions(h, monkeypatch)
+    h.run(1)
+    assert h.validator.history.pending_crown["hotkey"] == first
+
+    h.public.client.readonly = False
+    second = h.enrol("router-c", block=21, conductor=router(h))
+    now[0] += 3_600.0
+    reveal = h.run(2, at_block=CADENCE.opens_at(2))
+
+    assert reveal.report.crowned == second
+    promotion = json.loads(h.store.get(reveal_path(2)))["record"]["promotion"]
+    assert promotion["state"] == "promoted" and promotion["hotkey"] == second
+    assert promotion["superseded"] == {"hotkey": first, "window": 1}
+    assert h.validator.history.pending_crown is None

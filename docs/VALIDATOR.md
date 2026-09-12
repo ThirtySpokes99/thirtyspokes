@@ -375,6 +375,7 @@ nothing; it is never carried to the next window and never published. Three thing
 | `metering[].own_key` | whether the arm ran on the miner's registered key (D18) rather than a credited allowance |
 | `metering[].endpoints` | per model the arm bought live, which endpoint answered (`provider`, or `provider:served_model` when the response named a different model) |
 | `metering[].drift` | the `model@endpoint` pairs a miner-key arm was served by that no arm on YOUR key was served by that window — §11-1's residual made visible; evidence, not a gate |
+| `weights_set` | what the write to the chain did: `written`, the block it was attempted at, how stale the chain says this hotkey's slate is afterwards (`blocks_since_update`), and the refusal if there was one. `weights` above is what was COMPUTED; this is what landed |
 | `crown_model` | where the reigning king's weights are: `bucket`, `prefix`, `manifest_sha256`, and the `url` and `manifest_url` under `--public-model-base-url`; `null` while King₀ reigns |
 | `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `null` when nobody won |
 

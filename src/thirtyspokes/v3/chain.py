@@ -265,6 +265,9 @@ class Chain(Protocol):
     # `last_update` reached 2234 blocks against a cutoff of 5000 (`koth/neuron.py`).
     def set_weights(self, weights: Mapping[int, float], *, force: bool = False) -> None: ...
     def weights_rate_limit(self) -> int: ...
+    # How stale the slate this hotkey has ON CHAIN is, or None if it has never set one. Read
+    # after a write so the reveal can say the slate landed rather than that it was attempted.
+    def blocks_since_weight_update(self) -> int | None: ...
     # §8b.1's chain-side obligation, READ rather than taken on trust. See `read_immunity_period`.
     def immunity_period(self) -> int: ...
 
@@ -510,6 +513,9 @@ class MockChain:
 
     def weights_rate_limit(self) -> int:
         return self.rate_limit
+
+    def blocks_since_weight_update(self) -> int | None:
+        return None if self.weights_set_at is None else self.block - self.weights_set_at
 
     def immunity_period(self) -> int:
         return self.immunity
@@ -774,6 +780,10 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
 
     def weights_rate_limit(self) -> int:
         return read_weights_rate_limit(self._storage, self.netuid)
+
+    def blocks_since_weight_update(self) -> int | None:
+        uid = self._uid()
+        return None if uid is None else self._blocks_since_update(uid)
 
     def immunity_period(self) -> int:
         return read_immunity_period(self._storage, self.netuid)

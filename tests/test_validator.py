@@ -2475,3 +2475,51 @@ def test_the_queue_is_a_courtesy_and_a_store_outage_never_takes_the_window_down(
     h.client.readonly = False
     h.validator._publish_queue(h.chain.block, 1)
     assert len(queue_record(h)["entries"]) == 1, "the next poll publishes what the outage lost"
+# --- the weights: what the chain actually did with them -------------------------------------------
+
+
+def test_a_chain_that_refuses_the_weights_does_not_take_the_window_with_it(tmp_path):
+    """§8 step 5 persists the verdicts, writes the weights, then publishes. A write that RAISED took
+    the publish with it: the window was settled but its reveal only reached readers when the next
+    poll re-published it. On netuid 99 that happened 21 times in two days over a stale nonce."""
+    h = harness(tmp_path)
+    h.enrol("hopeful", block=10, conductor=router(h))
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("set_weights was not included: the extrinsic nonce is below the account's")
+
+    h.chain.set_weights = refuse
+
+    reveal = h.run(1)
+
+    assert reveal.weights_written is False
+    assert reveal_path(1) in h.client.objects, "the window's record must not wait on the chain"
+    written = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
+    assert written["written"] is False and "RuntimeError" in written["note"]
+    assert h.validator.history.completed(1), "the verdicts stand either way"
+
+
+def test_a_written_slate_is_published_with_what_the_chain_says_about_it(tmp_path):
+    """Included is not landed. The reveal claims the slate is on chain only when the chain agrees."""
+    h = harness(tmp_path)
+
+    reveal = h.run(1)
+
+    assert reveal.weights_written is True
+    written = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
+    assert written["written"] is True and written["note"] is None
+    assert written["blocks_since_update"] == 0
+    assert written["block"] == h.chain.block
+
+
+def test_a_rate_limited_write_says_so_in_the_reveal_rather_than_claiming_the_slate(tmp_path):
+    h = harness(tmp_path)
+    # A write at the block this window runs at: inside MockChain's 100-block limit. Set against
+    # the window's own block, not the harness's current one — `run` moves the chain first.
+    h.chain.weights_set_at = CADENCE.opens_at(1)
+
+    reveal = h.run(1)
+
+    assert reveal.weights_written is False
+    written = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
+    assert written["written"] is False and "rate-limited" in written["note"]

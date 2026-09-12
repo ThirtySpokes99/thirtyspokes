@@ -385,6 +385,21 @@ outside the trust boundary — the worst a tampered pointer can do is name a win
 fails its own signature check.
 """
 
+QUEUE_PATH = "v3/queue.json"
+"""Who has committed and has not been judged yet — the one thing the reveals cannot say in time.
+
+A REVEAL IS WRITTEN WHEN A WINDOW SETTLES, AND A WINDOW IS HOURS LONG. A challenger that commits
+after its window opened appears in no published file until that window ends, so a miner watching the
+dashboard cannot tell a queue that is working from one that is broken, and neither can the owner.
+Measured on netuid 99 on 2026-09-12: a submission committed at block 9046218 was invisible for the
+~4 h until window 6 settled, which is the whole of a miner's first impression of the subnet.
+
+The chain has held the answer the entire time (`CommitmentOf`), so this is the validator's signed
+copy of a public fact, published for readers that cannot query the chain. It is a COURTESY, never a
+gate: nothing here is read back, a failure to publish it is logged and forgotten, and every claim a
+reader acts on still comes from a signed reveal.
+"""
+
 
 @dataclass(frozen=True)
 class ArmAudit:
@@ -883,6 +898,8 @@ class Validator:
         self._entries = {entry["epoch"]: entry for entry in entries}
         self.manifest = holdout_feed.manifest(entries)
         self._last_weight_block: int | None = None
+        # What the published queue last said, so an unchanged queue is not rewritten every poll.
+        self._queue_published: str | None = None
         self._preflighted = False
         # `(window, arm) -> attempts made in THIS process`. Only the gateway's ledger identity needs
         # it; the money it protects is on disk in the checkpoint, which is what makes a retry cheap.
@@ -1003,6 +1020,7 @@ class Validator:
         self._apply_retention()
         block = self.chain.current_block()
         window = self.cadence.window_at(block)
+        self._publish_queue(block, window)
         if window is None or self.history.completed(window):
             if window is not None and not self.history.published(window):
                 # A crash between §8's second and third steps. Re-doing the CHEAP half is the whole
@@ -1055,6 +1073,8 @@ class Validator:
         # report who rolled over. §5.5's reversion is resolved on the same metagraph read.
         notes: dict[str, str] = {}              # D18: why a registered key could not fund an arm
         queue, turned_away = self._queue(metagraph, window, notes)
+        # Again at window open: `step` publishes between windows, and a window is hours long.
+        self._publish_queue(metagraph.block, window)
         # Every queued hotkey's registration, for §8b.7's retention: taken from the whole queue
         # here because two of `_publish`'s callers pass it no `queued` mapping at all.
         registrations = {entry.hotkey: entry.registration.registration_id for entry in queue}
@@ -1992,6 +2012,50 @@ class Validator:
             self._log(f"retention: deleted {freed} bytes of weights under {prefix}; its manifest "
                       f"is kept")
         self.history.save()
+
+    def _queue_entries(self) -> list[dict]:
+        """The committed-and-unjudged, in the order §8b.1 drains them.
+
+        The same first filter `_queue` applies and for the same reason: `CommitmentOf` survives
+        forever, so every hotkey ever judged is still committed and still visible, and listing them
+        would grow this file without bound while saying nothing — their record is the duel history.
+
+        Position is (commit_block, hotkey) — the order a window takes them in — and the entries past
+        `MAX_QUEUE_DEPTH` are marked rather than dropped, because being over the cap is exactly what
+        a miner needs to know before spending a registration on a slot that will be refused.
+        """
+        pending = sorted((c for c in self.chain.commitments()
+                          if c.hotkey not in self.history.judged),
+                         key=lambda c: (c.block, c.hotkey))
+        return [{"position": position,
+                 "hotkey": commitment.hotkey,
+                 "commit_block": commitment.block,
+                 "registration_id": commitment.ready.registration_id,
+                 "manifest_sha256": commitment.ready.manifest_sha256,
+                 "state": "queued" if position <= MAX_QUEUE_DEPTH else "over the depth cap"}
+                for position, commitment in enumerate(pending, start=1)]
+
+    def _publish_queue(self, block: int, window: int | None) -> None:
+        """Publish the queue when it changes. Never raises: the loop does not depend on it."""
+        try:
+            entries = self._queue_entries()
+        except Exception as exc:          # noqa: BLE001 — a chain read; the window matters more
+            self._log(f"queue not published ({type(exc).__name__}: {exc}); will retry")
+            return
+        fingerprint = json.dumps(entries, sort_keys=True)
+        if fingerprint == self._queue_published:
+            return
+        body = {"v": 1, "block": int(block), "window": None if window is None else int(window),
+                "depth_cap": MAX_QUEUE_DEPTH, "duels_per_window": MAX_DUELS_PER_WINDOW,
+                "entries": entries}
+        envelope = {"record": body, "sig": self.owner.sign(signing.canonical(body))}
+        try:
+            self.store.put(QUEUE_PATH, signing.canonical(envelope),
+                           content_type="application/json")
+        except Exception as exc:          # noqa: BLE001 — a courtesy file, never a gate
+            self._log(f"queue not published ({exc}); will retry")
+            return
+        self._queue_published = fingerprint
 
     def _local_reveal(self, window: int) -> Path:
         return self.root / "reveals" / f"{int(window)}.json"

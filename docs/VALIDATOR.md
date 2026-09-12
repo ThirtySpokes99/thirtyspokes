@@ -288,7 +288,7 @@ other challengers' artifacts, which D14 makes public only for the king").
 
 | Bucket | Flag | Visibility | Holds |
 | --- | --- | --- | --- |
-| store | `--r2-bucket` | Public — the domain miners poll | window files, reveals, `v3/latest.json`, credential envelopes |
+| store | `--r2-bucket` | Public — the domain miners poll | window files, reveals, `v3/latest.json`, `v3/queue.json`, credential envelopes |
 | private models | `--r2-private-model-bucket` | **Private** — no custom domain, `r2.dev` off | every submission (`submissions/<registration_id>/`) and its sealed OpenRouter key |
 | public models | `--r2-public-model-bucket` | Public | winners only, content-addressed at `models/sha256/<manifest digest>/`, never deleted |
 
@@ -333,6 +333,15 @@ change, and it is not what keeps a published king honest here — publishing fro
 tree is.
 
 ## 4. What is published, and what to watch
+
+**`v3/queue.json` — who is waiting, before any window has judged them.** A reveal is written when a
+window SETTLES, so between a miner committing and their window ending — hours — nothing published
+said the subnet had seen them; measured on netuid 99 on 2026-09-12, a submission committed at block
+9046218 was invisible for about four hours. The daemon now republishes the committed-and-unjudged
+hotkeys, in `(commit block, hotkey)` order and with anything past `MAX_QUEUE_DEPTH` marked, whenever
+that list changes. Owner-signed like a reveal, and a courtesy rather than a gate: nothing reads it
+back, and a store outage only logs.
+
 
 Every window publishes the verdict and its diagnostics, because a crown decided by something other
 than routing must be visible rather than inferred (§5.8):

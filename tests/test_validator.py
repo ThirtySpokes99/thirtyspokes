@@ -61,7 +61,8 @@ import thirtyspokes.v3.store as store_module
 from thirtyspokes.v3.tools import PROTOCOL
 from thirtyspokes.v3.types import Catalog, CatalogEntry, EpisodeResult, TaskSpec
 from thirtyspokes.v3.window import task_order
-from thirtyspokes.v3.validator import (Cadence, Checkpoint, Crown, History, Owner, Validator,
+from thirtyspokes.v3.validator import (Cadence, Checkpoint, Crown, History, Owner, QUEUE_PATH,
+                                        Validator,
                                         ValidatorError, WindowUnavailable, chain_beacon,
                                         check_launch, format_reveal, reveal_path, served_name,
                                         LATEST_PATH)
@@ -2401,3 +2402,76 @@ def test_a_deferred_crown_and_the_retention_clock_survive_a_restart(tmp_path):
     assert restored.judged_at == {"5Cwin": {"registration_id": "ab" * 32, "at": 1_000.0},
                                   "5Close": {"registration_id": "12" * 32, "at": 1_000.0}}
     assert restored.purged == {"12" * 32}
+
+
+# --- the queue, published so a committed challenger is visible before its window ------------------
+
+
+def queue_record(h: Harness) -> dict:
+    envelope = json.loads(h.store.get(QUEUE_PATH))
+    assert signing.verify(h.owner_signer.public_hex, signing.canonical(envelope["record"]),
+                          envelope["sig"]), "the queue must carry the owner's signature"
+    return envelope["record"]
+
+
+def test_a_committed_challenger_is_published_before_the_window_that_judges_it(tmp_path):
+    """THE GAP THIS FILE CLOSES. A reveal is written when a window SETTLES, so between committing and
+    being judged — hours — a miner had no published evidence the subnet had seen them at all."""
+    h = harness(tmp_path)
+    first = h.enrol("router-a", block=10, conductor=router(h))
+    second = h.enrol("router-b", block=11, conductor=router(h))
+
+    h.validator._publish_queue(h.chain.block, 1)
+
+    record = queue_record(h)
+    assert [e["hotkey"] for e in record["entries"]] == [first, second]
+    assert [e["position"] for e in record["entries"]] == [1, 2]
+    assert {e["state"] for e in record["entries"]} == {"queued"}
+    assert record["depth_cap"] == MAX_QUEUE_DEPTH and record["duels_per_window"] == MAX_DUELS_PER_WINDOW
+    assert all(e["commit_block"] and e["registration_id"] and e["manifest_sha256"]
+               for e in record["entries"])
+
+
+def test_a_judged_hotkey_leaves_the_queue_and_an_unchanged_queue_is_not_rewritten(tmp_path):
+    """`CommitmentOf` survives forever, so without the filter the file grows without bound and says
+    nothing; and a file rewritten every poll is a PUT a minute for a queue nobody joined."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    h.validator._publish_queue(h.chain.block, 1)
+    published = h.client.objects[QUEUE_PATH]
+
+    h.validator._publish_queue(h.chain.block + 50, 1)
+    assert h.client.objects[QUEUE_PATH] == published, "an unchanged queue must not be republished"
+
+    h.run(1)
+    assert hopeful in h.validator.history.judged
+    h.validator._publish_queue(h.chain.block, 2)
+
+    assert queue_record(h)["entries"] == []
+
+
+def test_a_commit_beyond_the_depth_cap_is_published_as_over_the_cap(tmp_path):
+    """§8b.1 refuses it at the door, so a miner must be able to see the door is shut BEFORE paying a
+    registration for a slot the window will turn away."""
+    h = harness(tmp_path)
+    for index in range(MAX_QUEUE_DEPTH + 1):
+        h.enrol(f"hopeful-{index}", block=10 + index, conductor=router(h))
+
+    h.validator._publish_queue(h.chain.block, 1)
+
+    states = [e["state"] for e in queue_record(h)["entries"]]
+    assert states.count("queued") == MAX_QUEUE_DEPTH
+    assert states[-1] == "over the depth cap"
+
+
+def test_the_queue_is_a_courtesy_and_a_store_outage_never_takes_the_window_down(tmp_path):
+    h = harness(tmp_path)
+    h.enrol("hopeful", block=10, conductor=router(h))
+    h.client.readonly = True
+
+    h.validator._publish_queue(h.chain.block, 1)          # must not raise
+    assert QUEUE_PATH not in h.client.objects
+
+    h.client.readonly = False
+    h.validator._publish_queue(h.chain.block, 1)
+    assert len(queue_record(h)["entries"]) == 1, "the next poll publishes what the outage lost"

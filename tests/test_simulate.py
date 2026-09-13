@@ -478,17 +478,24 @@ def test_a_verdict_decided_by_funding_is_visible_in_the_reveal(tmp_path):
 # --- §5.2 / §8 step 4: the verdict and batch coronation -------------------------------------------
 
 
-def test_the_crown_goes_to_the_largest_delta_winner_of_the_window(simulation):
-    """Batch coronation: both routers beat King₀, and the better one takes it (§8 step 4)."""
+def test_two_winners_are_crowned_in_commit_order_and_the_later_must_clear_the_earlier(simulation):
+    """Succession (§5.2, §8 step 4): both routers beat King₀. The earlier commit takes the crown first
+    and the later one takes it only by clearing that incumbent on the identical slice — and the
+    rematch that decided it is published on its row."""
     first = simulation[0]
-    a, b = duelled(first, "router-a").verdict, duelled(first, "router-b").verdict
-    assert a.challenger_wins and b.challenger_wins
-    assert b.delta > a.delta
+    a, b = duelled(first, "router-a"), duelled(first, "router-b")
+    assert a.verdict.challenger_wins and b.verdict.challenger_wins
+    early, late = sorted((a, b), key=lambda o: (o.commit_block, o.hotkey))
+    assert early.rematch is None
+    assert late.rematch is not None and late.rematch.incumbent == early.hotkey
+    assert first.crowned == (late.hotkey if late.rematch.clears else early.hotkey)
     assert first.crowned == "router-b"
+    assert f"rematch against {early.hotkey} (committed earlier)" in format_window(first)
 
 
 def test_a_coronation_tie_breaks_on_the_earliest_commit_block(tmp_path):
-    """Two identical policies produce identical deltas; seniority decides, not dict order."""
+    """Two identical policies produce identical deltas, and the later one's rematch against the
+    earlier ties — a tie is not a clear (D14, applied to the queue), so seniority keeps the crown."""
     validator, tree = build(tmp_path)
     late = submission(validator, "aaa-late", 99, router(validator), tree)
     early = submission(validator, "zzz-early", 7, router(validator), tree)
@@ -497,6 +504,8 @@ def test_a_coronation_tie_breaks_on_the_earliest_commit_block(tmp_path):
 
     assert duelled(report, "aaa-late").verdict.delta == duelled(report, "zzz-early").verdict.delta
     assert report.crowned == "zzz-early"
+    assert duelled(report, "aaa-late").rematch.incumbent == "zzz-early"
+    assert not duelled(report, "aaa-late").rematch.clears
 
 
 def test_a_copy_of_the_king_ties_and_the_crown_does_not_move(tmp_path):

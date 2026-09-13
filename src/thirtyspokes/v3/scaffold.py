@@ -378,12 +378,13 @@ class Scaffold:
         recorded per task, still legible in the reveal (§5.8), and the real hard stop is still the
         miner's own key, which OpenRouter enforces.
 
-        THE CALLER STILL OWES ONE THING (§8b.2, last paragraph): if the truncated arm is the KING's,
-        §5.2a makes the zeroed tail shared by every duel in the window, so the owner's own slowness
-        would decide all of them at once. Such a window is to be treated as the power gate treats a
-        dead window — no duels, no shot spent — rather than scored. The scaffold makes that
-        detectable and does not decide it: the check is
-        `any(e.result.stopped_reason == DUEL_WALL_CLOCK_REASON for e in king_episodes)`.
+        WHAT THE CALLER DOES WITH THE TAIL (§8b.2). The zero on an abandoned task is a placeholder,
+        not a score: `window.exclude` drops every `DUEL_WALL_CLOCK_REASON` row from both arms of the
+        duel it belongs to, because a task the arm never reached is a fact about the clock and not
+        about routing. The scaffold makes the tail detectable and does not decide what it is worth;
+        `simulate.adjudicate` withholds the crown from an arm that answered under
+        `MIN_SLICE_REACHED` of its slice, and `simulate._king_too_thin` refuses to price any verdict
+        against a king arm the clock cut that far.
         """
         remaining = budget_usd
         deadline = self.clock() + DUEL_WALL_CLOCK_SECONDS

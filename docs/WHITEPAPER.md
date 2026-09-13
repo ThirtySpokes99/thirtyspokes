@@ -389,7 +389,15 @@ All three run on `final` (§5.1b), so a challenger must be broadly better *at it
 broadly more accurate. Conditions 2 and 3 are gated at zero rather than at `eps`, for the reason
 §5.2b gives: `eps` is the anti-noise margin on the headline comparison, and requiring it on every
 subset as well would silently multiply the bar and refuse challengers for being merely broad.
-Remaining ties break on **earliest commit block**.
+
+**Several winners in one window are crowned in commit order** (§8 step 4). The earliest-committed
+challenger that beat the king takes the crown first; each later winner must then beat *that*
+incumbent under the same three conditions — its own arm against the incumbent's, paired on the
+identical slice — or the crown stays where it is. Every such rematch is published. Seniority is
+therefore worth `eps`: a later submission only marginally better than an earlier one (a near-copy
+with a small edge, or an honest convergence) cannot displace it. That is §5.2b's economic anti-copy
+rule, which already keeps a near-copy of the *king* off the throne, extended from the king to the
+queue.
 
 **Condition 3 was added after conditions 1–2 were measured and found not to bind** (§5.3 below:
 leave-one-out alone crowns a challenger that wins two benchmarks of twelve and is byte-identical on
@@ -420,14 +428,14 @@ thing with fresh noise.
 That is a bug, not merely waste. Suppose challengers A and B both duel the king on window 7. Re-run
 per duel, A is compared against king-run-1 and B against king-run-2. Run-to-run variance then makes
 the two comparisons *inconsistent*: B can be genuinely better than A yet lose while A wins, purely
-because king-run-2 came out higher. Batch coronation (§5.2) already picks a champion by comparing
-challengers to each other — and that comparison is only meaningful if they faced the identical
-baseline.
+because king-run-2 came out higher. Commit-order succession (§5.2) goes further and compares a
+later winner against an earlier one — and both comparisons are only meaningful if every arm ran the
+identical slice against the identical baseline.
 
 **So: one king arm per window, reused by every duel in it.** Three consequences, all good:
 
-* **Window-internal consistency.** All challengers are ranked against one number, so the champion
-  selection is well defined.
+* **Window-internal consistency.** Every challenger is judged against one king measurement, and a
+  rematch pairs two arms that ran the identical slice, so the succession is well defined.
 * **The griefing vector closes.** With per-duel re-runs, an attacker spends one allowance to burn one
   of the king's — near 1:1, cheap for a rival who wants the crown. Batched, the king pays once per
   window no matter how many challenge, so the ratio becomes N:1 against the attacker, who is also
@@ -1002,7 +1010,9 @@ enter has no competition to ossify.
      the §1.1 admission checks (architecture, tokenizer, tensor inventory, safetensors, dtype)
    - run king and challenger over the identical slice, in parallel, each on its own key
    - apply the three-condition verdict (§5.2)
-4. Highest-capture winner takes the crown; ties break on earliest commit block.
+4. Winners are crowned in `(commit_block, hotkey)` order: the first takes the crown, and each later
+   winner takes it only by clearing the incumbent under §5.2 on the identical slice. Every rematch
+   is published.
 5. Persist history → set weights → publish the reveal (slice, per-benchmark deltas, catalog,
    spend). Persist before setting weights: re-judging after a crash is not idempotent under the
    one-shot rule.
@@ -1047,7 +1057,7 @@ is a denial-of-service on the validator and a drain on the king's allowance.
 |---|---|
 | per-Conductor-call token cap | truncate; unparseable output counts as a parse failure |
 | per-episode wall clock | abandon the episode, score the task 0 for that arm |
-| per-duel wall clock | abandon remaining tasks, score them 0 for that arm |
+| per-duel wall clock | abandon remaining tasks; drop them from **both** arms of that duel and publish the count |
 | model load timeout / OOM | submission is **invalid**, shot spent, king not charged |
 
 The load check runs **before** the king's arm is touched, so a broken challenger never costs the
@@ -1061,14 +1071,30 @@ already running may overrun it by up to the per-episode clock; the honest bound 
 therefore duel + episode, and the per-duel clock must exceed the per-episode one or the arm is
 abandoned before its first episode could ever time out.
 
-Abandoned tasks score 0 **and say why**: they carry a `stopped_reason` of their own, distinct from
-the per-episode clock's. §5.8 requires a verdict decided by something other than routing to be
-visible in the reveal rather than buried in an aggregate, and one reason string for both clocks would
-render a pathological model and an overrunning validator as the same row. One case deserves naming:
-if the **king's** arm hits the clock, §5.2a means the zeroed tail is shared by every duel in that
-window, so the owner's own slowness would decide all of them at once — a window whose king arm was
-truncated should be treated as the power gate treats a dead window (no duels, no shot spent) rather
-than scored.
+Abandoned tasks **leave the comparison and say why**. They carry a `stopped_reason` of their own,
+distinct from the per-episode clock's, and they are dropped from **both** arms of the duel rather
+than scored 0 for the arm that ran out: a task an arm never reached is a fact about the clock, not
+about routing. Scoring it 0 would decide the duel on a tail the arm was never allowed to attempt, and a slow
+challenger could lose that way to a king it beats on every task it answered.
+§5.8 still requires the cut to be visible, so every duel publishes how many tasks the clock took
+from each arm.
+
+Three rules keep the clock from becoming a way out of the slice:
+
+* **The drop is per duel, never window-wide.** A slow arm shrinks only its own comparison; a
+  window-wide drop would let one deliberately stalling challenger thin every other duel in the
+  window.
+* **Participation still gates the crown.** An arm that answered fewer than `MIN_SLICE_REACHED`
+  (half) of its slice inside the clock is scored and published but may not take the throne — the
+  same floor that stops an unfunded arm winning by buying nothing.
+* **A king arm below that floor prices nothing.** Its tail would leave every duel and what remains
+  is too thin to call a comparison, so the window is treated as the power gate treats a dead one:
+  no duels, no shot spent. A **miner** king in that state also loses the reign and the crown
+  reverts to King₀ (§5.5), because a king too slow to answer its own slice would otherwise make
+  every window unscoreable and keep the throne forever.
+
+A per-episode timeout is different in kind — a model stalling on a task it started — and still
+scores 0.
 
 ### 8b.3 Worker failures are data; grader failures are not
 
@@ -1351,7 +1377,7 @@ precomputed matrix and free held-out scoring · `ARENA_LADDER` and `entry_outcom
 MiniLM encoder and `EMBED_DIM` · the 50K/2M param caps · `sv::` · `verify.grounding_check`.
 
 Kept: one-shot hotkeys · hotkey-salted commit binding · paired duels with eps + LCB · the power
-gate · batch coronation with earliest-commit tiebreak · the chained manifest · `arena.by_category`
+gate · commit-order succession · the chained manifest · `arena.by_category`
 and `corpus.category_freshness` · King₀ burn.
 
 **ROUTING_MEASUREMENTS §17 no longer constrains the product.** It measured singular-value
@@ -1403,8 +1429,9 @@ not a limit on a generative Conductor, and its own limits section says so.
 2. ~~**Griefing the king.**~~ **RESOLVED by D13 (§5.2a).** The king's arm is computed once per window
    and reused by every duel in it, so the king pays once per window however many challenge and the
    attacker's ratio falls from ~1:1 to N:1 — while they also pay a registration burn on top. This was
-   adopted for **correctness** rather than for cost: every challenger in a window must be ranked
-   against the *same* baseline, or champion selection compares against different measurements.
+   adopted for **correctness** rather than for cost: every challenger in a window must be judged
+   against the *same* baseline, or the commit-order succession (§5.2) compares against different
+   measurements.
 3. ~~**Derivative submissions.**~~ **RESOLVED — derivatives are allowed, and the mechanism already
    prices them.** The original worry was "a copy ties and loses, but a copy + ε wins," which was
    written when `eps` was 0.02 on a *ratio* scale. Under D10 `eps = 0.05` on the accuracy scale, and

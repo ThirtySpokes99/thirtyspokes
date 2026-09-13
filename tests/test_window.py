@@ -426,6 +426,32 @@ def test_exclusions_are_counted_and_reasoned_so_the_reveal_can_publish_them():
     assert len(arms.king) == len(ids) - 3
 
 
+def test_a_task_the_per_duel_clock_took_from_either_arm_leaves_both_arms():
+    """§8b.2. A task an arm never reached is a fact about the clock, not about routing, so it leaves
+    the duel on both sides — whichever arm the clock stopped — and the reason says which. A task an
+    episode stalled on to its OWN clock is the model's doing and stays in the score."""
+    from thirtyspokes.v3.config import DUEL_WALL_CLOCK_REASON
+
+    def stopped(results, reasons):
+        return tuple(EpisodeResult(task_id=r.task_id, benchmark=r.benchmark, steps=(),
+                                   graded_score=0.0 if r.task_id in reasons else r.graded_score,
+                                   spend_usd=r.spend_usd,
+                                   stopped_reason=reasons.get(r.task_id, r.stopped_reason))
+                     for r in results)
+
+    ids = [f"t{i}" for i in range(6)]
+    king = stopped(episodes(ids), {"t5": DUEL_WALL_CLOCK_REASON})
+    challenger = stopped(episodes(ids, score=0.5), {"t4": DUEL_WALL_CLOCK_REASON,
+                                                     "t5": DUEL_WALL_CLOCK_REASON,
+                                                     "t1": "wall_clock"})
+    arms = win.exclude(king, challenger, failed=["t0"])
+
+    assert [r.task_id for r in arms.king] == [r.task_id for r in arms.challenger] == ["t1", "t2", "t3"]
+    assert dict(arms.excluded) == {"t0": "grader", "t4": "duel wall clock (challenger)",
+                                   "t5": "duel wall clock (king)"}
+    assert arms.challenger[0].stopped_reason == "wall_clock"
+
+
 def test_a_duplicated_task_is_refused_rather_than_mispaired():
     """A repeated task ID makes positional pairing ambiguous, and the wrong pairing is invisible in
     every downstream number — so it stops the duel here instead."""

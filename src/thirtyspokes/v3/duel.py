@@ -182,7 +182,7 @@ be borrowed from this repo's single-turn measurements; production reference arms
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import comb
 from typing import Protocol
@@ -523,29 +523,73 @@ def duel(pairs: Sequence[BenchmarkPair], final_b: FinalB, *, eps: float = EPS,
 
 @dataclass(frozen=True)
 class Contender:
-    """A queued challenger and its verdict, for batch coronation."""
+    """A queued challenger that may take the crown, and its verdict against the window's king."""
 
     hotkey: str
     commit_block: int
     verdict: DuelVerdict
 
 
-def champion(contenders: Sequence[Contender]) -> Contender | None:
-    """The window's crown: the largest paired delta among the challengers that WON (§8 step 4).
+@dataclass(frozen=True)
+class Rematch:
+    """A later winner judged against the challenger that held the crown before it (§5.2, §8 step 4).
 
-    **Ties break on earliest commit block**, then hotkey — exactly the `(commit_block, hotkey)`
-    order the queue is evaluated in (§8b.1), so the tiebreak is a total order and the reveal is
-    reproducible rather than dependent on the order results happened to land in.
-
-    This selection is only meaningful because every duel in a window ran against ONE king arm
-    (§5.2a, D13): re-running the king per challenger would compare A against king-run-1 and B
-    against king-run-2, and run-to-run variance could then crown the worse of the two.
-
-    A near-copy of the king never reaches here: it ties, ties fail the strict `eps` beat, and the
-    crown stays where it is. That converts anti-copy from a detection problem (measurement 11 found
-    copier agreement and honest convergence to be the same signal) into an economic one.
+    `verdict` is the later arm against the INCUMBENT's arm, paired on the identical slice. None means
+    the pair could not be priced at all — the per-duel clock left too little of the slice both arms
+    answered (§8b.2) — and a rematch that cannot be priced cannot be won.
     """
-    winners = [c for c in contenders if c.verdict.challenger_wins]
-    if not winners:
-        return None
-    return min(winners, key=lambda c: (-c.verdict.delta, c.commit_block, c.hotkey))
+
+    challenger: str
+    incumbent: str
+    verdict: DuelVerdict | None
+
+    @property
+    def clears(self) -> bool:
+        return self.verdict is not None and self.verdict.challenger_wins
+
+
+@dataclass(frozen=True)
+class Succession:
+    """Who a window crowns, and every rematch that decided it — published, never re-derived."""
+
+    crowned: Contender | None
+    rematches: tuple[Rematch, ...] = ()
+
+
+def succession(contenders: Sequence[Contender],
+               rematch: Callable[[Contender, Contender], DuelVerdict | None]) -> Succession:
+    """The window's crown, placed in COMMIT ORDER (§5.2, §8 step 4).
+
+    Winners are taken in `(commit_block, hotkey)` order — the order the queue is evaluated in
+    (§8b.1). The earliest challenger that beat the king takes the crown first. Every later one that
+    also beat the king must then beat THAT incumbent — under the same three conditions, on the
+    identical slice, through `rematch(incumbent, challenger)` — or the crown stays where it is.
+
+    WHY SENIORITY IS WORTH `eps`. Under "largest delta over the king wins", a submission committed
+    later takes the throne from one committed earlier by any margin at all, including one inside the
+    noise the strict `eps` beat exists to refuse. A near-copy of the KING never wins, because it
+    ties and ties fail the beat; a near-copy of the FIRST WINNER, or an honest convergence on it,
+    would. Commit order extends D14's economic anti-copy rule from the king to the queue: a later
+    submission has to add real points over what came before it, not over what the king did.
+
+    THE CHOICE IS STILL WELL DEFINED, which is what one king arm per window was for (§5.2a, D13).
+    Every challenger faced the one king arm the window ran, and a rematch pairs two arms that ran the
+    identical slice against the identical outcome table — no arm is re-run, so no run-to-run
+    variance enters the choice between them.
+
+    A contender that did not beat the king is never crowned, whatever it would do in a rematch: the
+    throne is defended by the king, and the queue only decides the order in which beating it counts.
+    """
+    reigning: Contender | None = None
+    rematches: list[Rematch] = []
+    for contender in sorted(contenders, key=lambda c: (c.commit_block, c.hotkey)):
+        if not contender.verdict.challenger_wins:
+            continue
+        if reigning is None:
+            reigning = contender
+            continue
+        record = Rematch(contender.hotkey, reigning.hotkey, rematch(reigning, contender))
+        rematches.append(record)
+        if record.clears:
+            reigning = contender
+    return Succession(reigning, tuple(rematches))

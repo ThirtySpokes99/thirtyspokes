@@ -68,7 +68,7 @@ from ..gateway import signing
 from ..koth import holdout_feed
 from ..koth.corpus import category_freshness
 from ..koth.reference import open_envelope
-from .config import MAX_CONDUCTOR_TOKENS, MAX_STEPS, TEMPERATURE
+from .config import DUEL_WALL_CLOCK_REASON, MAX_CONDUCTOR_TOKENS, MAX_STEPS, TEMPERATURE
 from .pool import freeze, thaw
 from .scaffold import task_order
 from .types import Catalog, EpisodeResult, TaskSpec
@@ -363,6 +363,16 @@ def exclude(king: Sequence[EpisodeResult], challenger: Sequence[EpisodeResult],
     by a different route (a crashed arm rather than a named grader failure), and it is the one this
     rule would miss if `failed` were the only input.
 
+    A task either arm never REACHED before its per-duel wall clock ran out leaves both as well
+    (§8b.2). That is a fact about the clock, not about routing: scoring it zero for the arm that ran
+    out would decide the duel on a tail the arm was never allowed to attempt, and a slow challenger
+    could lose that way to a king it beats on every task it answered. The drop is PER DUEL, never
+    window-wide, because this function is called once per pair: a deliberately slow
+    challenger can shrink only its own comparison, not every other duel in the window. The per-
+    EPISODE clock is not this — `wall_clock` is a model stalling on a task it started, and it is
+    still scored. The participation floor that stops the clock becoming a way out of the slice is
+    the caller's (`simulate.adjudicate`).
+
     Output is row-aligned in the king's order, which is the window's pinned order: `duel
     .BenchmarkPair` pairs positionally, so alignment here is what its length check has to find.
     """
@@ -377,6 +387,13 @@ def exclude(king: Sequence[EpisodeResult], challenger: Sequence[EpisodeResult],
     for task_id in by_challenger:
         if task_id not in by_king:
             dropped.setdefault(task_id, "missing from king arm")
+
+    for task_id, result in by_king.items():
+        if result.stopped_reason == DUEL_WALL_CLOCK_REASON:
+            dropped.setdefault(task_id, "duel wall clock (king)")
+    for task_id, result in by_challenger.items():
+        if result.stopped_reason == DUEL_WALL_CLOCK_REASON:
+            dropped.setdefault(task_id, "duel wall clock (challenger)")
 
     kept = [task_id for task_id in by_king if task_id not in dropped]
     return Paired(king=tuple(by_king[task_id] for task_id in kept),

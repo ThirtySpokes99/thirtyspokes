@@ -1053,43 +1053,71 @@ def test_one_challengers_bad_number_kills_the_window_and_costs_that_challenger_n
         v.run_window(2, [victim, attacker])
 
 
-def test_a_king_arm_the_validators_own_clock_truncated_still_decides_every_duel(tmp_path):
-    """**A FINDING.** §8b.2 names the obligation and no caller discharges it.
-
-    "If the KING's arm hits the clock, §5.2a means the zeroed tail is shared by every duel in that
-    window, so the owner's own slowness would decide all of them at once — such a window should be
-    treated as the power gate treats a dead window (no duels, no shot spent) rather than scored."
-    `Scaffold.run_window` makes it detectable and says so in its own docstring; `simulate.Validator`
-    never looks.
-
-    Measured below: six of fifteen king tasks abandoned by the validator's clock, the window scored
-    anyway, and the challenger crowned on a tail the king was never allowed to attempt.
-
-    Two smaller silences travel with it, and both are §5.8's rule broken in the same place — a
-    verdict decided by something other than routing must be visible in the reveal rather than
-    buried: `simulate._exhausted` counts only `budget_exhausted`, so `king_exhausted` reads 0 for an
-    arm that ran out of clock; and the string `duel_wall_clock` appears nowhere in the published
-    reveal.
-    """
+def _slow_window(root: Path, *, n_tasks: int, per_benchmark: int, miner_king: bool):
+    """A window whose worker is slow per delegate, so the PER-DUEL clock is reachable (`Stopwatch`)."""
+    root.mkdir(parents=True, exist_ok=True)
     clock = Stopwatch(EPISODE_WALL_CLOCK_SECONDS * 0.9)
     slow = SlowWorker(MockWorker(answers=worker_answers(STRENGTH), costs=COST), clock)
-    corpus = (MockBenchmark("frontier-swe", STRENGTH, n_tasks=6, difficulty=(4, 4)),
-              MockBenchmark("nl2repo", STRENGTH, n_tasks=6, difficulty=(2, 2)),
-              MockBenchmark("programbench", STRENGTH, n_tasks=6, difficulty=(2, 2)))
-    v, tree = validator(tmp_path, corpus, worker=slow, per_benchmark=5, minimum=3, clock=clock)
-
+    corpus = (MockBenchmark("frontier-swe", STRENGTH, n_tasks=n_tasks, difficulty=(4, 4)),
+              MockBenchmark("nl2repo", STRENGTH, n_tasks=n_tasks, difficulty=(2, 2)),
+              MockBenchmark("programbench", STRENGTH, n_tasks=n_tasks, difficulty=(2, 2)))
+    v, tree = validator(root, corpus, worker=slow, per_benchmark=per_benchmark, minimum=3,
+                        clock=clock)
+    if miner_king:
+        v.king = submit(v, "incumbent", 1, learned_router(v.pins.king_zero, ROUTABLE, "mock/mid"),
+                        tree)
     report = v.run_window(
         1, [submit(v, "hopeful", 5, learned_router(v.pins.king_zero, ROUTABLE, "mock/mid"), tree)])
+    return v, report
 
-    reasons = [result.stopped_reason for result in report.king_results]
-    truncated = sum(1 for r in reasons if r == DUEL_WALL_CLOCK_REASON)
-    assert truncated > 0, "the king's arm never hit the clock; this proves nothing"
-    assert report.scored and outcome_of(report, "hopeful").status == DUELLED
-    assert report.crowned == "hopeful"          # decided on a tail the king never ran
-    assert report.king_exhausted == 0           # §5.8's published number cannot see it
-    assert DUEL_WALL_CLOCK_REASON not in format_window(report)
-    # The check §8b.2 asks the caller to make is one line, and it is available on the record.
-    assert any(r.stopped_reason == DUEL_WALL_CLOCK_REASON for r in report.king_results)
+
+def test_a_king_arm_the_clock_cut_by_less_than_half_decides_every_duel_on_what_it_answered(
+        tmp_path):
+    """**FORMERLY A FINDING, NOW THE RULE (§8b.2).** The per-duel clock abandoned part of the king's
+    arm and the window was scored with those tasks as the king's zeros — the challenger crowned on a
+    tail the king was never allowed to attempt, with nothing in the reveal to say so.
+
+    A task an arm never reached now leaves BOTH arms of the duel (`window.exclude`), so the verdict
+    runs on tasks the king answered; the cut is published on the king's section; and only a king arm
+    cut below half its slice settles the window instead (next test).
+    """
+    v, report = _slow_window(tmp_path, n_tasks=6, per_benchmark=5, miner_king=False)
+
+    king = report.king_results
+    truncated = sum(1 for r in king if r.stopped_reason == DUEL_WALL_CLOCK_REASON)
+    assert 0 < truncated < len(king) / 2, "the king's arm must be cut, and by less than half"
+    row = outcome_of(report, "hopeful")
+    assert report.scored and row.status == DUELLED and row.verdict is not None
+    # The published king arm is exactly the king's answered rows on the admitted benchmarks.
+    admitted = {name for name, rate in v.pins.world.exchange.items() if not rate.flags}
+    answered = [r for r in king
+                if r.benchmark in admitted and r.stopped_reason != DUEL_WALL_CLOCK_REASON]
+    assert sum(row_.n_tasks for row_ in report.king.per_benchmark) == len(answered)
+    assert row.verdict.n_tasks <= len(answered)
+    assert f"judged on the {row.verdict.n_tasks} tasks both arms answered" in row.detail
+    # §5.8: the cut is visible rather than buried in an aggregate.
+    assert report.king_clocked == truncated
+    assert (f"tasks the per-duel wall clock took from the king's arm: {truncated}"
+            in format_window(report))
+    assert (report.crowned == "hopeful") == row.verdict.challenger_wins
+
+
+def test_a_king_arm_the_clock_cut_below_half_prices_nothing_and_a_miner_king_loses_the_reign(
+        tmp_path):
+    """§8b.2. With most of the king's slice unreached, what is left is too thin to call a comparison:
+    no duel is scored and no shot is spent. A MINER king that slow also loses the reign — otherwise a
+    king too slow to answer its own slice would make every window unscoreable and keep the throne."""
+    for miner_king in (False, True):
+        v, report = _slow_window(tmp_path / f"miner-king-{miner_king}", n_tasks=12,
+                                 per_benchmark=10, miner_king=miner_king)
+
+        king = report.king_results
+        assert sum(1 for r in king if r.stopped_reason == DUEL_WALL_CLOCK_REASON) > len(king) / 2
+        row = outcome_of(report, "hopeful")
+        assert row.status == DEFERRED and not row.shot_spent and "hopeful" not in v.spent
+        assert "per-duel wall clock" in row.detail
+        assert report.crowned is None
+        assert v.king_hotkey == KING0
 
 
 def test_a_king_that_leaves_mid_window_pays_every_pensioner_one_rank_too_high(tmp_path):

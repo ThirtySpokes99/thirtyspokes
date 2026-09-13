@@ -39,7 +39,7 @@ from thirtyspokes.v3.archetypes import (
     arm,
 )
 from thirtyspokes.v3.config import MAX_STEPS
-from thirtyspokes.v3.duel import Contender, champion, duel
+from thirtyspokes.v3.duel import Contender, duel, succession
 from thirtyspokes.v3.reference import (
     FixedPolicy,
     ReferenceArm,
@@ -134,7 +134,8 @@ def test_a_one_benchmark_specialist_loses_although_its_aggregate_clears_eps():
     assert not v.challenger_wins
     assert v.loo_min == 0.0 and v.loo_dropped == SUBJECT
     assert [name for name, delta in v.by_benchmark if delta != 0.0] == [SUBJECT]
-    assert champion([Contender("hk_specialist", commit_block=10, verdict=v)]) is None
+    assert succession([Contender("hk_specialist", commit_block=10, verdict=v)],
+                      lambda *_: None).crowned is None
 
 
 def test_a_broadly_better_challenger_wins_although_it_loses_four_benchmarks():
@@ -231,7 +232,8 @@ def test_a_byte_identical_copy_ties_and_therefore_loses():
     assert (v.delta, v.lcb, v.loo_min) == (0.0, 0.0, 0.0)
     assert not v.challenger_wins
     assert (v.sign_wins, v.sign_p) == (0, 1.0)
-    assert champion([Contender("hk_copier", commit_block=1, verdict=v)]) is None
+    assert succession([Contender("hk_copier", commit_block=1, verdict=v)],
+                      lambda *_: None).crowned is None
 
 
 def test_the_degenerate_and_the_saboteur_differ_only_in_how_long_they_burn():

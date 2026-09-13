@@ -532,6 +532,13 @@ PRICE_PROBE_WAIT_SECONDS = 30.0
 # A half is chosen rather than tuned, and the fixture shows why no sharper line exists: a legitimate
 # starved arm reached 1 of 9 tasks and the nanodollar attack reached 0 of 9. Those are indistinguish-
 # able by participation, which is why participation gates eligibility and not scoring.
+#
+# THE PER-DUEL CLOCK COUNTS AGAINST PARTICIPATION TOO (§8b.2). A task an arm never reached before its
+# clock ran out leaves both arms of that duel rather than scoring 0 (`window.exclude`), so a slow arm
+# is judged on what it answered — and without this floor an arm that answered ten tasks and stalled
+# would be judged on those ten. So an arm that answered under half its slice inside the clock may not
+# take the crown either, and a KING arm the clock cut below this line prices no verdict at all: the
+# window's duels are deferred, and a miner king loses the reign (`simulate._king_too_thin`).
 MIN_SLICE_REACHED = 0.5
 
 

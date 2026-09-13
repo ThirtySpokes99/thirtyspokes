@@ -26,10 +26,14 @@ THE THREE RULES THAT ONLY EXIST ONCE THE SEAMS ARE REAL
    forward from the checkpointed spend rather than restarted.
 
 2. **§8b.2's last paragraph: a broken KING arm decides every duel at once.** Under §5.2a one king arm
-   is shared by every duel in the window, so if it hit the per-duel wall clock — or if its spend
-   cannot be reconciled against gateway receipts — the zeroed or unpriceable tail is shared by all of
-   them, and the owner's own slowness would settle every verdict. Such a window is treated exactly as
-   the power gate treats a dead one: no verdicts, no shots spent, everyone rolls over.
+   is shared by every duel in the window. If its spend cannot be reconciled against gateway
+   receipts, every duel would be priced against an unmetered baseline; if the per-duel wall clock cut
+   it below half its slice, what is left is too thin to call a comparison. Either way the window is
+   treated exactly as the power gate treats a dead one — no verdicts, no shots spent, everyone rolls
+   over — and a MINER king the clock cut that far also loses the reign, so a king too slow for its
+   own slice cannot hold the throne by making every window unscoreable. A king arm the clock cut by
+   less still decides every duel, on the tasks it answered: its tail leaves both arms
+   (`window.exclude`) rather than scoring zero.
 
 3. **The queue is a chain read, not a list somebody handed us.** `CommitmentOf` survives forever, so
    every miner ever judged is still committed and still visible. Judged hotkeys are therefore
@@ -89,7 +93,7 @@ from .config import (
     DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS, EPISODE_CONCURRENCY, EPS,
                      EXCLUDED_REASON, FUTILE_REASON, KING_ZERO_NAME, MAX_DUELS_PER_WINDOW,
                      MAX_QUEUE_DEPTH, MIN_SLICE_REACHED, UNCLAIMED_GRACE_SECONDS)
-from .duel import Contender, champion, duel
+from .duel import Contender
 from .emissions import KING0, Lineage, emission_weights
 from .funding import KEY_NAME, SealedKey, open_key
 from .gateway import (KEY_REFUSALS, Audit, GatewayWorker, OwnerGateway, Provider, allowance_journal,
@@ -103,7 +107,8 @@ from .scaffold import OutcomeTable, Scaffold, _unreached, task_order
 from .score import ArmScore, best_possible_final, score_arm
 from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
-                       _exhausted, _GraderGuard, _pairs, _why, format_window, priced)
+                       _clocked, _exhausted, _GraderGuard, _king_too_thin, _pairs, _why,
+                       adjudicate, format_window, priced)
 from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, apply_retention,
                     delete_prefix, fetch_manifest, fetch_submission, promote_submission,
                     retention_plan, unclaimed_plan)
@@ -1227,9 +1232,21 @@ class Validator:
         meters = tuple(ref_audits) + ((king_meter,) if king_meter is not None else ())
         broken = self._king_arm_unusable(king_results, king_meter)
         if admitted and broken is not None:
-            # §8b.2's last paragraph. Under §5.2a the king's arm is shared by every duel, so a
-            # truncated or unreconcilable one decides all of them at once — the owner's own failure
-            # settling every verdict in the window. Treated as the power gate treats a dead window.
+            # §8b.2's last paragraph. Under §5.2a the king's arm is shared by every duel, so an
+            # unreconcilable one, or one the clock cut below half its slice, settles every verdict in
+            # the window on a baseline nobody could price. Treated as the power gate treats a dead
+            # window.
+            if _king_too_thin(king_results) is not None and not crown.is_king_zero:
+                # A king too slow to answer half its own slice would otherwise make EVERY window
+                # dead and keep the throne forever. It loses the reign instead, as a king that could
+                # not fund its arm does below. King₀ is the owner's policy: its slowness is ours to
+                # fix, not a reign to end.
+                self._log(f"window {opened.epoch}: the king's arm answered "
+                          f"{len(king_results) - _clocked(king_results)} of {len(king_results)} "
+                          f"tasks inside the per-duel wall clock; §8b.2 ends the reign rather than "
+                          f"letting a king too slow for its own slice hold the throne")
+                self.history.crown_to(Crown(), window=opened.epoch,
+                                      reason="could not answer half its slice inside the wall clock")
             outcomes.extend(Outcome(q.hotkey, q.block, DEFERRED, broken) for q, _ in admitted)
             return self._publish(opened, power, tuple(arms), king_hotkey, None, king_results, guard,
                                  tuple(outcomes), None, meters, {}, judged=judged, table=table,
@@ -1281,10 +1298,7 @@ class Validator:
         retest = self._retest(opened, table, guard)
 
         # PHASE 6 — every verdict, only now.
-        final_b = priced(self.pins.world.exchange)
-        contenders: list[Contender] = []
-        crowned_dirs: dict[str, Queued] = {}
-        king_arm: ArmScore | None = None
+        scored: list[tuple[Queued, tuple[EpisodeResult, ...]]] = []
         for queued, results, meter in ran:
             if not meter.scoreable:
                 # An arm whose dollars cannot be traced to gateway receipts cannot be scored at all
@@ -1301,8 +1315,6 @@ class Validator:
             # first version of this guard read the meter and therefore deferred every challenger a
             # restart had resumed, breaking §8b.5 on the one path it exists to protect.
             spent = sum(result.spend_usd for result in results)
-            reached = sum(1 for result in results
-                          if result.stopped_reason != "budget_exhausted")
             if not spent > 0.0:
                 # No worker was reached on any task, so the action space was never exercised — a
                 # model that answers STOP everywhere, or a pool that refused every request. There is
@@ -1312,40 +1324,31 @@ class Validator:
                                         f"{len(results)} tasks and spent $0, so there is no routing "
                                         f"to score; the shot is not spent"))
                 continue
-            # Funding does not decide the crown. §4 zeroes a starved arm's tail and §5.8 requires
-            # that cut to be published rather than hidden — so the arm below is scored and revealed
-            # exactly as any other. What it may not do is WIN: an allowance of a nanodollar buys one
-            # metered call, answers almost none of the slice, and scores ~0 at ~0 cost, which beats
-            # any king whose priced spend exceeds its quality. A challenger may take the throne by
-            # buying the same quality for less; it may not take it by declining to buy anything.
-            eligible = reached >= MIN_SLICE_REACHED * len(results)
-            paired = exclude(king_results, results, failed=sorted(guard.failed))
-            verdict = duel(_pairs(paired, self.pins.world.exchange, opened.tasks), final_b,
-                           nonce=opened.nonce)
-            # Scored from INSIDE the loop and identical every time: all arms ran the same task list
-            # and the exclusion set is now final, so every duel drops exactly the same rows and the
-            # published king arm is the one the duels were computed on.
-            king_arm = score_arm(paired.king, self.pins.world.exchange)
-            judged.append(queued.hotkey)
-            why = _why(verdict)
-            if verdict.challenger_wins and not eligible:
-                # §5.8: the reader must be able to see that funding, not routing, settled this.
-                why = (f"{why} — but the crown is withheld: this arm reached {reached} of "
-                       f"{len(results)} tasks before its allowance ran out, and a challenger may "
-                       f"not take the throne by declining to buy anything")
-            outcomes.append(Outcome(queued.hotkey, queued.block, DUELLED, why,
-                                    verdict=verdict,
-                                    arm=score_arm(paired.challenger, self.pins.world.exchange),
-                                    exhausted=_exhausted(results)))
-            if eligible:
-                contenders.append(Contender(queued.hotkey, queued.block, verdict))
-                crowned_dirs[queued.hotkey] = queued
+            scored.append((queued, results))
+        # ONE ADJUDICATION, SHARED WITH THE OFFLINE MECHANISM (`simulate.adjudicate`), so the rules
+        # that place a crown cannot drift between the two. Funding does not decide the crown: §4
+        # zeroes a starved arm's tail and §5.8 requires that cut published, and an arm that reached
+        # under `MIN_SLICE_REACHED` of its slice — starved, or cut by the per-duel clock — is scored
+        # and revealed but may not win. A challenger may take the throne by buying the same quality
+        # for less; it may not take it by declining to buy anything, or by running out the clock.
+        adjudged = adjudicate(king_results, [(queued.hotkey, queued.block, results)
+                                             for queued, results in scored],
+                              failed=guard.failed, exchange=self.pins.world.exchange,
+                              tasks=opened.tasks, nonce=opened.nonce)
+        queued_of = {queued.hotkey: queued for queued, _ in scored}
+        crowned_dirs: dict[str, Queued] = {}
+        for judgement in adjudged.judgements:
+            judged.append(judgement.hotkey)
+            outcomes.append(judgement.outcome())
+            if judgement.eligible:
+                crowned_dirs[judgement.hotkey] = queued_of[judgement.hotkey]
 
-        # PHASE 7 — batch coronation, every delta measured against the same king arm (§5.2a).
-        return self._publish(opened, power, tuple(arms), king_hotkey, king_arm, king_results, guard,
-                             tuple(outcomes), champion(contenders), meters, crowned_dirs,
-                             judged=judged, table=table, retest=retest, splits=splits,
-                             registrations=registrations)
+        # PHASE 7 — succession: winners crowned in commit order, each later one only by clearing the
+        # incumbent's arm on the identical slice; every duel ran against the one king arm (§5.2a).
+        return self._publish(opened, power, tuple(arms), king_hotkey, adjudged.king, king_results,
+                             guard, tuple(outcomes), adjudged.succession.crowned, meters,
+                             crowned_dirs, judged=judged, table=table, retest=retest,
+                             splits=splits, registrations=registrations)
 
     # --- the steps ---------------------------------------------------------------------------
 
@@ -1718,7 +1721,13 @@ class Validator:
                 # score as well as the challenger's; comparing a ceiling that knows about the
                 # exclusions against a bar that does not is a false abort waiting to happen.
                 scored = [result for result in placed if result is not None]
-                failed = frozenset(guard.failed)
+                # The king's own per-duel clock tail leaves both arms of every duel (§8b.2,
+                # `window.exclude`), so it leaves this comparison on both sides as well: the bar is
+                # the king the duel will face, and the ceiling is taken over the tasks the duel will
+                # keep. Counting those rows as the king's zeros would compare two different slices.
+                failed = frozenset(guard.failed) | {
+                    r.task_id for r in king_arm_results
+                    if r.stopped_reason == DUEL_WALL_CLOCK_REASON}
                 king_now = [r for r in king_arm_results if r.task_id not in failed]
                 if scored and king_now and best_possible_final(
                         scored, tasks=tasks, exchange=self.pins.world.exchange,
@@ -1816,10 +1825,9 @@ class Validator:
         """§8b.2: the two ways one king arm settles a whole window by accident. None means usable."""
         if meter is None:
             return None
-        if any(result.stopped_reason == DUEL_WALL_CLOCK_REASON for result in results):
-            return ("the king's arm hit the per-duel wall clock, so under §5.2a its zeroed tail "
-                    "would be shared by every duel in this window; no duel is scored and no shot is "
-                    "spent (§8b.2)")
+        thin = _king_too_thin(results)
+        if thin is not None:
+            return thin
         if not meter.scoreable:
             return (f"the king's arm could not be reconciled against gateway receipts "
                     f"({meter.audit.reason}); every duel in this window would be priced against an "
@@ -2414,20 +2422,30 @@ def _arm_json(arm: ArmScore | None) -> dict | None:
             "excluded": [[name, list(flags)] for name, flags in arm.excluded]}
 
 
+def _verdict_json(verdict) -> dict | None:
+    return None if verdict is None else {
+        "delta": verdict.delta, "lcb": verdict.lcb, "eps": verdict.eps,
+        "loo_min": verdict.loo_min, "loo_dropped": verdict.loo_dropped,
+        "median": verdict.median, "sign_wins": verdict.sign_wins,
+        "sign_p": verdict.sign_p, "n_tasks": verdict.n_tasks,
+        "by_benchmark": [list(row) for row in verdict.by_benchmark],
+        "loo": [list(row) for row in verdict.loo]}
+
+
 def _outcome_json(outcome: Outcome) -> dict:
-    verdict = outcome.verdict
+    rematch = outcome.rematch
     return {"hotkey": outcome.hotkey, "commit_block": outcome.commit_block,
             "status": outcome.status, "detail": outcome.detail,
             "shot_spent": outcome.shot_spent, "won": outcome.won,
             "exhausted": outcome.exhausted,
+            # §8b.2: tasks the per-duel clock took from this arm — dropped from both arms, not zeroed.
+            "clocked": outcome.clocked,
             "arm": _arm_json(outcome.arm),
-            "verdict": None if verdict is None else {
-                "delta": verdict.delta, "lcb": verdict.lcb, "eps": verdict.eps,
-                "loo_min": verdict.loo_min, "loo_dropped": verdict.loo_dropped,
-                "median": verdict.median, "sign_wins": verdict.sign_wins,
-                "sign_p": verdict.sign_p, "n_tasks": verdict.n_tasks,
-                "by_benchmark": [list(row) for row in verdict.by_benchmark],
-                "loo": [list(row) for row in verdict.loo]}}
+            "verdict": _verdict_json(outcome.verdict),
+            # §5.2: the comparison against the earlier-committed incumbent, where there was one.
+            "rematch": None if rematch is None else {
+                "incumbent": rematch.incumbent, "clears": rematch.clears,
+                "verdict": _verdict_json(rematch.verdict)}}
 
 
 # --- the entry point ---------------------------------------------------------------------------------

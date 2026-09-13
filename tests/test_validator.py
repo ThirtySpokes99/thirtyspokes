@@ -424,6 +424,15 @@ def test_a_full_window_runs_end_to_end_over_the_real_seams_and_crowns_the_better
     assert not outcome(reveal, copy).won
     assert "does not clear eps" in outcome(reveal, copy).detail
     assert reveal.report.crowned == strong
+    # Succession (§5.2, §8 step 4): `weak` committed first and was crowned first; `strong` took the
+    # crown only by clearing it, and that rematch is on its row and in the published record.
+    assert outcome(reveal, weak).rematch is None and outcome(reveal, copy).rematch is None
+    assert outcome(reveal, strong).rematch.incumbent == weak
+    assert outcome(reveal, strong).rematch.clears
+    published = next(r for r in json.loads(h.store.get(reveal_path(1)))["record"]["outcomes"]
+                     if r["hotkey"] == strong)
+    assert published["rematch"]["incumbent"] == weak and published["rematch"]["clears"]
+    assert published["clocked"] == 0
     # The traces D15 publishes as the entry ramp: the king's arm and both reference arms.
     assert len(reveal.report.reference) == 2
     assert any(result.steps for result in reveal.report.king_results)
@@ -686,14 +695,17 @@ def test_every_verdict_waits_for_the_last_arm_so_one_denominator_serves_the_whol
 # --- §8b.2: a broken KING arm settles the whole window ----------------------------------------------
 
 
-def test_a_king_arm_that_hits_the_per_duel_clock_settles_no_verdict_and_spends_no_shot(tmp_path):
+def test_a_king_arm_the_clock_cut_below_half_its_slice_settles_no_verdict_and_loses_the_reign(
+        tmp_path):
     """§8b.2's last paragraph — the rule that only exists because of §5.2a.
 
-    One king arm is shared by every duel in the window, so a king arm truncated by the OWNER's clock
-    would hand every challenger in the window the same zeroed tail and decide all of them at once.
-    That is our failure, not theirs, so the window is treated exactly as the power gate treats a dead
-    one. Note what is NOT rolled back: the refusals from phase 3 stand, because those were judged on
-    their own artifact and the king's clock has nothing to do with them.
+    One king arm is shared by every duel in the window. The per-duel clock's tail leaves both arms of
+    every duel, so a king arm cut by a little still decides them on what it answered; one cut below
+    half its slice leaves too little to call a comparison, and the window is treated exactly as the
+    power gate treats a dead one — no verdict, no shot spent. A MINER king that slow also loses the
+    reign, or it could hold the throne forever by making every window unscoreable. Note what is NOT
+    rolled back: the refusals from phase 3 stand, because those were judged on their own artifact
+    and the king's clock has nothing to do with them.
     """
     clock = Clock()
     h = harness(tmp_path, clock=clock)
@@ -710,6 +722,10 @@ def test_a_king_arm_that_hits_the_per_duel_clock_settles_no_verdict_and_spends_n
     assert not outcome(reveal, hopeful).shot_spent
     assert hopeful not in h.validator.history.judged
     assert reveal.report.crowned is None
+    # The king answered next to none of its slice: too slow to defend, so it no longer reigns.
+    assert h.validator.history.crown.is_king_zero
+    assert any(reign["ended"] == "could not answer half its slice inside the wall clock"
+               for reign in h.validator.history.reigns)
 
 
 # --- §8b.1: the queue is a chain read ---------------------------------------------------------------
@@ -1014,17 +1030,17 @@ def test_a_window_that_dies_halfway_is_retried_without_re_spending_what_it_alrea
     h.enrol("hopeful", block=10, conductor=router(h))
     h.chain.block = CADENCE.opens_at(1)
     h.open_window(1)
-    real_duel = daemon.duel
+    real_duel = simulate.duel          # the verdicts run inside the adjudication the daemon shares
 
     def explode(*args, **kwargs):
         raise RuntimeError("the verdict blew up")
 
-    daemon.duel = explode
+    simulate.duel = explode
     try:
         with pytest.raises(RuntimeError):
             h.validator.run_window(1)
     finally:
-        daemon.duel = real_duel
+        simulate.duel = real_duel
     spent_by_the_first_attempt = h.pool.calls
     assert not h.validator.history.completed(1)
 

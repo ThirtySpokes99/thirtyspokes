@@ -30,7 +30,7 @@ import pytest
 
 from thirtyspokes.v3.config import EPS, N_BOOT
 from thirtyspokes.v3.duel import (BenchmarkPair, Contender, DuelVerdict, _clusters, _delta,
-                                   _resample, champion, duel, sign_test)
+                                   _resample, duel, sign_test, succession)
 
 # The twelve of §6.1, so a narrowed slice in the tests below reads as a real one.
 NAMES = ("terminal-bench", "deepswe", "agents-last-exam", "automationbench", "hle-tools",
@@ -215,7 +215,8 @@ def test_a_byte_identical_copy_ties_and_therefore_loses():
     assert v.loo_min == 0.0
     assert not v.challenger_wins
     assert (v.sign_wins, v.sign_p) == (0, 1.0)   # ties count against the challenger, no special case
-    assert champion([Contender("hk_copy", commit_block=10, verdict=v)]) is None
+    assert succession([Contender("hk_copy", commit_block=10, verdict=v)],
+                      lambda *_: None).crowned is None
 
 
 def test_leave_one_out_runs_over_the_benchmarks_present_in_the_slice():
@@ -522,22 +523,90 @@ def test_the_arms_must_cover_the_same_tasks():
         BenchmarkPair("cybergym", np.zeros(20), np.zeros(20), np.zeros(19), np.zeros(19))
 
 
-def test_the_crown_goes_to_the_largest_delta_and_ties_break_on_earliest_commit_block():
-    """§5.2, §8 step 4. Batch coronation ranks every winning challenger against the ONE king arm the
-    window ran (§5.2a), so the comparison between challengers is well defined; remaining ties break
-    on earliest commit block, then hotkey — the same total order the queue is evaluated in (§8b.1),
-    so the reveal is reproducible rather than dependent on the order results landed in."""
-    def won(delta):
-        return DuelVerdict(delta=delta, lcb=delta / 2, by_benchmark=(("a", delta), ("b", delta)),
-                           loo=(("a", delta), ("b", delta)), sign_wins=2, sign_p=0.25,
-                           n_tasks=240, eps=EPS)
+def _winning(delta):
+    """A verdict carrying `delta` on both of two benchmarks: a win at any delta above `EPS`."""
+    return DuelVerdict(delta=delta, lcb=delta / 2, by_benchmark=(("a", delta), ("b", delta)),
+                       loo=(("a", delta), ("b", delta)), sign_wins=2, sign_p=0.25,
+                       n_tasks=240, eps=EPS)
 
-    late_and_best = Contender("hk_a", commit_block=200, verdict=won(0.10))
-    tied_later = Contender("hk_b", commit_block=50, verdict=won(0.07))
-    tied_earlier = Contender("hk_c", commit_block=40, verdict=won(0.07))
 
-    assert champion([tied_later, late_and_best, tied_earlier]) is late_and_best
-    assert champion([tied_later, tied_earlier]) is tied_earlier
+def test_winners_are_crowned_in_commit_order_and_a_later_one_must_clear_the_incumbent():
+    """§5.2, §8 step 4. The earliest winner takes the crown; a later winner that beat the king by
+    MORE still does not take it unless it clears the incumbent itself. Under largest-delta batch
+    coronation the later arm here would have been crowned on a margin of 0.02 — inside the noise the
+    strict `eps` beat exists to refuse."""
+    early = Contender("hk_early", commit_block=10, verdict=_winning(0.08))
+    late_and_better = Contender("hk_late", commit_block=20, verdict=_winning(0.10))
+    asked = []
+
+    def rematch(incumbent, challenger):
+        asked.append((incumbent.hotkey, challenger.hotkey))
+        return _winning(0.02)
+
+    placed = succession([late_and_better, early], rematch)
+
+    assert placed.crowned is early
+    assert asked == [("hk_early", "hk_late")]
+    (record,) = placed.rematches
+    assert (record.challenger, record.incumbent, record.clears) == ("hk_late", "hk_early", False)
+
+
+def test_a_later_winner_that_clears_the_incumbent_takes_the_crown_and_must_then_defend_it():
+    """The succession is a chain, not a ranking: each later winner meets whoever holds the crown when
+    its turn comes, and the arriving order of the list changes nothing."""
+    first = Contender("hk_a", commit_block=1, verdict=_winning(0.06))
+    second = Contender("hk_b", commit_block=2, verdict=_winning(0.20))
+    third = Contender("hk_c", commit_block=3, verdict=_winning(0.21))
+    margin = {("hk_a", "hk_b"): 0.14, ("hk_b", "hk_c"): 0.01}
+
+    placed = succession([third, first, second],
+                        lambda incumbent, challenger: _winning(margin[(incumbent.hotkey,
+                                                                        challenger.hotkey)]))
+
+    assert placed.crowned is second
+    assert [(r.incumbent, r.challenger, r.clears) for r in placed.rematches] == [
+        ("hk_a", "hk_b", True), ("hk_b", "hk_c", False)]
+
+
+def test_an_arm_that_did_not_beat_the_king_is_never_crowned_and_never_rematched():
+    """The throne is defended by the king; the queue only decides the order in which beating it
+    counts. A loser to the king holds nothing, so it is not asked to defend and cannot take it."""
+    loser = Contender("hk_loser", commit_block=1, verdict=_winning(0.02))
+    winner = Contender("hk_winner", commit_block=2, verdict=_winning(0.07))
+
+    def rematch(incumbent, challenger):
+        raise AssertionError("an arm that did not beat the king has nothing to defend")
+
+    placed = succession([loser, winner], rematch)
+
+    assert placed.crowned is winner and placed.rematches == ()
+    assert succession([loser], rematch).crowned is None
+    assert succession([], rematch).crowned is None
+
+
+def test_a_rematch_that_cannot_be_priced_leaves_the_crown_with_the_incumbent():
+    """§8b.2: when the per-duel clock leaves too little of the slice two arms both answered, the
+    rematch is None, and a comparison that cannot be priced cannot be won."""
+    early = Contender("hk_early", commit_block=1, verdict=_winning(0.06))
+    late = Contender("hk_late", commit_block=2, verdict=_winning(0.30))
+
+    placed = succession([early, late], lambda incumbent, challenger: None)
+
+    assert placed.crowned is early
+    assert placed.rematches[0].verdict is None and not placed.rematches[0].clears
+
+
+def test_identical_winners_keep_the_crown_with_the_earlier_commit_then_the_lower_hotkey():
+    """A copy of an earlier winner ties it, and a tie is not a clear — D14's rule, applied to the
+    queue. Order is `(commit_block, hotkey)`, the order the queue is evaluated in (§8b.1)."""
+    senior = Contender("zzz", commit_block=7, verdict=_winning(0.07))
+    junior = Contender("aaa", commit_block=99, verdict=_winning(0.07))
+    same_block = Contender("bbb", commit_block=7, verdict=_winning(0.07))
+    tie = lambda incumbent, challenger: _winning(0.0)       # noqa: E731
+
+    assert succession([junior, senior], tie).crowned is senior
+    assert succession([senior, junior], tie).crowned is senior
+    assert succession([senior, same_block], tie).crowned is same_block
 
 
 # --- what the verdict is worth at N = 2 (MEASURED 2026-09-05/06, not argued) -----------------------

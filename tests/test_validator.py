@@ -60,6 +60,8 @@ from thirtyspokes.v3.store import (GRACE_SECONDS, MANIFEST_NAME, S3Bucket, build
                                    UNCLAIMED_GRACE_SECONDS,
                                    public_model_prefix, upload_tree)
 import thirtyspokes.v3.store as store_module
+import thirtyspokes.v3.hosttrees as hosttrees_module
+from thirtyspokes.v3.hosttrees import HostTrees
 from thirtyspokes.v3.tools import PROTOCOL
 from thirtyspokes.v3.types import Catalog, CatalogEntry, EpisodeResult, TaskSpec
 from thirtyspokes.v3.window import task_order
@@ -334,7 +336,7 @@ class Harness:
 
 def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int = 2,
             grade=None, failures: frozenset[str] = frozenset(), owner_budget: float = 1_000.0,
-            clock=None) -> Harness:
+            clock=None, tree_host=None) -> Harness:
     worker = MockWorker(answers=worker_answers(STRENGTH), costs=COST)
     tasks = tuple(task for benchmark in benchmarks for task in benchmark.load())
     # λ_b is pinned per corpus (§5.1b), so the sweep runs against the HONEST world; a flaky grader or
@@ -367,7 +369,7 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
     validator = Validator(
         pins=pins, reference=describe(simulate._write_tree(root / "reference")), chain=chain,
         store=store, private_models=private, public_models=public,
-        public_model_base_url="https://models.example.org/",
+        public_model_base_url="https://models.example.org/", tree_host=tree_host,
         mailbox=Mailbox(root / "mailbox.json", signing.Signer(), _never_mint),
         gateway=gateway,
         owner=Owner(ss58=owner_signer.public_hex, sign=owner_signer.sign,
@@ -2373,6 +2375,74 @@ def test_a_shard_replaced_after_judgment_never_reaches_the_public_king(tmp_path,
     king = public_model_prefix(committed(h, strong).ready.manifest_sha256)
     assert h.validator.history.crown.hotkey == strong
     assert h.public.client.objects[king + key[len(source):]][0] == judged
+
+
+@dataclass
+class RecordingHost:
+    """A `store.TreeHost` that moves the bytes in-process and records every call — the daemon's
+    WIRING is what is under test here; the transport is `test_hosttrees.py`'s."""
+
+    fetches: list = field(default_factory=list)
+    uploads: list = field(default_factory=list)
+    refuse: bool = False
+
+    def fetch(self, bucket, prefix, manifest, dest) -> None:
+        self.fetches.append(Path(dest).name)
+        if self.refuse:
+            raise store_module.StoreError("model.safetensors hashes to the wrong digest")
+        for item in manifest.files:
+            bucket.download_file(prefix + item.path, Path(dest) / item.path)
+
+    def upload(self, public, destination, manifest, tree, pending) -> None:
+        self.uploads.append((destination, tuple(item.path for item in pending)))
+        for item in pending:
+            public.put(destination + item.path, (Path(tree) / item.path).read_bytes(),
+                       digest=item.sha256)
+
+
+def test_a_daemon_with_a_tree_host_fetches_and_publishes_through_it_and_marks_the_same_place(
+        tmp_path):
+    """§8b.9: with a serving host wired in, admission's bulk transfer and the winner's publication
+    both go through it, while the verification marker lands exactly where the in-process path puts
+    it — beside the tree under `<state>/trees` — so a restart reads markers from either path."""
+    host = RecordingHost()
+    h = harness(tmp_path, tree_host=host)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    registration_id = committed(h, strong).ready.registration_id
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong
+    assert host.fetches == [registration_id]
+    king = public_model_prefix(committed(h, strong).ready.manifest_sha256)
+    assert [destination for destination, _pending in host.uploads] == [king]
+    marker = h.root / "state" / "trees" / f"{registration_id}.verified"
+    assert marker.read_text(encoding="utf-8") == committed(h, strong).ready.manifest_sha256
+    assert king + MANIFEST_NAME in h.public.client.objects
+
+
+def test_bytes_the_tree_host_shows_to_be_wrong_refuse_the_challenger(tmp_path):
+    host = RecordingHost(refuse=True)
+    h = harness(tmp_path, tree_host=host)
+    challenger = h.enrol("router-b", block=11, conductor=router(h))
+
+    reveal = h.run(1)
+
+    assert outcome(reveal, challenger).status == REFUSED
+    assert "hashes to the wrong digest" in outcome(reveal, challenger).detail
+    assert h.public.client.objects == {}
+
+
+def test_the_tree_transfer_moves_to_the_serving_host_exactly_when_one_is_named(monkeypatch):
+    """Explicit wiring, no guessing: `--serve-host` (already on every validator-managed launch)
+    means `<state>/trees` is that host's `--serve-trees` behind a mount; without it, no host."""
+    assert daemon.tree_host_for(None, "/var/v3/trees") is None
+    monkeypatch.setattr(hosttrees_module, "ssh_runner",
+                        lambda host, *, timeout: (lambda script: ""))
+
+    wired = daemon.tree_host_for("serving-host", "/var/v3/trees")
+
+    assert isinstance(wired, HostTrees) and wired.trees == "/var/v3/trees"
 
 
 def test_losing_weights_go_fourteen_days_after_judgment_and_nothing_else_is_touched(tmp_path):

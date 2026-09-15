@@ -1164,6 +1164,18 @@ card or the least recently used one, waits for the endpoint to list the committe
 a Conductor whose card was given away in between. With two cards a window launches about seven
 times. `--serve-url` remains for an operator who serves a fixed cast by hand.
 
+**Transfer runs where the bytes land.** A tree is served from the GPU host's disk, so that is where
+it is fetched: the Orchestrator checks the manifest, the commitment, the signature and the listing,
+then hands the GPU host one short-lived presigned URL per object on the ssh session's stdin — no
+long-lived credential, only per-object, expiring URLs — and the host downloads and hashes each file
+locally and reports what it saw. The Orchestrator compares every size and digest with the committed
+manifest and alone decides; only bytes shown to be wrong refuse a submission, and a failed transfer
+is the owner's. Promotion is the mirror image: the Orchestrator creates each multipart upload with
+its digest metadata and presigns its parts, the host re-hashes the verified tree and sends the
+parts, and the Orchestrator completes an upload only when the hash and every part's checksum match.
+It is never a server-side copy, which R2 cannot pin to the judged version (`store.py`,
+`hosttrees.py`).
+
 Every item below was found by standing the Conductor up on a real 2× RTX PRO 6000 Blackwell box on
 2026-09-01, not by reasoning about it. **Six of the eight failures arrive AFTER a successful 65 GiB
 model load**, which is what makes them worth writing down: they read as serving bugs, so an operator
@@ -1191,7 +1203,7 @@ row was never deployed — the graders ran on the Orchestrator.
 | host | runs | needs Docker | holds |
 |---|---|---|---|
 | **Orchestrator** — the controller box | window build, verdicts, weights. **Executes no untrusted code.** | **no** | chain hotkey, R2, gateway creds |
-| **Conductor + sandbox fleet** — the GPU machines | serving the miner's model, the agentic tool calls **and the graders** | **yes** | ***no credentials at all*** |
+| **Conductor + sandbox fleet** — the GPU machines | serving the miner's model, the agentic tool calls **and the graders** | **yes** | ***no credentials at all*** (only per-object, expiring presigned URLs, during a transfer) |
 
 Serving still needs no Docker of its own: weights are parsed by `safetensors` with no code path, and
 §2.1 guarantees the model's output never reaches an executor — so the Docker requirement on that row
@@ -1474,7 +1486,8 @@ not a limit on a generative Conductor, and its own limits section says so.
 
 8. **Storage and transfer** (retention policy now in §8b.7). ~70 GB per hotkey. R2 egress is free, which is
    why it is the right store, but ingest time is hours for a miner on a normal connection and each
-   duel pulls a full tree to the validator. Multipart upload is mandatory (teutonic already
+   duel pulls a full tree to the serving host, from presigned URLs, verified per file there and
+   judged on the Orchestrator (§8b.9). Multipart upload is mandatory (teutonic already
    configures 64 MB parts; 4 streams per file, 2 files at a time — the 16 x 16 it shipped with collapsed a 68 GB upload on a ~35 MB/s link, measured 2026-09-08).
 
 ---

@@ -554,6 +554,24 @@ def test_an_interrupted_promotion_resumes_and_sends_each_file_once(tmp_path, buc
     assert public.client.transfers == len(manifest.files)
 
 
+def test_without_a_tree_host_fetch_and_promotion_stay_in_process_and_presign_nothing(tmp_path,
+                                                                                    bucket, public):
+    """The host-routed transfer (`hosttrees.py`) is opt-in by wiring. A local disk, the dev kit and
+    every test above keep the original path, which never mints a URL or opens an upload by hand."""
+    def refuse(*args, **kwargs):
+        raise AssertionError("the in-process path used a host-routed transfer call")
+
+    for client in (bucket.client, public.client):
+        client.generate_presigned_url = refuse
+        client.create_multipart_upload = refuse
+        client.list_multipart_uploads = refuse
+    dest, manifest = judged_tree(tmp_path, bucket)
+
+    assert promote_submission(dest, public, manifest=manifest) == public_model_prefix(manifest.sha256)
+    assert (tmp_path / "trees" / f"{REGISTRATION.registration_id}.verified").read_text() == \
+        manifest.sha256
+
+
 # --- protocol 2: the name a miner gives their model -----------------------------------------------
 
 

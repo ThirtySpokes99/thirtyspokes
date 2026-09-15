@@ -105,12 +105,13 @@ from .reference import ReferenceArm, power_gate, subsample
 # constructor here would be a second definition of that row, and the two would drift silently.
 from .scaffold import OutcomeTable, Scaffold, _unreached, task_order
 from .score import ArmScore, best_possible_final, score_arm
+from .hosttrees import host_trees
 from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
                        _clocked, _exhausted, _GraderGuard, _king_too_thin, _pairs, _why,
                        adjudicate, format_window, priced)
 from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, apply_retention,
-                    delete_prefix, fetch_manifest, fetch_submission, promote_submission,
+                    TreeHost, delete_prefix, fetch_manifest, fetch_submission, promote_submission,
                     retention_plan, unclaimed_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
 from .window import Window, WindowError, exclude, schedule, window_path
@@ -936,6 +937,11 @@ class Validator:
     # The public https:// address `public_models` is served at (its custom domain). A reveal names the
     # reigning king's download URL under it; left empty, it names only the bucket and the prefix.
     public_model_base_url: str = ""
+    # The machine whose disk holds `<root>/trees` (§8b.9), when that directory is a mount of it:
+    # challenger trees are then pulled and hashed THERE and a king is published from there, while
+    # every check and verdict stays here (`hosttrees.py`). None keeps the transfer in this process,
+    # which is right whenever `<root>/trees` is a local disk.
+    tree_host: TreeHost | None = None
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -1545,7 +1551,9 @@ class Validator:
         commitment first, so a tree that is not the one committed to is refused for the price of one
         small object rather than an hour of transfer; then every file is hashed as it lands, so a
         swapped shard is refused at that shard; then `admit` reads headers only (§1.1); then the
-        serving stack is asked to load it, which is where an OOM or a load timeout appears.
+        serving stack is asked to load it, which is where an OOM or a load timeout appears. With a
+        `tree_host` the order is the same and only the bulk transfer and its hashing run on the
+        serving host; the digests are still compared with the manifest here.
 
         Every one of those is `REFUSED` at the call site: the submission is invalid, the shot is
         spent, and the king is not charged (§8b.2). The `except` there is broad because these three
@@ -1555,7 +1563,7 @@ class Validator:
         """
         dest = self.root / "trees" / queued.registration.registration_id
         manifest = fetch_submission(self.private_models, dest, commitment=queued.commitment,
-                                    registration=queued.registration)
+                                    registration=queued.registration, host=self.tree_host)
         admit(dest, self.reference)
         # Kept, not published: §7's name is the miner's, and D14 makes a submission public only if
         # it wins. It reaches a reveal through the crown and nowhere else.
@@ -2032,7 +2040,8 @@ class Validator:
                 raise ValidatorError(f"{prefix} now holds manifest {manifest.sha256}, the chain "
                                      f"committed {pending['manifest_sha256']}")
             public_prefix = promote_submission(self.root / "trees" / registration_id,
-                                               self.public_models, manifest=manifest)
+                                               self.public_models, manifest=manifest,
+                                               host=self.tree_host)
         except Exception as exc:          # noqa: BLE001 — every failure defers; none crowns
             # Logged in full, published by type only (teutonic's `error_code`): a store exception
             # can carry the account endpoint and this host's paths, and the reveal is public.
@@ -2490,8 +2499,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="with --serve-host: the cards and the ports their servers listen "
                              "on, reached here at http://127.0.0.1:PORT/v1 (docs/VALIDATOR.md §2)")
     parser.add_argument("--serve-trees", default="/var/v3/trees", metavar="DIR",
-                        help="with --serve-host: the directory ON THE SERVING HOST that holds the "
-                             "trees this daemon fetches into <state>/trees (the shared mount)")
+                        help="with --serve-host: the directory ON THE SERVING HOST behind the "
+                             "<state>/trees mount. Challenger trees are pulled and hashed there, "
+                             "and a king is published from there, over ssh; the mount carries "
+                             "only admission's header reads and the verification marker")
     parser.add_argument("--serve-preamble", default=DEFAULT_PREAMBLE, metavar="SHELL",
                         help="with --serve-host: the exports the launch script runs before vLLM "
                              "(toolchain paths; never a credential)")
@@ -2530,6 +2541,17 @@ def _parser() -> argparse.ArgumentParser:
                         help="run the launch-time gates against the chain and exit, spending "
                              "nothing and scoring nobody")
     return parser
+
+
+def tree_host_for(serve_host: str | None, serve_trees: str) -> TreeHost | None:
+    """Where the tree transfer runs, decided by the flags the deployment already passes.
+
+    EXPLICIT, NOT SNIFFED. `--serve-host` means `<state>/trees` is the serving host's
+    `--serve-trees` seen through a mount (docs/VALIDATOR.md §2) — the host has to hold the trees to
+    load them — so the bytes are moved there; without it the trees directory is this machine's own
+    and the transfer stays in-process. No mount table is read to guess, and no new flag is needed.
+    """
+    return host_trees(serve_host, serve_trees) if serve_host else None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -2619,6 +2641,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # the two cannot name different files and the daemon cannot start against a wallet the owner
     # believes is full. Without it the balances are process memory and one restart zeroes every
     # allowance while the checkpoint's `<arm>.budget` still claims the money is there.
+    tree_host = tree_host_for(args.serve_host, args.serve_trees)
     if args.serve_host:
         serving = remote_serving(args.serve_host, args.serve_cards, trees=args.serve_trees,
                                  preamble=args.serve_preamble)
@@ -2634,7 +2657,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         store=r2_bucket(credential),
         private_models=r2_bucket(replace(credential, bucket=args.r2_private_model_bucket)),
         public_models=r2_bucket(replace(credential, bucket=args.r2_public_model_bucket)),
-        public_model_base_url=args.public_model_base_url,
+        public_model_base_url=args.public_model_base_url, tree_host=tree_host,
         mailbox=Mailbox(args.state / "mailbox.json", Signer(), never_mint),
         gateway=gateway,
         owner=Owner(ss58=wallet.hotkey.ss58_address, sign=wallet_signer(wallet),

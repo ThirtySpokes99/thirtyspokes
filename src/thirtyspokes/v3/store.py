@@ -51,9 +51,17 @@ asking what a tree is until it is known to be the tree that was submitted.
 
 THE STORE SEAM. `S3Bucket` wraps a boto3-style S3 client rather than constructing one, so the class
 that actually talks to R2 is the class under test and only the client differs — the tests drive it
-through an in-memory bucket that speaks the same seven calls. `r2_bucket` is the one function here
-that cannot be exercised offline; it is pure configuration and carries no logic beyond the pinned
+through an in-memory bucket that speaks the same calls. `r2_bucket` is the one function here that
+cannot be exercised offline; it is pure configuration and carries no logic beyond the pinned
 transfer numbers.
+
+THE TREE-HOST SEAM (§8b.9). In production `<state>/trees` is a network mount of the serving host's
+trees directory, and moving tens of GB through it — download here, then read every byte back to
+hash it — is hours per challenger where the same objects pulled on the host itself take minutes.
+So `fetch_submission` and `promote_submission` take an optional `host` (`TreeHost`,
+implemented by `hosttrees.HostTrees`): every check that DECIDES anything still runs here, in the
+same order, and only the bulk bytes move on the host, from per-object presigned URLs, hashed where
+they land. `host=None` is the original path, unchanged, for local disks, tests and the dev kit.
 """
 
 from __future__ import annotations
@@ -64,10 +72,10 @@ import json
 import re
 import sys
 import time
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from . import access
 from .access import AccessError, Registration
@@ -110,6 +118,10 @@ MANIFEST_NAME = "manifest.json"
 # against the committed manifest (`fetch_submission`); holds that manifest's digest. Beside, not
 # inside: `admission.admit` walks the tree and a file it does not expect is a refusal.
 VERIFIED_MARKER = ".verified"
+# The suffix a host-routed fetch downloads under before a file is verified and renamed into place
+# (`hosttrees.py`). RESERVED like `MANIFEST_NAME`: a manifest path containing it could be swept as
+# a leftover or clobbered by another file's rename, so `fetch_submission` refuses one in every mode.
+PARTIAL_MARKER = ".thirtyspokes-partial"
 # Where a winning model is published in the public models bucket: content-addressed by the manifest
 # digest the chain committed to, so a published king is immutable by name and a repeated promotion
 # lands on the same keys.
@@ -368,7 +380,7 @@ def build_manifest(root: Path, registration: Registration, sign: Callable[[bytes
 
 
 class S3Bucket:
-    """One bucket, through a boto3-style S3 client. Seven calls, and no state of its own.
+    """One bucket, through a boto3-style S3 client. Thin wrappers, and no state of its own.
 
     `list` FOLLOWS THE CONTINUATION TOKEN, which is the one thing about this API that fails
     silently: `list_objects_v2` truncates at 1000 keys and reports it only in `IsTruncated`. A
@@ -451,6 +463,56 @@ class S3Bucket:
     def download_file(self, key: str, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.client.download_file(self.bucket, key, str(path), Config=self.transfer)
+
+    # --- host-routed transfer (`hosttrees.py`): the credential stays here, a URL travels ---------
+    #
+    # Presigning is a local SigV4 computation — no request is made — so these two calls are how a
+    # serving host that holds NO credential (§8b.9's table) moves one object and nothing else, for
+    # a bounded time. Temporary credentials cap a URL's real lifetime at their own expiry,
+    # whatever `expires` says.
+
+    def presign_get(self, key: str, *, expires: float) -> str:
+        """A GET URL for exactly one object, valid for `expires` seconds."""
+        return self.client.generate_presigned_url(
+            "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=int(expires))
+
+    def presign_upload_part(self, key: str, upload_id: str, part_number: int, *,
+                            expires: float) -> str:
+        """A PUT URL for one part of one multipart upload this controller created."""
+        return self.client.generate_presigned_url(
+            "upload_part", Params={"Bucket": self.bucket, "Key": key, "UploadId": upload_id,
+                                   "PartNumber": int(part_number)}, ExpiresIn=int(expires))
+
+    def create_multipart(self, key: str, *, digest: str) -> str:
+        """Open a multipart upload carrying the same `sha256` metadata `upload_file` sets — the
+        metadata is fixed HERE, at creation, so a host that only holds part URLs cannot change it."""
+        return self.client.create_multipart_upload(
+            Bucket=self.bucket, Key=key, Metadata={"sha256": digest})["UploadId"]
+
+    def complete_multipart(self, key: str, upload_id: str,
+                           parts: Sequence[tuple[int, str]]) -> None:
+        self.client.complete_multipart_upload(
+            Bucket=self.bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": [{"PartNumber": int(number), "ETag": etag}
+                                       for number, etag in parts]})
+
+    def abort_multipart(self, key: str, upload_id: str) -> None:
+        self.client.abort_multipart_upload(Bucket=self.bucket, Key=key, UploadId=upload_id)
+
+    def open_multipart(self, prefix: str) -> list[tuple[str, str]]:
+        """Every multipart upload still open under `prefix`, as (key, upload id), all pages.
+
+        A controller killed mid-promotion never reaches its `finally`, and R2 bills stored parts
+        until they are aborted; `hosttrees.HostTrees.upload` reads this first and aborts them."""
+        found: list[tuple[str, str]] = []
+        markers: dict[str, str] = {}
+        while True:
+            page = self.client.list_multipart_uploads(Bucket=self.bucket, Prefix=prefix, **markers)
+            found.extend((item["Key"], item["UploadId"]) for item in page.get("Uploads", ()))
+            if not page.get("IsTruncated"):
+                return found
+            markers = {"KeyMarker": page["NextKeyMarker"],
+                       "UploadIdMarker": page["NextUploadIdMarker"]}
 
 
 def r2_bucket(credential: access.Credential) -> S3Bucket:
@@ -598,8 +660,49 @@ def fetch_manifest(bucket: S3Bucket, prefix: str) -> Manifest:
     return Manifest.from_bytes(bucket.get(key))
 
 
+class TreeHost(Protocol):
+    """The machine whose disk actually holds `<state>/trees` — `hosttrees.HostTrees` in production.
+
+    It moves bytes and reports what it saw; it decides nothing. `fetch` places every manifest file
+    under the host-side twin of `dest` and returns only once THIS process has compared every
+    reported size and digest with the manifest; `upload` publishes `pending` from the verified tree
+    under `destination` (never `manifest.json`, which the caller writes last). A failure of the
+    transfer itself — a runner error, a timeout, output that cannot be read — must surface as
+    something OTHER than a plain `StoreError`, which is reserved for bytes shown to be wrong.
+    """
+
+    def fetch(self, bucket: S3Bucket, prefix: str, manifest: Manifest, dest: Path) -> None: ...
+
+    def upload(self, public: S3Bucket, destination: str, manifest: Manifest, tree: Path,
+               pending: Sequence[ManifestFile]) -> None: ...
+
+
+def _check_materialisable(manifest: Manifest) -> None:
+    """Refuse a manifest whose tree no validator could write to disk as named, in EVERY mode.
+
+    `ManifestFile.from_mapping` already refuses absolute paths, `..` and non-normal spellings; this
+    adds the three things only materialising a tree runs into. A control character (NUL, newline,
+    tab, DEL …) is not a file name any tool chain round-trips, and a host-routed fetch passes paths
+    through a shell script. A path containing `PARTIAL_MARKER` collides with the download's own
+    temporary names. A path that is both a file and another path's directory cannot exist. Checked
+    here rather than in the manifest parser so manifests already committed keep parsing, and in
+    both modes so the rule a miner meets does not depend on how the validator is deployed.
+    """
+    paths = {item.path for item in manifest.files}
+    for item in manifest.files:
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in item.path):
+            raise StoreError(f"manifest path {item.path!r} carries a control character")
+        if PARTIAL_MARKER in item.path:
+            raise StoreError(f"manifest path {item.path!r} uses the reserved {PARTIAL_MARKER} name")
+        parents = PurePosixPath(item.path).parents
+        clash = next((str(parent) for parent in parents if str(parent) in paths), None)
+        if clash is not None:
+            raise StoreError(f"manifest names {clash!r} as a file and as the directory of "
+                             f"{item.path!r}")
+
+
 def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
-                     registration: Registration) -> Manifest:
+                     registration: Registration, host: TreeHost | None = None) -> Manifest:
     """Pull the tree the chain committed to, and refuse anything else. M6 exit 4.
 
     ORDER IS THE DESIGN. The manifest is fetched and checked against the on-chain commitment, the
@@ -607,6 +710,14 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
     manifest does not match the commitment is refused for the price of one small object rather than
     an hour of transfer. Then every file is hashed AS IT LANDS, so a swapped shard is refused at
     that shard.
+
+    WHERE IT LANDS (§8b.9). With `host=None` the bytes are downloaded to `dest` and hashed here.
+    With a `host` — the serving host whose disk `dest`'s parent mounts — the checks above and the
+    listing checks below still run HERE and first, then the host pulls each file from a presigned
+    URL and hashes it on its own disk, and this function compares every reported size and digest
+    with the manifest itself. The verdict never moves: a digest the manifest does not give is the
+    same `StoreError` in both modes, while a transfer that failed is the host's error, not a
+    refusal. The `.verified` marker is written in the same place and format either way.
 
     Three refusals, each closing a different substitution:
 
@@ -634,7 +745,8 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
         raise StoreError(f"manifest is not signed by {manifest.hotkey}: {exc}") from exc
 
     prefix = registration.prefix
-    listed = {key[len(prefix):] for key in bucket.list(prefix) if key.startswith(prefix)}
+    listing = bucket.list(prefix)
+    listed = {key[len(prefix):] for key in listing if key.startswith(prefix)}
     # `KEY_PREFIX` is the ONE place beside `manifest.json` the manifest need not name: the miner's
     # sealed OpenRouter key lives there (`funding.py`), is not part of the tree, is never
     # materialised here, and is meant to be replaced after the commit — so it cannot be in a digest
@@ -646,9 +758,31 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
                    and not name.startswith(KEY_PREFIX))
     if extra:
         raise StoreError(f"{prefix} carries files the manifest does not name: {extra}")
+    _check_materialisable(manifest)
+
+    marker = dest.parent / f"{dest.name}{VERIFIED_MARKER}"    # beside the tree, never inside it
+    if host is not None:
+        # The resident-tree shortcut first: it reads one small file and stats each path through the
+        # mount, so a tree already verified costs no call to the host at all.
+        if _verified(marker, manifest, dest):
+            return manifest
+        # What the LISTING says is evidence about the bucket and costs nothing more: a committed
+        # file absent from the prefix, or stored at a size the manifest does not give, is the
+        # miner's tree and is refused here. Everything the host later sees at a DIFFERENT size
+        # than this is therefore the transfer's fault, not the tree's (`hosttrees.py`).
+        for item in manifest.files:
+            stored = listing.get(prefix + item.path)
+            if stored is None:
+                raise StoreError(f"the committed manifest names {item.path}, which {prefix} does "
+                                 f"not hold")
+            if stored != item.size:
+                raise StoreError(f"{item.path} is {stored} bytes, the committed manifest says "
+                                 f"{item.size}")
+        host.fetch(bucket, prefix, manifest, dest)
+        marker.write_text(manifest.sha256, encoding="utf-8")
+        return manifest
 
     dest.mkdir(parents=True, exist_ok=True)
-    marker = dest.parent / f"{dest.name}{VERIFIED_MARKER}"    # beside the tree, never inside it
     if _verified(marker, manifest, dest):
         return manifest
     for item in manifest.files:
@@ -699,15 +833,25 @@ def public_model_prefix(manifest_sha256: str) -> str:
     return f"{PUBLIC_MODEL_ROOT}{manifest_sha256}/"
 
 
-def promote_submission(tree: Path, public: S3Bucket, *, manifest: Manifest) -> str:
+def promote_submission(tree: Path, public: S3Bucket, *, manifest: Manifest,
+                       host: TreeHost | None = None) -> str:
     """Publish a winner's tree to the public models bucket, prove it arrived, return its prefix.
 
-    FROM THE VALIDATOR'S OWN DISK, NEVER FROM THE PRIVATE BUCKET. `tree` is the directory
+    FROM THE VERIFIED TREE, NEVER FROM THE PRIVATE BUCKET. `tree` is the directory
     `fetch_submission` hashed every byte of on arrival — the copy the king is served from — so what
     is published is what was judged, whatever the private bucket holds by now. A server-side copy
     could not promise that on R2: `UploadPartCopy`, which every multi-GB shard needs, does not
     honour `x-amz-copy-source-if-match`, so the copy could not be tied to the judged version.
-    Teutonic's promotion is host-routed too, and refuses a server-side copy outright.
+    Teutonic's promotion is host-routed too, and refuses a server-side copy outright — and so does
+    the `host` path here: it never issues `CopyObject` or `UploadPartCopy`.
+
+    WHO READS THE BYTES (§8b.9). With `host=None`, `upload_tree` reads `tree` from this process's
+    disk. With a `host`, the tree lives on the serving host behind a mount, so the host re-hashes
+    each file, reports the digest and each part's MD5, and PUTs the parts to multipart uploads THIS
+    process created (with the `sha256` metadata fixed at creation) and completes only after every
+    report matches; `manifest.json` is still written last, from here. Every file then carries a
+    multipart ETag (`…-N`) rather than a single-PUT one — nothing here reads ETags — and a zero-byte
+    file is written by this process, since it has no part to send.
 
     Three refusals, and none of them repairs anything:
 
@@ -746,9 +890,17 @@ def promote_submission(tree: Path, public: S3Bucket, *, manifest: Manifest) -> s
         return present
 
     listing = public.list(destination)
-    in_place(listing)
+    present = in_place(listing)
     if destination + MANIFEST_NAME not in listing:
-        upload_tree(tree, public, destination, manifest)
+        if host is None:
+            upload_tree(tree, public, destination, manifest)
+        else:
+            # `in_place` has already refused anything at a wrong size or digest, so what is present
+            # is exactly what may be skipped — the same resume rule `upload_tree` applies.
+            host.upload(public, destination, manifest, tree,
+                        [item for item in manifest.files if item.path not in present])
+            public.put(destination + MANIFEST_NAME, manifest.as_bytes(), digest=manifest.sha256,
+                       content_type="application/json")
     arrived = public.list(destination)
     if in_place(arrived) != set(expected) or destination + MANIFEST_NAME not in arrived:
         raise StoreError(f"{destination} does not hold the whole committed tree after promotion")
@@ -873,6 +1025,7 @@ __all__ = [
     "FILE_WORKERS", "GRACE_SECONDS", "MANIFEST_NAME", "MULTIPART_THRESHOLD", "Manifest",
     "UPLOAD_ATTEMPTS", "UPLOAD_BACKOFF_SECONDS",
     "ManifestFile", "PART_SIZE", "PART_STREAMS", "Retention", "S3Bucket", "StoreError",
+    "PARTIAL_MARKER", "TreeHost", "VERIFIED_MARKER",
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
     "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
     "MODEL_NAME", "RESERVED_NAME_PREFIX", "check_model_name",

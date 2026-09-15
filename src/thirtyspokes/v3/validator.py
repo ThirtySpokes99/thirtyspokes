@@ -98,7 +98,7 @@ from .config import (
     DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS, EPISODE_CONCURRENCY, EPS,
                      EXCLUDED_REASON, FUTILE_REASON, KING_ZERO_NAME, MAX_DUELS_PER_WINDOW,
                      MAX_INFRA_DEFERRALS, MAX_QUEUE_DEPTH, MIN_SLICE_REACHED,
-                     UNCLAIMED_GRACE_SECONDS)
+                     UNCLAIMED_GRACE_SECONDS, UNCLAIMED_SWEEP_STALL_RELOG_SECONDS)
 from .duel import Contender
 from .emissions import KING0, Lineage, emission_weights
 from .funding import KEY_NAME, SealedKey, open_key
@@ -119,7 +119,7 @@ from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, P
                        adjudicate, format_window, priced)
 from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, StoreError, TreeHost,
                     apply_retention, delete_prefix, fetch_manifest, fetch_submission,
-                    promote_submission,
+                    is_digest, promote_submission,
                     retention_plan, unclaimed_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
 from .window import Window, WindowError, exclude, schedule, window_path
@@ -1132,6 +1132,12 @@ class Validator:
         self._keeper: threading.Thread | None = None
         # What the published queue last said, so an unchanged queue is not rewritten every poll.
         self._queue_published: str | None = None
+        # The unclaimed sweep's log memory (`_note_sweep`): why it last skipped, when it last said
+        # so, and how many registrations durable state protected — so a stall is a line on change
+        # and a daily reminder, not a line a minute.
+        self._sweep_note: str | None = None
+        self._sweep_noted_at: float | None = None
+        self._protected_count: int | None = None
         self._preflighted = False
         # hotkey -> the name on the manifest admitted this window, for the one that is crowned.
         self._admitted_names: dict[str, str] = {}
@@ -2484,7 +2490,9 @@ class Validator:
                                   "next_attempt_at": self._next_attempt_at(attempts)})
 
     def _apply_retention(self) -> None:
-        """§8b.7's two sweeps: a judged loser's weights, and bytes nobody ever committed to."""
+        """§8b.7's two sweeps: a judged loser's weights, and bytes nobody ever committed to. The
+        second never touches a submission the validator's durable state names
+        (`_retained_registrations`), and never runs on a partial commitment read."""
         self._retire_judged()
         self._sweep_unclaimed()
 
@@ -2497,16 +2505,57 @@ class Validator:
         a rounding error. With issuing automatic, every registered hotkey can park ~70 GB in the
         owner's bucket, and 256 uids makes that ~18 TB nobody is accountable for.
 
-        Nothing the chain names is swept, whatever its age: that is a submission, and §8b.7's
-        fortnight is the promise it earned by being judged.
+        "UNCLAIMED" IS AN ABSENCE, AND AN ABSENCE IN ONE CHAIN READ PROVES NOTHING. The sweep deletes
+        a prefix WHOLE — manifest and the sealed OpenRouter key under `access.KEY_PREFIX` included —
+        so what it trusts to name a submission decides what survives. Two guards, each closing a
+        hole the other cannot:
+
+        1. DURABLE STATE PROTECTS, WHATEVER THE CHAIN SAYS (`_retained_registrations`). The chain
+           read walks the CURRENT metagraph, so a judged hotkey that deregisters — a loser, or an
+           ex-king drawing a pension — falls out of it, and §8b.7's promise that its manifest is kept
+           forever would end a week later. The crown, a pending crown, every judged, deferred or
+           spent registration is exempt here outright; a judged prefix's weights are
+           `_retire_judged`'s alone, on its own fortnight.
+        2. A PARTIAL READ DELETES NOTHING. `read_commitments` skips a slot whose query raised, which
+           is right for the queue and fatal here: one transient RPC failure on the king's slot, once
+           its prefix is past the grace window, would delete the key its next arm is funded from and
+           end the reign through no fault of the miner. So the sweep reads `commitment_survey()` and
+           skips the whole poll if any query raised — guard 1 protects what the owner KNOWS about,
+           and this protects what only the chain knows about (a spent shot from before the ledger, a
+           commitment the daemon has not consumed yet). A slot that is empty or whose payload does
+           not decode is a fact about the slot, reads the same next poll, and never blocks it.
+
+        A metagraph read that fails raises into the same early return. Skips are logged once per
+        change of cause and again daily while they persist (`_note_sweep`), never once a poll.
         """
         try:
-            committed = {c.ready.registration_id for c in self.chain.commitments()}
-            expired = unclaimed_plan(self.private_models, committed=committed, now=self.now())
+            survey = self.chain.commitment_survey()
+            if not survey.complete:
+                failed = survey.failed_queries
+                self._note_sweep(
+                    "incomplete",
+                    f"retention: unclaimed sweep skipped — {len(failed)} commitment "
+                    f"quer{'y' if len(failed) == 1 else 'ies'} raised this poll, and nothing is "
+                    f"deleted on a partial read",
+                    reminder=f"retention: unclaimed sweep still skipped — the commitment queries "
+                             f"for {', '.join(failed[:5])}{' …' if len(failed) > 5 else ''} keep "
+                             f"raising; nothing is deleted until a read sees every slot")
+                return
+            committed = {c.ready.registration_id for c in survey.commitments}
+            protected = self._retained_registrations()
+            expired = unclaimed_plan(self.private_models, committed=committed, now=self.now(),
+                                     protected=protected)
         except Exception as exc:      # noqa: BLE001 — a chain read and a listing; retried next poll
-            self._log(f"retention: could not survey unclaimed uploads "
-                      f"({type(exc).__name__}: {exc})")
+            message = (f"retention: could not survey unclaimed uploads "
+                       f"({type(exc).__name__}: {exc})")
+            self._note_sweep(f"failed:{type(exc).__name__}", message, reminder=message)
             return
+        self._note_sweep(None, "retention: unclaimed sweep resumed")
+        if len(protected) != self._protected_count:
+            self._protected_count = len(protected)
+            self._log(f"retention: the unclaimed sweep keeps {len(protected)} registration(s) the "
+                      f"validator's own records name (crown, pending crown, judged, deferred, "
+                      f"spent)")
         for prefix in expired:
             try:
                 freed = delete_prefix(self.private_models, prefix)
@@ -2516,6 +2565,70 @@ class Validator:
             self._log(f"retention: swept {prefix} — {freed} bytes uploaded against a credential and "
                       f"never committed, untouched for "
                       f"{int(UNCLAIMED_GRACE_SECONDS // 86_400)} days")
+
+    def _note_sweep(self, key: str | None, message: str, *, reminder: str | None = None) -> None:
+        """Log the unclaimed sweep's state once per CHANGE, and `reminder` daily while it persists.
+
+        `key` None is the healthy state: it logs `message` only if a skip was noted before it, so a
+        sweep that never skipped never says it resumed. The reminder exists because a query that
+        raises every poll stalls the sweep indefinitely by design (`config.
+        UNCLAIMED_SWEEP_STALL_RELOG_SECONDS`), and the one line announcing it rotates away.
+        """
+        now = self.now()
+        if key is None:
+            if self._sweep_note is not None:
+                self._log(message)
+            self._sweep_note = self._sweep_noted_at = None
+            return
+        if key != self._sweep_note:
+            self._log(message)
+        elif (reminder is not None and self._sweep_noted_at is not None
+                and now - self._sweep_noted_at >= UNCLAIMED_SWEEP_STALL_RELOG_SECONDS):
+            self._log(reminder)
+        else:
+            return
+        self._sweep_note, self._sweep_noted_at = key, now
+
+    def _retained_registrations(self) -> frozenset[str]:
+        """Every registration id the validator's durable state says the subnet still depends on.
+
+        §8b.7's unclaimed sweep exempts these whatever the chain read returned (`_sweep_unclaimed`).
+        Read only from what `History` and the `Mailbox` already persist — no new field:
+
+        * every `judged_at` registration: losers, whose manifests §8b.7 keeps forever and whose
+          weights `_retire_judged` owns; ex-kings and pensioners; the reigning king; and a pending
+          winner, which `settle` records in the same call that defers its crown;
+        * the pending crown's registration, in case it outlives its `judged_at` entry;
+        * the reigning crown's `model_dir` basename. `Crown` carries no registration id, but
+          `_crown_for` always puts the tree at `<root>/trees/<registration id>` (and `_fund` reads
+          it back the same way), so this covers a crown set without a `judged_at` entry. Only a
+          64-hex name counts, so a hand-written path contributes nothing rather than a wrong id;
+        * every `infra_deferrals` key: an entry deferred for the owner's failure, still owed a duel;
+        * every registration the mailbox has SPENT: a shot queued, deferred or waiting behind the
+          duel cap has no verdict yet, and deleting it would destroy a submission §8b.7 never
+          authorised deleting;
+        * for a hotkey judged before `judged_at` existed, the registration the mailbox issued it.
+
+        Hotkey-only records (`coronations`, `reigns`, `windows[].crowned`) add nothing: every crowned
+        hotkey is judged, so its registration is already in `judged_at`.
+        """
+        history = self.history
+        retained = {str(entry.get("registration_id")) for entry in history.judged_at.values()
+                    if isinstance(entry, Mapping) and entry.get("registration_id")}
+        pending = history.pending_crown
+        if isinstance(pending, Mapping) and pending.get("registration_id"):
+            retained.add(str(pending["registration_id"]))
+        crown = history.crown
+        if not crown.is_king_zero and crown.model_dir and is_digest(Path(crown.model_dir).name):
+            retained.add(Path(crown.model_dir).name)
+        retained.update(str(rid) for rid in history.infra_deferrals)
+        if self.mailbox is not None:
+            retained.update(self.mailbox.spent_registrations())
+            for hotkey in history.judged - set(history.judged_at):
+                issued = self.mailbox.issued_registration(hotkey)
+                if issued:
+                    retained.add(issued)
+        return frozenset(retained)
 
     def _retire_judged(self) -> None:
         """§8b.7: delete a loser's weights 14 days after it was judged, and keep its manifest.

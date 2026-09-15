@@ -56,7 +56,8 @@ from typing import Protocol
 # apart on the one decode whose disagreement is undetectable from either side.
 from ..subnet.chain import WeightRateLimited, _decode_raw_commitment
 
-__all__ = ["Chain", "ChainError", "Commitment", "MockChain", "Metagraph", "Neuron", "ReadySignal",
+__all__ = ["Chain", "ChainError", "Commitment", "CommitmentSurvey", "MockChain", "Metagraph",
+           "Neuron", "ReadySignal", "survey_commitments",
            "SCHEDULE_PREFIX", "SerialisedChain", "WeightRateLimited", "check_weight_cadence",
            "encode_schedule", "same_weight_distribution", "serialised",
            "parse_schedule", "read_commitments", "read_metagraph",
@@ -247,6 +248,10 @@ class Chain(Protocol):
     def current_block(self) -> int: ...
     def metagraph(self) -> Metagraph: ...
     def commitments(self) -> tuple[Commitment, ...]: ...
+    # The same read, plus the slots whose query raised. `commitments()` is what the queue reads and
+    # it tolerates a failed slot; §8b.7's unclaimed sweep DELETES whatever the read did not name, so
+    # it must know when the read was partial (`CommitmentSurvey`).
+    def commitment_survey(self) -> CommitmentSurvey: ...
     def commit_ready(self, hotkey: str, signal: ReadySignal) -> None: ...
     # The owner's side of §6.3: one root for the whole schedule, written before any challenger
     # commits and readable by anyone. `schedule_root()` returns None when nothing is committed,
@@ -399,6 +404,59 @@ def read_metagraph(substrate, netuid: int, block: int) -> Metagraph:
     return Metagraph(block=block, neurons=tuple(neurons))
 
 
+@dataclass(frozen=True)
+class CommitmentSurvey:
+    """One commitment read, and whether it saw every slot it walked (§8b.7's unclaimed sweep).
+
+    THE QUEUE AND THE SWEEP NEED DIFFERENT READS. Queueing from a partial read is harmless: a slot
+    missed this poll is queued on the next. Deleting from one is not: a prefix the read failed to
+    name looks exactly like a prefix nobody committed to, and the sweep deletes it whole — sealed
+    OpenRouter key included. So the read reports what it could not see instead of hiding it.
+
+    Two different facts are kept apart. A slot that holds NO commitment, or one whose payload does
+    not decode (the owner's governance record, garbage), is a fact about the SLOT: it will read the
+    same way next poll, and it must never stop the sweep. A query that RAISED is a fact about THIS
+    READ: the slot's contents are unknown, and `failed_queries` names it so the caller can refuse to
+    act on the rest.
+    """
+
+    commitments: tuple[Commitment, ...]
+    failed_queries: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed_queries
+
+
+def survey_commitments(substrate, netuid: int, metagraph: Metagraph) -> CommitmentSurvey:
+    """Every readable `r2ready:v1` commitment IN QUEUE ORDER, and the hotkeys whose query raised.
+
+    The QUERY and the DECODE are guarded separately because they fail for different reasons
+    (`CommitmentSurvey`). Everything after the query returns — the `Raw<N>` field decode, the block,
+    `ReadySignal.parse` — is a property of the bytes on chain and is skipped, as it always was.
+    """
+    found: list[Commitment] = []
+    failed: list[str] = []
+    for neuron in metagraph.neurons:
+        try:
+            record = _value(substrate.query("Commitments", "CommitmentOf", [netuid, neuron.hotkey]))
+        except Exception:  # noqa: BLE001 — a transport failure: this slot is unknown, not empty
+            failed.append(neuron.hotkey)
+            continue
+        try:
+            raw = _decode_raw_commitment(record["info"]["fields"]) if record else None
+            if raw is None:
+                continue
+            found.append(Commitment(hotkey=neuron.hotkey, block=int(record["block"]),
+                                    ready=ReadySignal.parse(raw)))
+        except Exception:  # noqa: BLE001 — a payload that does not decode reads the same next poll
+            continue
+    return CommitmentSurvey(
+        commitments=tuple(sorted(found, key=lambda commitment: (commitment.block,
+                                                                commitment.hotkey))),
+        failed_queries=tuple(sorted(failed)))
+
+
 def read_commitments(substrate, netuid: int, metagraph: Metagraph) -> tuple[Commitment, ...]:
     """Every readable `r2ready:v1` commitment, IN QUEUE ORDER (§8b.1).
 
@@ -409,21 +467,13 @@ def read_commitments(substrate, netuid: int, metagraph: Metagraph) -> tuple[Comm
 
     A slot that does not decode is SKIPPED, not raised on, for the reason `decode_revealed` gives:
     the owner's own governance record lives in this same map, and one malformed payload must not
-    blind the validator to every other miner's submission. Returned sorted by `(block, hotkey)` so
-    the queue order is a property of the read rather than of whoever consumes it.
+    blind the validator to every other miner's submission. A slot whose query RAISES is skipped too,
+    which is right for the queue — it is re-read next poll — and wrong for anything that DELETES on
+    the strength of what the read did not name; that caller uses `survey_commitments`. Returned
+    sorted by `(block, hotkey)` so the queue order is a property of the read rather than of whoever
+    consumes it.
     """
-    found: list[Commitment] = []
-    for neuron in metagraph.neurons:
-        try:
-            record = _value(substrate.query("Commitments", "CommitmentOf", [netuid, neuron.hotkey]))
-            raw = _decode_raw_commitment(record["info"]["fields"]) if record else None
-            if raw is None:
-                continue
-            found.append(Commitment(hotkey=neuron.hotkey, block=int(record["block"]),
-                                    ready=ReadySignal.parse(raw)))
-        except Exception:  # noqa: BLE001 — one unreadable slot must not hide the rest of the queue
-            continue
-    return tuple(sorted(found, key=lambda commitment: (commitment.block, commitment.hotkey)))
+    return survey_commitments(substrate, netuid, metagraph).commitments
 
 
 def read_immunity_period(subtensor, netuid: int) -> int:
@@ -474,9 +524,10 @@ class MockChain:
     3. **It skips an unchanged slate unless forced**, using the live chain's own comparison, so the
        `force` flag means here what it means there.
 
-    A commitment SURVIVES deregistration, as `CommitmentOf` does on the real chain. It becomes
-    unreadable simply because `commitments()` walks the metagraph, which is the same reason it is
-    unreadable live.
+    A commitment SURVIVES deregistration, as `CommitmentOf` does on the real chain. It drops out of
+    `commitments()` simply because that read walks the metagraph, which is the same reason it drops
+    out live. That is a different state from `failing_queries`: a hotkey still registered whose
+    `CommitmentOf` query RAISES, as a transient RPC failure does live.
     """
 
     # 100 blocks is the value `koth/neuron.py` records for the live subnet; it is a field rather than
@@ -488,6 +539,9 @@ class MockChain:
     block: int = 0
     weights: dict[int, float] = field(default_factory=dict)
     weights_set_at: int | None = None
+    # Registered hotkeys whose commitment query raises this poll: `commitments()` skips them, as the
+    # live read does, and `commitment_survey()` reports them, as `survey_commitments` does.
+    failing_queries: set[str] = field(default_factory=set)
 
     _uid_of: dict[str, int] = field(default_factory=dict)
     _registered_at: dict[str, int] = field(default_factory=dict)
@@ -527,14 +581,24 @@ class MockChain:
              for hotkey, uid in self._uid_of.items()), key=lambda neuron: neuron.uid)))
 
     def commitments(self) -> tuple[Commitment, ...]:
+        return self.commitment_survey().commitments
+
+    def commitment_survey(self) -> CommitmentSurvey:
         found: list[Commitment] = []
+        failed: list[str] = []
         for neuron in self.metagraph().neurons:
+            if neuron.hotkey in self.failing_queries:
+                failed.append(neuron.hotkey)
+                continue
             payload, block = self._commit.get(neuron.hotkey, (None, 0))
             try:
                 found.append(Commitment(neuron.hotkey, block, ReadySignal.parse(payload or "")))
             except ValueError:
                 continue
-        return tuple(sorted(found, key=lambda commitment: (commitment.block, commitment.hotkey)))
+        return CommitmentSurvey(
+            commitments=tuple(sorted(found, key=lambda commitment: (commitment.block,
+                                                                    commitment.hotkey))),
+            failed_queries=tuple(sorted(failed)))
 
     def commit_schedule(self, root: str, *, replace_governance: bool = False) -> None:
         # Models the live guard: the owner's slot is shared with whatever else publishes there, and
@@ -687,6 +751,10 @@ class BittensorChain:  # pragma: no cover — needs a live chain + wallet
 
     def commitments(self) -> tuple[Commitment, ...]:
         return read_commitments(self._substrate, self.netuid, self.metagraph())
+
+    def commitment_survey(self) -> CommitmentSurvey:
+        # A metagraph read that fails RAISES here, and the sweep's caller skips the poll on it.
+        return survey_commitments(self._substrate, self.netuid, self.metagraph())
 
     def commit_ready(self, hotkey: str, signal: ReadySignal) -> None:
         """Write this wallet's ready signal, and RAISE if the chain did not accept it.

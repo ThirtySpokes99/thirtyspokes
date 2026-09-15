@@ -744,3 +744,26 @@ def test_a_file_the_manifest_names_but_the_prefix_lacks_is_refused_before_any_do
         fetch_submission(bucket, tmp_path / "pulled", commitment=commitment(manifest.sha256),
                          registration=REGISTRATION)
     assert downloads == []
+
+
+def test_an_empty_session_token_puts_no_token_into_a_presigned_url():
+    """R2 refuses a presigned URL whose `X-Amz-Security-Token` is empty (400 InvalidArgument), and
+    boto3 writes one whenever it is handed "" rather than None — which is exactly what a deployment
+    without temporary credentials passes. Every host-routed fetch and promotion rides on these URLs.
+    Presigning is a local signature computation, so this reaches no network."""
+    pytest.importorskip("boto3")
+    from datetime import datetime, timezone
+
+    from thirtyspokes.v3.access import Credential
+
+    def presigned(token: str) -> tuple[str, str]:
+        live = store_module.r2_bucket(Credential(
+            endpoint="https://r2.example.invalid", bucket=PUBLIC_BUCKET,
+            access_key_id="AKIDEXAMPLE", secret_access_key="secret", session_token=token,
+            expires_at=datetime.now(timezone.utc)))
+        return (live.presign_get("models/sha256/x/config.json", expires=60),
+                live.presign_upload_part("models/sha256/x/model.safetensors", "upload-1", 1,
+                                         expires=60))
+
+    assert all("X-Amz-Security-Token" not in url for url in presigned(""))
+    assert all("X-Amz-Security-Token=temporary" in url for url in presigned("temporary"))

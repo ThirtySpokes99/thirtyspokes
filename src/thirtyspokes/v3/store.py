@@ -535,11 +535,15 @@ class S3Bucket:
 
 
 def r2_bucket(credential: access.Credential) -> S3Bucket:
-    """The real R2 bucket from a mailbox credential. THE ONE FUNCTION HERE WITH NO OFFLINE TEST.
+    """The real R2 bucket from a mailbox credential. It never reaches R2 in a test.
 
     It carries no logic — every decision in it is one of the constants above — and is deliberately
     kept that way, because the alternative to "untested configuration" is "untested configuration
-    plus untested behaviour". `region_name="auto"` is R2's requirement; the connection pool is sized
+    plus untested behaviour". The one thing tested offline is what it signs, because presigning is a
+    local computation: an EMPTY session token must reach boto3 as None. boto3 treats "" as a token
+    and writes an empty `X-Amz-Security-Token` into every presigned URL, which R2 refuses with 400
+    InvalidArgument — so every host-routed fetch and promotion (`hosttrees.py`) fails, while the
+    header-signed calls made from this process keep working and hide it. `region_name="auto"` is R2's requirement; the connection pool is sized
     to the two concurrencies (2 files x 4 part streams) so the transfer is not serialised behind
     it; and boto3's default 8 MiB chunk is replaced by the pinned 64 MiB, which over a 71.9 GB tree
     is ~1,100 part requests instead of ~8,600; and the body is sent unsigned, because a signed body
@@ -555,7 +559,8 @@ def r2_bucket(credential: access.Credential) -> S3Bucket:
     client = boto3.client(
         "s3", endpoint_url=credential.endpoint, aws_access_key_id=credential.access_key_id,
         aws_secret_access_key=credential.secret_access_key,
-        aws_session_token=credential.session_token, region_name="auto",
+        # None, never "": an empty token is signed into every presigned URL and R2 refuses it.
+        aws_session_token=credential.session_token or None, region_name="auto",
         config=Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"},
                       max_pool_connections=FILE_WORKERS * PART_STREAMS,
                       request_checksum_calculation="when_required",

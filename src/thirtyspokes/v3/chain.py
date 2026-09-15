@@ -46,7 +46,8 @@ from __future__ import annotations
 
 import base64
 import re
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -56,7 +57,8 @@ from typing import Protocol
 from ..subnet.chain import WeightRateLimited, _decode_raw_commitment
 
 __all__ = ["Chain", "ChainError", "Commitment", "MockChain", "Metagraph", "Neuron", "ReadySignal",
-           "SCHEDULE_PREFIX", "WeightRateLimited", "check_weight_cadence", "encode_schedule",
+           "SCHEDULE_PREFIX", "SerialisedChain", "WeightRateLimited", "check_weight_cadence",
+           "encode_schedule", "same_weight_distribution", "serialised",
            "parse_schedule", "read_commitments", "read_metagraph",
            "read_immunity_period", "read_weights_rate_limit"]
 
@@ -262,7 +264,9 @@ class Chain(Protocol):
     # `force` re-submits an UNCHANGED slate, which both implementations otherwise skip. A stable
     # reign is precisely an unchanged slate, and a validator that never re-submits ages out of Yuma's
     # `activity_cutoff` while scoring every window correctly — measured on netuid 99, where
-    # `last_update` reached 2234 blocks against a cutoff of 5000 (`koth/neuron.py`).
+    # `last_update` reached 2234 blocks against a cutoff of 5000 (`koth/neuron.py`). The validator's
+    # forced refresh runs continuously on its own thread, INCLUDING while a window holds the main
+    # loop, because a window with challengers can last most of that cutoff (`SerialisedChain`).
     def set_weights(self, weights: Mapping[int, float], *, force: bool = False) -> None: ...
     def weights_rate_limit(self) -> int: ...
     # How stale the slate this hotkey has ON CHAIN is, or None if it has never set one. Read
@@ -292,6 +296,67 @@ def check_weight_cadence(window_blocks: int, rate_limit: int) -> None:
             f"{rate_limit} blocks (§8b.6): the validator would set weights faster than the chain "
             f"accepts, the update would be rejected, and the PREVIOUS schedule would silently stay "
             f"in force. Lengthen the window past {rate_limit} blocks.")
+
+
+class SerialisedChain:
+    """A `Chain` whose every call, from every thread, runs under ONE lock.
+
+    WHY IT EXISTS. The validator keeps its slate fresh from a background thread while the main loop
+    runs a window, and both threads talk to the chain. The live seam wraps one SDK websocket client,
+    which is not safe for concurrent use: two interleaved requests on one socket can read each other's
+    responses, and a weight write that reads a metagraph reply as its rate-limit answer fails in ways
+    no log explains. Serialising at the seam, once, makes that impossible to forget at a call site —
+    a lock taken around "the calls that looked risky" is the version that misses one.
+
+    Attributes are resolved on the WRAPPED chain at call time, inside the lock, so a test that
+    replaces a method on the inner chain is honoured; a write to the wrapper is forwarded to the
+    inner chain for the same reason, so the two can never silently diverge. A non-callable attribute
+    passes through UNLOCKED — which is why the beacon, which drives the SDK through `_substrate`, is
+    serialised separately with this same lock (`serialised`). The lock is re-entrant so a wrapped call
+    that comes back through the wrapper cannot deadlock itself.
+    """
+
+    __slots__ = ("_inner", "lock")
+
+    def __init__(self, inner, lock: threading.RLock | None = None) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "lock", lock if lock is not None else threading.RLock())
+
+    @property
+    def inner(self):
+        return self._inner
+
+    def __getattr__(self, name: str):
+        value = getattr(self._inner, name)
+        if not callable(value):
+            return value
+
+        def call(*args, **kwargs):
+            with self.lock:
+                return getattr(self._inner, name)(*args, **kwargs)
+
+        call.__name__ = name
+        return call
+
+    def __setattr__(self, name: str, value) -> None:
+        setattr(self._inner, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._inner, name)
+
+
+def serialised(function: Callable, lock) -> Callable:
+    """`function`, run under `lock` — for a chain reader that reaches the SDK outside the `Chain`
+    methods (`validator.chain_beacon`), so it shares `SerialisedChain`'s one lock."""
+    if getattr(function, "__serialised_lock__", None) is lock:
+        return function
+
+    def call(*args, **kwargs):
+        with lock:
+            return function(*args, **kwargs)
+
+    call.__serialised_lock__ = lock
+    return call
 
 
 # --- live reads, as functions over the SDK objects that own them ----------------------------------

@@ -50,7 +50,7 @@ from thirtyspokes.v3.config import (DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECO
                                      EXCLUDED_REASON,
                                      MAX_DUELS_PER_WINDOW, MAX_QUEUE_DEPTH, FUTILE_REASON)
 from thirtyspokes.v3.devkit import suite_grade
-from thirtyspokes.v3.emissions import KING0
+from thirtyspokes.v3.emissions import KING0, emission_weights
 from thirtyspokes.v3.gateway import OwnerGateway
 from thirtyspokes.v3.openrouter import Completion
 from thirtyspokes.v3.scaffold import Scaffold
@@ -1139,6 +1139,384 @@ def test_a_stable_reign_is_re_submitted_between_windows_so_it_does_not_age_out(t
     h.chain.block += 1
     h.validator.step()
     assert h.chain.weights_set_at == h.chain.block - 1
+
+
+# --- the weight keeper: the slate stays fresh while a window holds the loop --------------------------
+
+
+def _stop_after(steps: int):
+    ticks = {"n": 0}
+
+    def stop() -> bool:
+        ticks["n"] += 1
+        return ticks["n"] > steps
+
+    return stop
+
+
+def test_a_window_that_holds_the_loop_for_hours_still_has_its_slate_refreshed(tmp_path):
+    """A window with challengers is one blocking call lasting most of the activity cutoff — a tree
+    fetch, a king arm, every challenger arm. A refresh that only the loop could reach would age this
+    validator, and with it the subnet's whole incentive, out of consensus inside that call."""
+    h = harness(tmp_path)
+    h.run(1, at_block=CADENCE.opens_at(2) - 1)             # the last write is a block old
+    first_write = h.chain.weights_set_at
+    refreshed = threading.Event()
+    real_set_weights = h.chain.set_weights
+
+    def set_weights(weights, *, force=False):
+        real_set_weights(weights, force=force)
+        if h.chain.weights_set_at > first_write:
+            refreshed.set()
+
+    h.chain.set_weights = set_weights
+    inside: dict = {}
+
+    def run_window(window):
+        h.chain.block = first_write + daemon.WEIGHT_REFRESH_BLOCKS      # hours pass in one call
+        inside["refreshed"] = refreshed.wait(timeout=10)
+        inside["written_at"] = h.chain.weights_set_at
+        return None
+
+    h.validator.run_window = run_window
+    h.chain.block = CADENCE.opens_at(2)
+    h.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1), keeper_poll_seconds=0.001)
+
+    assert inside["refreshed"], "no refresh landed while the window held the loop"
+    assert inside["written_at"] == first_write + daemon.WEIGHT_REFRESH_BLOCKS
+    assert not h.validator._keeper.is_alive()
+
+
+def test_the_weight_keeper_stops_when_the_loop_stops_and_a_refused_launch_starts_none(tmp_path):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(3) + CADENCE.window_blocks         # past the schedule
+    h.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1), keeper_poll_seconds=0.001)
+
+    assert h.validator._keeper is not None and not h.validator._keeper.is_alive()
+    assert daemon.WEIGHT_KEEPER_THREAD not in {thread.name for thread in threading.enumerate()}
+
+    refused = harness(tmp_path / "refused")
+    refused.chain.rate_limit = 500                    # longer than the window: preflight refuses it
+    with pytest.raises(Exception, match="weights_rate_limit"):
+        refused.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1))
+    assert refused.validator._keeper is None, "a misconfigured launch must write nothing"
+
+
+def test_the_keeper_and_the_loop_never_use_the_chain_at_the_same_time(tmp_path):
+    """The live seam is one websocket client that is not safe for concurrent use. A keeper tick
+    arriving while the loop is inside a chain call waits for it — and so does the window's beacon,
+    which drives the same client without going through the `Chain` methods."""
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    entered, release = threading.Event(), threading.Event()
+    guard = threading.Lock()
+    inside = {"now": 0, "most": 0}
+
+    def occupied(call):
+        def run(*args, **kwargs):
+            with guard:
+                inside["now"] += 1
+                inside["most"] = max(inside["most"], inside["now"])
+            try:
+                return call(*args, **kwargs)
+            finally:
+                with guard:
+                    inside["now"] -= 1
+        return run
+
+    real_set_weights = h.chain.set_weights
+
+    def slow_set_weights(weights, *, force=False):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = occupied(slow_set_weights)
+    h.chain.current_block = occupied(h.chain.current_block)
+    h.chain.metagraph = occupied(h.chain.metagraph)
+    loop = threading.Thread(target=h.validator.chain.set_weights, args=({0: 1.0},),
+                            kwargs={"force": True})
+    loop.start()
+    assert entered.wait(timeout=10)
+
+    ticked, nonce = threading.Event(), threading.Event()
+    threading.Thread(target=lambda: (h.validator._keep_weights_once(), ticked.set())).start()
+    threading.Thread(target=lambda: (h.validator.beacon(1), nonce.set())).start()
+    assert not ticked.wait(timeout=0.1), "the keeper used the chain while a write was in flight"
+    assert not nonce.wait(timeout=0.05), "the beacon used the chain while a write was in flight"
+
+    release.set()
+    assert ticked.wait(timeout=10) and nonce.wait(timeout=10)
+    loop.join(timeout=10)
+    assert inside["most"] == 1
+
+
+def test_a_refresh_writes_the_same_slate_the_window_wrote_while_king_zero_is_paid_at_a_uid(tmp_path):
+    """Every write path builds the slate through one function. The refresh used to leave out
+    `king_zero_uid`, so between two windows that each paid King₀'s share at its uid, the refresh
+    quietly moved it to the burn."""
+    h = harness(tmp_path)
+    seat = h.chain.register(address("genesis-seat"))
+    h.validator.king_zero_uid = seat
+    reveal = h.run(1)
+    assert reveal.report.weights[seat] == pytest.approx(0.85)
+
+    h.chain.block += daemon.WEIGHT_REFRESH_BLOCKS
+    assert h.validator._keep_weights_once()
+    assert h.chain.weights == reveal.report.weights
+
+    h.chain.block = CADENCE.opens_at(3) + CADENCE.window_blocks         # the loop's idle path
+    assert h.validator.step() is None
+    assert h.chain.weights_set_at == h.chain.block
+    assert h.chain.weights == reveal.report.weights
+
+
+def test_a_coronation_slate_is_retried_as_soon_as_the_rate_limit_allows_not_a_cadence_later(
+        tmp_path, capsys):
+    """A refresh that lands just before the window's write makes that write rate-limited. The new
+    king's slate must follow the first block the chain would accept it — not wait out the refresh
+    cadence with the old king still paid — and the ticks in between neither write nor log."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    refreshed_at = h.chain.weights_set_at
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong and reveal.weights_written is False
+    note = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]["note"]
+    assert "rate-limited" in note and "identical" not in note
+    king_uid = h.chain.metagraph().resolve(strong).uid
+    assert king_uid not in h.chain.weights                      # the old slate is still paying
+    retry_at = refreshed_at + h.chain.rate_limit + 1
+    assert retry_at - refreshed_at < daemon.WEIGHT_REFRESH_BLOCKS
+
+    capsys.readouterr()
+    for block in range(refreshed_at + 1, retry_at):
+        h.chain.block = block
+        assert not h.validator._keep_weights_once()
+    assert capsys.readouterr().out == ""
+
+    h.chain.block = retry_at
+    assert h.validator._keep_weights_once()
+    assert h.chain.weights[king_uid] == pytest.approx(0.85)
+
+
+def test_a_rate_limited_refresh_is_attempted_and_logged_once_until_the_chain_would_accept_it(
+        tmp_path, capsys):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    attempts: list[int] = []
+    real_set_weights = h.chain.set_weights
+
+    def counting(weights, *, force=False):
+        attempts.append(h.chain.block)
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = counting
+    due = CADENCE.opens_at(1) + daemon.WEIGHT_REFRESH_BLOCKS
+    h.chain.weights_set_at = due - 10               # a write this process did not make
+    capsys.readouterr()
+
+    for block in range(due, due + 30):
+        h.chain.block = block
+        h.validator._keep_weights_once()
+
+    assert attempts == [due]
+    logged = [line for line in capsys.readouterr().out.splitlines() if "rate-limited" in line]
+    assert len(logged) == 1
+    h.chain.block = due - 10 + h.chain.rate_limit + 1
+    assert h.validator._keep_weights_once() and attempts[-1] == h.chain.block
+
+
+def test_keeper_exceptions_are_logged_once_and_retried_until_the_chain_recovers(tmp_path, capsys):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    outages = {"left": 3}
+    real_metagraph = h.chain.metagraph
+
+    def flaky():
+        if outages["left"]:
+            outages["left"] -= 1
+            raise ConnectionError("websocket closed")
+        return real_metagraph()
+
+    h.chain.metagraph = flaky
+
+    class Ticks(threading.Event):
+        """`stop`, set after a fixed number of ticks, so the loop runs without sleeping."""
+
+        def __init__(self, ticks: int) -> None:
+            super().__init__()
+            self.left = ticks
+
+        def wait(self, timeout=None) -> bool:
+            self.left -= 1
+            if self.left <= 0:
+                self.set()
+            return self.is_set()
+
+    h.validator._keep_weights_forever(Ticks(5), 0.0)         # returns: nothing escaped
+
+    out = capsys.readouterr().out
+    assert out.count("weight keeper: ConnectionError") == 1
+    assert "the chain answers again" in out
+    assert h.chain.weights_set_at == h.chain.block
+
+
+def test_a_keeper_that_keeps_failing_never_takes_the_loop_or_the_window_down(
+        tmp_path, capsys, monkeypatch):
+    h = harness(tmp_path)
+    uncaught: list = []
+    monkeypatch.setattr(threading, "excepthook", uncaught.append)
+    failed = threading.Event()
+    failures = {"n": 0}
+    real_block = h.chain.current_block
+
+    def block():
+        if threading.current_thread().name == daemon.WEIGHT_KEEPER_THREAD:
+            failures["n"] += 1
+            if failures["n"] >= 3:
+                failed.set()
+            raise ConnectionError("websocket closed")
+        return real_block()
+
+    h.chain.current_block = block
+    windows: list[bool] = []
+
+    def run_window(window):
+        windows.append(failed.wait(timeout=10))
+        return None
+
+    h.validator.run_window = run_window
+    h.chain.block = CADENCE.opens_at(1)
+    h.validator.run_forever(poll_seconds=0.0, should_stop=lambda: bool(windows),
+                            keeper_poll_seconds=0.001)
+
+    assert windows == [True]
+    assert uncaught == []
+    assert not h.validator._keeper.is_alive()
+    assert capsys.readouterr().out.count("weight keeper: ConnectionError") == 1
+
+
+def test_a_keeper_tick_never_sees_a_half_settled_history(tmp_path):
+    """`_publish` moves the crown, settles, computes the slate and writes it as one step. A keeper
+    tick arriving between the coronation and the settle waits, and the only slate that reaches the
+    chain is the settled one."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    slates: list[dict] = []
+    real_set_weights = h.chain.set_weights
+
+    def recording(weights, *, force=False):
+        slates.append(dict(weights))
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = recording
+    computed = threading.Event()
+    real_slate = h.validator._slate
+
+    def watched(metagraph):
+        if threading.current_thread().name == "keeper-tick":
+            computed.set()
+        return real_slate(metagraph)
+
+    h.validator._slate = watched
+    tick = threading.Thread(target=h.validator._keep_weights_once, name="keeper-tick")
+    seen: dict = {}
+    real_settle = h.validator.history.settle
+
+    def settle(*args, **kwargs):
+        tick.start()                                  # the crown has moved; nothing is settled
+        seen["waited"] = not computed.wait(timeout=0.2)
+        return real_settle(*args, **kwargs)
+
+    h.validator.history.settle = settle
+    h.chain.block = CADENCE.opens_at(1)
+    reveal = h.run(1)
+    tick.join(timeout=10)
+
+    assert reveal.report.crowned == strong
+    assert seen["waited"], "the keeper computed a slate in the middle of _publish"
+    assert computed.is_set() and not tick.is_alive()
+    assert slates == [reveal.report.weights]
+
+
+def test_a_deregistered_king_is_paid_as_a_reversion_by_the_keeper_without_touching_history(tmp_path):
+    """§5.5's payout cannot wait for the window to end, and the keeper cannot record it: it runs
+    beside a window and never changes history. It pays King₀'s slate — pension ranks unshifted — and
+    the loop's idle path records the reversion later without writing the same slate twice."""
+    h = harness(tmp_path)
+    h.crown("old", router(h))
+    king = h.crown("king", router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    h.chain.deregister(king)
+    reigns = [dict(reign) for reign in h.validator.history.reigns]
+
+    h.chain.block = CADENCE.opens_at(1) + h.chain.rate_limit + 1     # well inside the cadence
+    assert h.validator._keep_weights_once(), "a changed slate is due at once"
+
+    hotkey_of = h.chain.metagraph().hotkey_of
+    lineage = h.validator.history.lineage()
+    reverted = emission_weights(lineage, KING0, hotkey_of, burn_uid=0)
+    assert h.chain.weights == reverted
+    assert reverted != emission_weights(lineage, king, hotkey_of, burn_uid=0)
+    assert h.validator.history.crown.hotkey == king
+    assert h.validator.history.reigns == reigns
+
+    written_at = h.chain.weights_set_at
+    h.chain.block += 1
+    assert h.validator._refresh_weights(h.chain.block) is False     # recorded, not re-written
+    assert h.validator.history.crown.is_king_zero
+    assert h.validator.history.reigns[-2]["ended"] == "deregistered"
+    assert h.chain.weights_set_at == written_at
+
+
+def test_a_king_that_deregisters_mid_window_is_published_as_a_reversion_in_every_field(tmp_path):
+    """The window's own write pays §5.5's reversion only after recording it, so the signed reveal's
+    weights, pensioners, reign and history.json all describe the same throne."""
+    h = harness(tmp_path)
+    king = h.crown("king", router(h))
+    real_settle = h.validator.history.settle
+
+    def settle(*args, **kwargs):
+        h.chain.deregister(king)                      # after the window opened on a live king
+        return real_settle(*args, **kwargs)
+
+    h.validator.history.settle = settle
+    reveal = h.run(1)
+
+    assert reveal.report.king_hotkey == king                  # the king the window opened with
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["reign"]["genesis"] is True
+    assert record["reign"]["previous"]["hotkey"] == king
+    assert record["reign"]["previous"]["reason"] == "deregistered"
+    assert reveal.report.pensioners == (king,)
+    assert reveal.report.weights == emission_weights(
+        h.validator.history.lineage(), KING0, h.chain.metagraph().hotkey_of, burn_uid=0)
+    assert json.loads(h.validator.history.path.read_text())["crown"]["hotkey"] == KING0
+
+
+def test_a_window_write_pre_empted_by_the_keeper_names_the_identical_slate_and_keeps_its_record(
+        tmp_path):
+    """Written=false stays true of the window's own write, and says the slate it computed is the one
+    on chain; a keeper write afterwards never rewrites what the reveal recorded."""
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+
+    reveal = h.run(1)
+
+    assert reveal.weights_written is False
+    record = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
+    assert "rate-limited" in record["note"]
+    assert f"an identical slate was written at block {CADENCE.opens_at(1)}" in record["note"]
+    h.chain.block += daemon.WEIGHT_REFRESH_BLOCKS
+    assert h.validator._keep_weights_once()
+    assert json.loads(h.validator._local_reveal(1).read_text())["weights_set"] == record
 
 
 def test_a_launch_the_chain_would_silently_defeat_is_refused_before_anything_is_scored(tmp_path):

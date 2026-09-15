@@ -24,9 +24,9 @@ from __future__ import annotations
 import pytest
 
 from thirtyspokes.v3.chain import (COMMITMENT_MAX_BYTES, ChainError, Commitment, Metagraph,
-                                    MockChain, Neuron, ReadySignal, WeightRateLimited,
-                                    check_weight_cadence, read_commitments, read_metagraph,
-                                    read_weights_rate_limit)
+                                    MockChain, Neuron, ReadySignal, SerialisedChain,
+                                    WeightRateLimited, check_weight_cadence, read_commitments,
+                                    read_metagraph, read_weights_rate_limit, serialised)
 from thirtyspokes.v3.emissions import Lineage, emission_weights
 
 BURN_UID = 0
@@ -48,6 +48,43 @@ def arena() -> MockChain:
     assert chain.register("hk_ex_king") == 5
     chain.register("hk_king")
     return chain
+
+
+def test_a_serialised_chain_runs_one_call_at_a_time_and_honours_a_patched_inner_chain():
+    """The validator's weight keeper and its loop share one SDK client that cannot be used
+    concurrently, so every call through the wrapper waits for the one in flight. Attributes are
+    resolved on the inner chain at call time, and written through to it, so a patch is never
+    shadowed by the wrapper."""
+    import threading
+
+    chain = arena()
+    wrapped = SerialisedChain(chain)
+    assert wrapped.current_block() == chain.block
+    chain.current_block = lambda: 42
+    assert wrapped.current_block() == 42
+    wrapped.block = 7
+    assert chain.block == 7 and wrapped.block == 7
+
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+
+    def slow():
+        entered.set()
+        assert release.wait(timeout=10)
+        return ()
+
+    chain.commitments = slow
+    writer = threading.Thread(target=wrapped.commitments)
+    writer.start()
+    assert entered.wait(timeout=10)
+    threading.Thread(target=lambda: (wrapped.immunity_period(), done.set())).start()
+    assert not done.wait(timeout=0.1), "a second caller ran while the first was inside the chain"
+    release.set()
+    assert done.wait(timeout=10)
+    writer.join(timeout=10)
+
+    nonce = serialised(lambda window: f"nonce-{window}", wrapped.lock)
+    assert nonce(3) == "nonce-3"
+    assert serialised(nonce, wrapped.lock) is nonce, "wrapping twice must not stack a second lock"
 
 
 # --- the rule this module exists for: UID recycling (§5.7) ---------------------------------------

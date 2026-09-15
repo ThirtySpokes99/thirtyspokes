@@ -54,8 +54,10 @@ WHAT IS DELIBERATELY ABSENT: any decay, heartbeat or default slate. If the valid
 window, weights are left untouched and the previous schedule persists (§8b.6) — the documented cost
 of the owner-liveness dependency (D1) and the right failure, since decaying weights toward nothing
 would punish a king for the owner's outage. The only way to express "we do nothing" in code is to
-have nothing here that could do something, so the only write is `_write_weights`, and nothing calls
-it on a schedule of its own.
+have nothing here that could do something, so the only write is `_write_weights`, and nothing ever
+hands it a slate of its own: the weight keeper (`_keep_weights_forever`) re-submits the CURRENT
+slate, derived from persisted history and a fresh metagraph by the same `_slate` a window uses, so
+it keeps the reign earning and never invents a schedule.
 
 **THIS MODULE IS NEVER RUN AGAINST A LIVE NETWORK BY ITS TESTS.** `thirtyspokes-validator` builds
 real seams from real credentials; the tests drive the identical `Validator` over `chain.MockChain`, a
@@ -84,7 +86,8 @@ from ..koth import holdout_feed
 from .access import AccessError, Mailbox, Registration
 from .admission import Reference, admit
 from .benchmarks.base import check_protocol
-from .chain import Chain, Commitment, Metagraph, WeightRateLimited, check_weight_cadence
+from .chain import (Chain, Commitment, Metagraph, SerialisedChain, WeightRateLimited,
+                    check_weight_cadence, same_weight_distribution, serialised)
 from .conductor import Conductor
 from .config import (
     RETEST_COST_TOLERANCE,
@@ -127,11 +130,27 @@ __all__ = ["Cadence", "Checkpoint", "Crown", "check_chain_launch", "History", "O
 # of 5000. A 24-hour window is 7200 blocks, so ONE weight write per window ages out of consensus by
 # design. The fix is KOTH's: re-submit the unchanged slate on a cadence the cutoff cannot outrun.
 # It must exceed the chain's `weights_rate_limit` or every second refresh is rejected (`_preflight`).
+# The cadence is kept by a THREAD of its own (`Validator._keep_weights_forever`), not by the loop: a
+# window with challengers holds the loop through a tree fetch, a king arm and every challenger arm,
+# which can be most of the activity cutoff, and this validator's slate is the subnet's whole incentive.
 WEIGHT_REFRESH_BLOCKS = 180
 
 # How often the daemon looks at the chain. Windows are hours long, so this only bounds how late a
 # window opens; polling faster costs RPC and buys nothing.
 POLL_SECONDS = 60.0
+
+# How often the weight keeper looks. A few blocks per tick against a 180-block cadence: the cost is
+# one block read and one metagraph read a tick, and what it buys is that a CHANGED slate — a
+# coronation, a deregistered pensioner — lands within a tick of the rate limit allowing it.
+WEIGHT_KEEPER_POLL_SECONDS = 60.0
+# A write that failed for a reason other than the rate limit is retried after 1, 2, 4, … blocks, capped
+# here — far below the refresh cadence, so an unhealthy chain delays the slate by minutes rather than
+# a cadence, and far above zero, so it is not hammered with an extrinsic every tick.
+WEIGHT_RETRY_MAX_BLOCKS = 32
+# How long `run_forever` waits for the keeper to finish its tick on the way out. Bounded because a
+# tick can be inside a hung chain call, and the thread is a daemon thread that dies with the process.
+WEIGHT_KEEPER_JOIN_SECONDS = 5.0
+WEIGHT_KEEPER_THREAD = "v3-weight-keeper"
 
 STATE_VERSION = 1
 
@@ -227,7 +246,8 @@ def check_launch(*, window_blocks: int, immunity_blocks: int, rate_limit: int) -
       the one that was computed. `check_weight_cadence` owns that comparison, including the
       off-by-one against the writer's own guard;
     * `WEIGHT_REFRESH_BLOCKS` below the same limit would have every second forced refresh rejected,
-      and the refresh is what stops a stable reign ageing out of Yuma's `activity_cutoff`;
+      and the refresh — kept continuously by the weight keeper, while a window runs as well as
+      between windows — is what stops a stable reign ageing out of Yuma's `activity_cutoff`;
     * an `immunity_period` shorter than the queue's drain time deregisters challengers before they
       are ever evaluated, having paid a registration burn for nothing (§8b.1). The requirement is
       derived from the caps rather than written down as a headcount, so it stays correct when the
@@ -949,11 +969,34 @@ class Validator:
                            per_benchmark=self.per_benchmark, minimum=self.minimum)
         self._entries = {entry["epoch"]: entry for entry in entries}
         self.manifest = holdout_feed.manifest(entries)
+        # TWO LOCKS, ALWAYS TAKEN IN THIS ORDER: state, then chain. The chain lock is held for one
+        # call into the chain and nothing else, and a chain call never touches the validator, so no
+        # thread can hold the chain lock while waiting for the state lock.
+        #
+        # The chain lock serialises every call from the loop and the weight keeper onto the one SDK
+        # client (`SerialisedChain`), the beacon included — it drives that client directly. `None`
+        # seams are left alone: the schedule-root CLI builds a Validator with no chain at all.
+        if self.chain is not None and not isinstance(self.chain, SerialisedChain):
+            self.chain = SerialisedChain(self.chain)
+        self._chain_lock = self.chain.lock if self.chain is not None else threading.RLock()
+        if self.beacon is not None:
+            self.beacon = serialised(self.beacon, self._chain_lock)
+        # The state lock covers every change to the crown or the coronations, and every slate
+        # computed and written from them. The keeper reads history under it and never writes it, so
+        # it cannot see `_publish` between crowning and settling, nor slip a pre-coronation slate in
+        # between `_publish`'s settle and its own write.
+        self._state_lock = threading.RLock()
+        # The weight write's memory, all in-process (nothing here is persisted — a restart re-derives
+        # it from the chain in `_seed_weight_clock`). `_written_slate` is only ever COMPARED against a
+        # freshly computed slate, never written: §5.7 forbids replaying a uid map.
         self._last_weight_block: int | None = None
+        self._written_slate: dict[int, float] | None = None
+        self._retry_at_block: int | None = None
+        self._weight_failures = 0
+        self._weights_note: str | None = None
+        self._keeper: threading.Thread | None = None
         # What the published queue last said, so an unchanged queue is not rewritten every poll.
         self._queue_published: str | None = None
-        # What the last write to the chain did, published in the reveal beside the slate.
-        self._weights_state: dict | None = None
         self._preflighted = False
         # hotkey -> the name on the manifest admitted this window, for the one that is crowned.
         self._admitted_names: dict[str, str] = {}
@@ -1045,26 +1088,51 @@ class Validator:
 
     def run_forever(self, *, poll_seconds: float = POLL_SECONDS,
                     should_stop: Callable[[], bool] | None = None,
-                    on_reveal: Callable[[Reveal], None] | None = None) -> None:
-        """Poll the chain, run each window once, keep the slate alive between them.
+                    on_reveal: Callable[[Reveal], None] | None = None,
+                    keep_weights: bool = True,
+                    keeper_poll_seconds: float = WEIGHT_KEEPER_POLL_SECONDS) -> None:
+        """Poll the chain, run each window once, and keep the slate alive the whole time.
 
         Every failure inside `step` is caught and the loop continues, with ONE exception: a
         `ValidatorError` from `preflight` is a misconfiguration that would make every window wrong,
         so it stops the daemon rather than being retried sixty seconds later forever.
+
+        THE WEIGHT KEEPER IS A THREAD BECAUSE A WINDOW IS ONE BLOCKING CALL. `run_window` holds this
+        loop through a tree fetch, a vLLM readiness wait, a king arm and each challenger arm, and any
+        one of those can block for hours on an ssh call nobody can interrupt; a refresh driven from
+        the loop, or from checks sprinkled between phases, cannot run inside that call. The keeper
+        shares nothing with the loop but the two locks, and the chain lock is held for one chain call
+        at a time. It starts only after `preflight` passes — a misconfigured launch writes nothing —
+        and here rather than in `step`, so `step` and `run_window` stay synchronous for tests.
         """
         self.preflight()
-        while not (should_stop is not None and should_stop()):
-            try:
-                reveal = self.step()
-            except Exception as exc:      # noqa: BLE001 — one bad window must not end the reign
-                self._log(f"window step failed, weights untouched: {exc}")
-            else:
-                if reveal is not None and on_reveal is not None:
-                    on_reveal(reveal)
-            self.sleep(poll_seconds)
+        stop = threading.Event()
+        if keep_weights:
+            self._seed_weight_clock()
+            self._keeper = threading.Thread(target=self._keep_weights_forever,
+                                            args=(stop, keeper_poll_seconds),
+                                            name=WEIGHT_KEEPER_THREAD, daemon=True)
+            self._keeper.start()
+        try:
+            while not (should_stop is not None and should_stop()):
+                try:
+                    reveal = self.step()
+                except Exception as exc:      # noqa: BLE001 — one bad window must not end the reign
+                    self._log(f"window step failed, weights untouched: {exc}")
+                else:
+                    if reveal is not None and on_reveal is not None:
+                        on_reveal(reveal)
+                self.sleep(poll_seconds)
+        finally:
+            stop.set()
+            if self._keeper is not None:
+                self._keeper.join(timeout=WEIGHT_KEEPER_JOIN_SECONDS)
 
     def step(self) -> Reveal | None:
-        """One turn of the loop: run this block's window if it is due, else keep the slate warm.
+        """One turn of the loop: run this block's window if it is due, else keep the reign current.
+
+        The idle paths call `_refresh_weights`, which is where §5.5's reversion is RECORDED; the
+        weight keeper keeps the slate fresh whatever this method is doing.
 
         Returns None when nothing was scored, which is the ordinary case — a window is hours long and
         the poll is a minute. The three None paths are different and all of them leave the ledger
@@ -1088,7 +1156,10 @@ class Validator:
             return self.run_window(window)
         except WindowUnavailable as exc:
             self._log(f"window {window}: {exc}")
-            self._refresh_weights(block, force=True)
+            # Not forced: this path repeats every poll for as long as the window file is missing, and
+            # a forced write each time would be rejected by the rate limit — and logged — every poll.
+            # The due rule writes when the cadence, a changed slate or a retry calls for it.
+            self._refresh_weights(block)
             return None
 
     # --- one window -------------------------------------------------------------------------
@@ -1245,8 +1316,10 @@ class Validator:
                           f"{len(king_results) - _clocked(king_results)} of {len(king_results)} "
                           f"tasks inside the per-duel wall clock; §8b.2 ends the reign rather than "
                           f"letting a king too slow for its own slice hold the throne")
-                self.history.crown_to(Crown(), window=opened.epoch,
-                                      reason="could not answer half its slice inside the wall clock")
+                with self._state_lock:
+                    self.history.crown_to(
+                        Crown(), window=opened.epoch,
+                        reason="could not answer half its slice inside the wall clock")
             outcomes.extend(Outcome(q.hotkey, q.block, DEFERRED, broken) for q, _ in admitted)
             return self._publish(opened, power, tuple(arms), king_hotkey, None, king_results, guard,
                                  tuple(outcomes), None, meters, {}, judged=judged, table=table,
@@ -1273,7 +1346,9 @@ class Validator:
                 self._log(f"window {opened.epoch}: the king's arm reached {king_reached} of "
                           f"{len(king_results)} tasks before its allowance ran out; §4 ends the "
                           f"reign rather than letting an unfunded king defend for nothing")
-                self.history.crown_to(Crown(), window=opened.epoch, reason="could not fund its arm")
+                with self._state_lock:
+                    self.history.crown_to(Crown(), window=opened.epoch,
+                                          reason="could not fund its arm")
                 crown = self.history.crown
 
         # PHASE 5 — every challenger's arm. Splitting arms from verdicts is what makes the exclusion
@@ -1847,9 +1922,33 @@ class Validator:
         the rank-1 slot it was dethroned into — a slot whose share then burns — and the throne stays
         vacant until a challenger clears the verdict against King₀, exactly as at cold start.
         """
+        with self._state_lock:
+            crown = self.history.crown
+            if not crown.is_king_zero and metagraph.resolve(crown.hotkey) is None:
+                self.history.crown_to(Crown(), window=window, reason="deregistered")
+
+    def _slate(self, metagraph: Metagraph) -> tuple[dict[int, float], str]:
+        """The slate the persisted state pays on this metagraph, and the king it pays: ONE DEFINITION.
+
+        `_publish`, the idle refresh and the weight keeper all write through this, so the same history
+        and the same metagraph give a bit-identical slate on every path — `burn_uid` and
+        `king_zero_uid` included. Two call sites that each spelled out `emission_weights` disagreed in
+        exactly that argument, and a refresh while King₀ reigned at a uid then quietly moved its 0.85
+        to the burn between two windows that both published it paid elsewhere.
+
+        A miner king that no longer resolves is paid as §5.5's reversion — King₀, pension ranks
+        unshifted — WITHOUT recording it: the keeper runs beside a window and must never change
+        history, so the reversion is recorded by the main thread (`_resolve_reign`) and only its
+        payout is anticipated here. On the main thread's paths `_resolve_reign` has already run, and
+        this rule is a no-op.
+        """
         crown = self.history.crown
-        if not crown.is_king_zero and metagraph.resolve(crown.hotkey) is None:
-            self.history.crown_to(Crown(), window=window, reason="deregistered")
+        king = crown.hotkey
+        if not crown.is_king_zero and metagraph.resolve(king) is None:
+            king = KING0
+        weights = emission_weights(self.history.lineage(), king, metagraph.hotkey_of,
+                                   burn_uid=self.burn_uid, king_zero_uid=self.king_zero_uid)
+        return weights, king
 
     # --- §8 step 5: persist, set weights, publish ---------------------------------------------
 
@@ -1879,12 +1978,10 @@ class Validator:
         outcomes = tuple(sorted(outcomes, key=lambda o: (o.commit_block, o.hotkey)))
         # CROWN AFTER VERIFY. A winner's weights must be public before the crown is theirs (D14), so
         # the coronation waits on `_promote`; a copy that fails leaves the verdict standing and the
-        # shot spent, and the crown pending for `step` to retry.
-        # Whoever holds the crown when the first window settles is reign 1; every later change
-        # closes the open reign with the reason it ended (§5.5's reversion is not a dethroning).
-        self.history.ensure_reign(opened.epoch)
-        promotion: dict | None = None
-        crowned_hotkey: str | None = None
+        # shot spent, and the crown pending for `step` to retry. The copy runs BEFORE the state lock
+        # below: it uploads a whole tree and can take hours, and the weight keeper must not wait on it.
+        pending: dict | None = None
+        public_prefix = error = None
         if crowned is not None:
             entry = queued[crowned.hotkey]
             pending = {"window": opened.epoch, "hotkey": crowned.hotkey,
@@ -1893,15 +1990,37 @@ class Validator:
                        "served_model": served_name(entry.commitment), "attempts": 1,
                        "model_name": self._admitted_names.get(crowned.hotkey, "")}
             public_prefix, error = self._promote(pending)
+        # ONE CRITICAL SECTION FROM THE CROWN CHANGE TO THE WEIGHT WRITE. The weight keeper computes
+        # its slate from persisted history under the same lock, so it can neither pay a half-settled
+        # history nor land an older slate between this settle and this write.
+        with self._state_lock:
+            report, body, written = self._settle_and_write(
+                opened, power, arms, king_hotkey, king_arm, king_results, guard, outcomes, crowned,
+                meters, pending, public_prefix, error, judged, table, retest, splits, registrations)
+        published = self._put_reveal(opened.epoch, body)
+        if published:
+            self.history.mark_published(opened.epoch)
+        return Reveal(report=report, arms=meters, weights_written=written, retest=retest,
+                      splits=None if splits is None else dict(splits))
+
+    def _settle_and_write(self, opened: Window, power, arms, king_hotkey: str, king_arm,
+                          king_results, guard, outcomes, crowned, meters, pending, public_prefix,
+                          error, judged, table, retest, splits, registrations):
+        """`_publish`'s persist-then-write half, run under the state lock: (report, body, written)."""
+        # Whoever holds the crown when the first window settles is reign 1; every later change
+        # closes the open reign with the reason it ended (§5.5's reversion is not a dethroning).
+        self.history.ensure_reign(opened.epoch)
+        promotion: dict | None = None
+        crowned_hotkey: str | None = None
+        if pending is not None:
+            superseded = self._supersede_pending(crowned.hotkey)
             if public_prefix is not None:
-                superseded = self._supersede_pending(crowned.hotkey)
                 self.history.crown_to(self._crown_for(pending, public_prefix),
                                       window=opened.epoch, reason="dethroned")
                 crowned_hotkey = crowned.hotkey
                 promotion = {"hotkey": crowned.hotkey, "state": "promoted", "prefix": public_prefix,
                              "superseded": superseded}
             else:
-                superseded = self._supersede_pending(crowned.hotkey)
                 self.history.defer_crown({**pending, "error": error,
                                           "next_attempt_at": self._next_attempt_at(1)})
                 promotion = {"hotkey": crowned.hotkey, "state": "pending", "attempts": 1,
@@ -1913,9 +2032,13 @@ class Validator:
                             registrations=registrations, at=self.now())
 
         metagraph = self.chain.metagraph()
+        # §5.5 on THIS read, and recorded (saved) before the write. A king that stopped resolving
+        # after the window opened would otherwise be paid as a reversion by `_slate` while the reign
+        # record, `crown_model` and history.json still named it — a signed reveal contradicting
+        # itself. Resolved here, every field below describes the same throne.
+        self._resolve_reign(metagraph, window=opened.epoch)
+        weights, paid_king = self._slate(metagraph)
         lineage = self.history.lineage()
-        weights = emission_weights(lineage, self.history.crown.hotkey, metagraph.hotkey_of,
-                                   burn_uid=self.burn_uid, king_zero_uid=self.king_zero_uid)
         # §5.5, captured HERE and not from `self.history.crown`: `settle` has already run by this
         # point and may have crowned a challenger, so reading the live crown would describe the
         # END-of-window king while `king_hotkey` beside it documents the START-of-window one — the
@@ -1939,7 +2062,7 @@ class Validator:
             king_is_genesis=king_is_genesis,
             graders_failed=tuple(sorted(guard.failed)), outcomes=outcomes,
             crowned=crowned_hotkey,
-            pensioners=lineage.pensioners(self.history.crown.hotkey), weights=weights,
+            pensioners=lineage.pensioners(paid_king), weights=weights,
             metagraph=metagraph.hotkey_of, table=None if table is None else table.stats())
 
         body = _record(report, meters, retest=retest, splits=splits, promotion=promotion,
@@ -1947,18 +2070,18 @@ class Validator:
         self._local_reveal(opened.epoch).parent.mkdir(parents=True, exist_ok=True)
         self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
                                                     encoding="utf-8")
-        written = self._write_weights(weights, metagraph.block)
+        # ALWAYS attempted, whatever the keeper's due rule says: the window's slate is the one the
+        # reveal names, and the reveal must say what the chain did with it.
+        record = self._write_weights(weights, metagraph.block, source="window")
         # FILLED IN AFTER THE WRITE, and the local copy is rewritten with it. §8 step 5's order is
         # persist, then weights, then publish — so the traces are on disk before the chain is
         # touched — which leaves this the one field that cannot be known when the body is built.
-        body["weights_set"] = self._weights_state
+        # The record is THIS write's, returned rather than read off the object, so a keeper write
+        # landing a moment later cannot overwrite what the reveal says.
+        body["weights_set"] = record
         self._local_reveal(opened.epoch).write_text(json.dumps(body, sort_keys=True),
                                                     encoding="utf-8")
-        published = self._put_reveal(opened.epoch, body)
-        if published:
-            self.history.mark_published(opened.epoch)
-        return Reveal(report=report, arms=meters, weights_written=written, retest=retest,
-                      splits=None if splits is None else dict(splits))
+        return report, body, bool(record["written"])
 
     # --- private submissions, public kings --------------------------------------------------
 
@@ -2077,9 +2200,13 @@ class Validator:
             return
         public_prefix, error = self._promote(pending)
         if public_prefix is not None:
-            self.history.crown_promoted(self._crown_for(pending, public_prefix),
-                                        window=int(pending["window"]))
-            self._refresh_weights(self.chain.current_block(), force=True)
+            # The copy above ran unlocked (it can take hours); the coronation and the new slate are
+            # one step under the state lock. Not forced: the new king makes it a changed slate, which
+            # the due rule writes at once — or at the first block the rate limit allows.
+            with self._state_lock:
+                self.history.crown_promoted(self._crown_for(pending, public_prefix),
+                                            window=int(pending["window"]))
+                self._refresh_weights(self.chain.current_block())
             return
         attempts = int(pending.get("attempts", 1)) + 1
         if attempts >= PROMOTION_MAX_ATTEMPTS:
@@ -2234,18 +2361,40 @@ class Validator:
         if self._put_reveal(window, json.loads(path.read_text(encoding="utf-8"))):
             self.history.mark_published(window)
 
-    def _write_weights(self, weights: Mapping[int, float], block: int) -> bool:
-        """The ONLY write. `force` because a stable reign is an unchanged slate, and both
-        implementations short-circuit one — so without it the validator physically cannot re-submit
-        and ages out of Yuma's `activity_cutoff` while scoring every window correctly."""
+    def _write_weights(self, weights: Mapping[int, float], block: int, *, source: str,
+                       reason: str | None = None) -> dict:
+        """The ONLY write, returning its `weights_set` record. `force` because a stable reign is an
+        unchanged slate, and both implementations short-circuit one — so without it the validator
+        physically cannot re-submit and ages out of Yuma's `activity_cutoff` while scoring every
+        window correctly.
+
+        `source` is `window` (`_publish`, whose record the reveal publishes and whose messages are
+        logged every time), or `refresh`/`keeper`, which log one compact line on success and a
+        failure only when its note changes — a chain that stays unhealthy is one line, not one a
+        minute. Every outcome also sets when the next attempt may happen (`_weights_due`): the
+        block the rate limit names, or a capped backoff for any other failure.
+        """
+        window = source == "window"
         try:
             self.chain.set_weights(weights, force=True)
         except WeightRateLimited as exc:
-            self._log(f"weights rejected by the rate limit, the previous slate stands: {exc}")
-            self._weights_state = {"written": False, "block": int(block),
-                                   "blocks_since_update": self._weights_age(),
-                                   "note": f"rate-limited: {exc}"}
-            return False
+            self._retry_at_block = self._head(block) + int(exc.retry_blocks)
+            note = f"rate-limited: {exc}"
+            if (self._written_slate is not None
+                    and same_weight_distribution(weights, self._written_slate.items())):
+                # Usually the keeper, a few blocks earlier. Written=false stays strictly true of THIS
+                # write, and the clause stops it reading as though a different slate is in force.
+                note += f"; an identical slate was written at block {self._last_weight_block}"
+            if window:
+                self._log(f"weights rejected by the rate limit, the previous slate stands: {exc}")
+            else:
+                # Keyed by the slate, so the same slate refused twice in a row is one line.
+                self._note_weights("rate-limited " + json.dumps(sorted(
+                                       (int(uid), float(share)) for uid, share in weights.items())),
+                                   f"weight {source}: slate at block {block} rate-limited, "
+                                   f"retrying at block {self._retry_at_block}: {exc}")
+            return {"written": False, "block": int(block),
+                    "blocks_since_update": self._weights_age() if window else None, "note": note}
         except Exception as exc:          # noqa: BLE001 — a failed write must not lose the window
             # §8 step 5 persists the verdicts, writes the weights, then publishes the reveal. A write
             # that RAISED took the last step with it: `run_forever` caught it, the window was settled
@@ -2253,17 +2402,46 @@ class Validator:
             # it. Measured on netuid 99 on 2026-09-12: 21 stale-nonce rejections, each one taking a
             # window's reveal off the air for a poll for a reason that has nothing to do with it.
             # The slate is retried on the next refresh either way; the reveal should not wait for it.
-            self._log(f"weights not set, the previous slate stands: {type(exc).__name__}: {exc}")
-            self._weights_state = {"written": False, "block": int(block),
-                                   "blocks_since_update": self._weights_age(),
-                                   "note": f"{type(exc).__name__}: {exc}"}
-            return False
-        self._last_weight_block = block
+            self._weight_failures += 1
+            backoff = min(2 ** (self._weight_failures - 1), WEIGHT_RETRY_MAX_BLOCKS)
+            self._retry_at_block = int(block) + backoff
+            note = f"{type(exc).__name__}: {exc}"
+            if window:
+                self._log(f"weights not set, the previous slate stands: {note}")
+            else:
+                self._note_weights(note, f"weight {source}: slate at block {block} not set, "
+                                         f"retrying at block {self._retry_at_block}: {note}")
+            return {"written": False, "block": int(block),
+                    "blocks_since_update": self._weights_age() if window else None, "note": note}
+        self._last_weight_block = int(block)
+        self._written_slate = {int(uid): float(share) for uid, share in weights.items()}
+        self._retry_at_block = None
+        self._weight_failures = 0
+        if not window:
+            self._log(f"weights kept at block {block} by the {source} ({reason or 'forced'}): "
+                      f"{sum(1 for share in weights.values() if share > 0)} uids")
+        self._weights_note = None
         # Included is not the same as landed: read back how stale the chain says this hotkey's slate
-        # is, so a reveal claims the weights are on chain only when the chain agrees.
-        self._weights_state = {"written": True, "block": int(block),
-                               "blocks_since_update": self._weights_age(), "note": None}
-        return True
+        # is, so a reveal claims the weights are on chain only when the chain agrees. Only for the
+        # window's write — the one whose record is published — so a keeper tick holding the state
+        # lock makes no extra chain call, and an unreadable age is not logged every tick.
+        return {"written": True, "block": int(block),
+                "blocks_since_update": self._weights_age() if window else None, "note": None}
+
+    def _note_weights(self, key: str, message: str) -> None:
+        """Log a background write's failure once per distinct failure, not once per attempt."""
+        if key != self._weights_note:
+            self._log(message)
+            self._weights_note = key
+
+    def _head(self, fallback: int) -> int:
+        """The chain head now, for a retry block: `WeightRateLimited` counts from the head at the
+        moment of the write, which can be past the block the caller read. The caller's block if the
+        head cannot be read — one early attempt is cheaper than a failed write."""
+        try:
+            return max(int(fallback), int(self.chain.current_block()))
+        except Exception:                 # noqa: BLE001 — a refinement, never a gate
+            return int(fallback)
 
     def _weights_age(self) -> int | None:
         """How stale the chain says our slate is, or None when it cannot be read."""
@@ -2273,22 +2451,109 @@ class Validator:
             self._log(f"could not read the weight age: {type(exc).__name__}: {exc}")
             return None
 
-    def _refresh_weights(self, block: int, *, force: bool = False) -> bool:
-        """Re-submit the CURRENT slate between windows (see `WEIGHT_REFRESH_BLOCKS`).
+    def _weights_due(self, block: int, weights: Mapping[int, float]) -> str | None:
+        """Why a background write of `weights` is due at `block`, or None if it is not.
+
+        DUE BY THE SLATE, NOT BY A FINGERPRINT OF HISTORY. The slate moves with the metagraph as well
+        as with the crown: a pensioner deregistering must have its share burn, a king that stops
+        resolving is paid as a reversion, and a recycled uid must stop being paid. So the fresh slate
+        is compared with the last one that LANDED, by the chain's own definition of "unchanged"
+        (`same_weight_distribution`), and any difference is due at once. An unchanged slate is due
+        on `WEIGHT_REFRESH_BLOCKS`. Either waits for `_retry_at_block` — the block the rate limit
+        named, or a failure's backoff — so a refused write is neither re-attempted nor re-logged
+        before the chain could accept it, and a coronation refused because a refresh had just landed
+        is written the first block it can be rather than a cadence later.
+        """
+        if self._retry_at_block is not None and block < self._retry_at_block:
+            return None
+        if self._written_slate is None or self._last_weight_block is None:
+            return "first write" if self._retry_at_block is None else "retry"
+        if not same_weight_distribution(weights, self._written_slate.items()):
+            return "new slate"
+        if block - self._last_weight_block >= WEIGHT_REFRESH_BLOCKS:
+            return "cadence"
+        return None
+
+    def _refresh_weights(self, block: int) -> bool:
+        """The main thread's idle-path refresh, and the ONE place §5.5's reversion is recorded.
 
         It recomputes rather than replays: a pensioner that deregistered since the last write must
         have its share burn, and §5.5's reversion must happen even in a window that never opened, or
-        the pension ranks behind a departed king are all paid one rank too high.
+        the pension ranks behind a departed king are all paid one rank too high. The reversion is
+        checked on every idle poll, not only when a write is due, because the weight keeper cannot
+        record it (it never changes history) and a refresh cadence it owns would otherwise starve it.
+        The write itself follows the same due rule as the keeper, so the two never duplicate a slate.
         """
-        due = (self._last_weight_block is None
-               or block - self._last_weight_block >= WEIGHT_REFRESH_BLOCKS)
-        if not (force or due):
+        with self._state_lock:
+            metagraph = self.chain.metagraph()
+            self._resolve_reign(metagraph, window=self.cadence.window_at(block))
+            weights, _ = self._slate(metagraph)
+            reason = self._weights_due(metagraph.block, weights)
+            if reason is None:
+                return False
+            return bool(self._write_weights(weights, metagraph.block, source="refresh",
+                                            reason=reason)["written"])
+
+    # --- the weight keeper --------------------------------------------------------------------
+
+    def _keep_weights_once(self) -> bool:
+        """One keeper tick: re-submit the current slate if `_weights_due` says so. True if written.
+
+        READ-ONLY WITH RESPECT TO HISTORY. The slate is computed from what is persisted — lineage,
+        crown — and a metagraph read at this tick (§5.7: no remembered uid map), under the state lock,
+        so a `_publish` in progress is waited out rather than half-read. The block read before the
+        lock only skips a tick the retry gate already rules out; the decision is re-made inside.
+        """
+        block = self.chain.current_block()
+        retry_at = self._retry_at_block
+        if retry_at is not None and block < retry_at:
             return False
-        metagraph = self.chain.metagraph()
-        self._resolve_reign(metagraph, window=self.cadence.window_at(block))
-        return self._write_weights(
-            emission_weights(self.history.lineage(), self.history.crown.hotkey,
-                             metagraph.hotkey_of, burn_uid=self.burn_uid), block)
+        with self._state_lock:
+            metagraph = self.chain.metagraph()
+            weights, _ = self._slate(metagraph)
+            reason = self._weights_due(metagraph.block, weights)
+            if reason is None:
+                return False
+            return bool(self._write_weights(weights, metagraph.block, source="keeper",
+                                            reason=reason)["written"])
+
+    def _keep_weights_forever(self, stop: threading.Event, poll_seconds: float) -> None:
+        """The keeper thread: tick until `stop` is set. Nothing it raises leaves this function.
+
+        A failing chain read is logged once per distinct failure and retried next tick; the window
+        and the loop never see it. `stop.wait` is the sleep, so stopping interrupts it at once.
+        """
+        failure: str | None = None
+        while not stop.is_set():
+            try:
+                self._keep_weights_once()
+            except Exception as exc:      # noqa: BLE001 — the keeper must outlive any chain outage
+                note = f"{type(exc).__name__}: {exc}"
+                if note != failure:
+                    self._log(f"weight keeper: {note}; will retry")
+                    failure = note
+            else:
+                if failure is not None:
+                    self._log("weight keeper: the chain answers again")
+                    failure = None
+            stop.wait(poll_seconds)
+
+    def _seed_weight_clock(self) -> None:
+        """After a restart, gate the first write on the slate the PREVIOUS process left on chain.
+
+        This process has written nothing, so its first tick is always due; if the last process wrote
+        inside the rate limit that attempt is refused, and logged, for nothing. One read of the
+        chain's own `LastUpdate` sets the retry gate instead. Nothing on disk is involved.
+        """
+        try:
+            block = int(self.chain.current_block())
+            age = self.chain.blocks_since_weight_update()
+            limit = int(self.chain.weights_rate_limit())
+        except Exception as exc:          # noqa: BLE001 — the gate is a courtesy; the write decides
+            self._log(f"weight keeper: could not read the last weight update ({exc})")
+            return
+        if age is not None and int(age) <= limit:
+            self._retry_at_block = block + limit - int(age) + 1
 
     def _log(self, message: str) -> None:
         print(f"[v3-validator] {message}", flush=True)

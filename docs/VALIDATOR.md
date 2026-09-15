@@ -94,9 +94,11 @@ WantedBy=multi-user.target
 ### Surviving a reboot
 
 Nothing above is any use if a reboot leaves it down. Four units, and the ORDER is the point: the
-daemon refuses to start without the mounts rather than running without them, because a window that
-cannot fetch a challenger REFUSES it (§8b.2) — and that spends a miner's one shot on our broken
-mount. No windows at all is the honest failure.
+daemon refuses to start without the mounts rather than running without them. A window that cannot
+fetch a challenger because of our mount DEFERS it with its shot intact (§8b.2), but a mount that
+works for small reads and fails large ones can look like the tree's fault to the probe, and every
+such window spends one of that entry's `MAX_INFRA_DEFERRALS` counted deferrals before it is
+refused. So the mounts stay mandatory: no windows at all is the honest failure.
 
 ```ini
 # /etc/systemd/system/var-lib-v3-trees.mount   (and var-v3-grade.mount, the same shape)
@@ -279,10 +281,17 @@ Three of these are worth understanding rather than copying:
   no Docker, no credential; weights are parsed by `safetensors` with no code
   path, and §2.1 guarantees the model's output never reaches an executor. One server per distinct
   tree: vLLM answers every alias with its first served name, so two names on one server are
-  refused by the identity check (measured 2026-09-08).
+  refused by the identity check (measured 2026-09-08). **A load that does not come up is
+  diagnosed, not assumed** (§8b.2): at the readiness deadline the daemon asks the host over ssh
+  whether the launched pid is alive, whether its port listens there, what the host's own
+  `/v1/models` lists, and for the log tail. Only an exit with a safetensors load error, or a live
+  process with nothing listening at the deadline, spends the shot; an unreachable host, a dead
+  forward, an OOM or an unexplained exit defers. Install `curl` on the serving host: without it a
+  listening port cannot be told from a dead forward, and that case defers instead of refusing.
 * **`--serve-url`** is the operator-managed alternative: the endpoint(s) on which you have ALREADY
-  launched the artifacts under test, comma-separated with one server per card. The daemon refuses
-  a name no endpoint lists and launches nothing. Use it for a rehearsal or a fixed cast.
+  launched the artifacts under test, comma-separated with one server per card. The daemon launches
+  nothing and so cannot attribute a load: a name no endpoint lists is DEFERRED, and refused only
+  once its `MAX_INFRA_DEFERRALS` counted windows are spent. Use it for a rehearsal or a fixed cast.
 * **`--grade-dir`** must resolve **at the daemon**, not merely on this box. Required whenever
   `--sandbox-host` names another machine. The launch gate refuses a path that is not a directory
   here, because a typo would otherwise drop every task from both arms while the window spent its
@@ -523,8 +532,9 @@ nothing; it is never carried to the next window and never published. Three thing
 | `metering[].own_key` | whether the arm ran on the miner's registered key (D18) rather than a credited allowance |
 | `metering[].endpoints` | per model the arm bought live, which endpoint answered (`provider`, or `provider:served_model` when the response named a different model) |
 | `metering[].drift` | the `model@endpoint` pairs a miner-key arm was served by that no arm on YOUR key was served by that window — §11-1's residual made visible; evidence, not a gate |
-| `weights_set` | what the write to the chain did: `written`, the block it was attempted at, how stale the chain says this hotkey's slate is afterwards (`blocks_since_update`), and the refusal if there was one. `weights` above is what was COMPUTED; this is what landed |
+| `weights_set` | what the window's own write to the chain did: `written`, the block it was attempted at, how stale the chain says this hotkey's slate is afterwards (`blocks_since_update`), and the refusal if there was one. `weights` above is what was COMPUTED; this is what landed. Beside the loop, a weight-keeper thread re-submits the CURRENT slate every `WEIGHT_REFRESH_BLOCKS`, including while a window runs (a window with challengers can hold the loop for most of the activity cutoff). So a window write can be rate-limited only because the keeper just wrote: `written` is then `false` and the note ends `an identical slate was written at block N`, meaning the slate the window computed is the one on chain. When the slate CHANGES (a coronation, a deregistered king or pensioner), the keeper writes it at the first block the rate limit allows, not a cadence later |
 | `crown_model` | where the reigning king's weights are: `bucket`, `prefix`, `manifest_sha256`, and the `url` and `manifest_url` under `--public-model-base-url`; `null` while King₀ reigns |
+| `outcomes[].detail` at admission | whose failure it was (§8b.2): `artifact: …` for a refusal the tree decided (the shot is spent); `owner-side: …` for our store, disk, serving host or tunnel failing on a window where that stage worked for everything else (deferred, `N of MAX_INFRA_DEFERRALS` counted); `owner-side (outage, not counted): …` when it did not; `owner-side, deferral cap reached` once the count is spent. Owner-side rows name the exception's type only — the full error is in the daemon's log. Repeated `owner-side` rows are an alert about your infrastructure |
 | `promotion` | this window's coronation and its public copy: `promoted` with the prefix, or `pending` with the attempt count and the error's type (never its message); `superseded` names a pending winner this one passed over; `null` when nobody won |
 | `reign` | the throne once this window settled: `number`, `genesis`, `hotkey`, `name` (`thirtyspokes-genesis` for King₀, the miner's own name for a miner king, `null` for one submitted before names existed), `since_window`, `windows`, and `previous` with the window and reason the last reign ended — `dethroned`, `deregistered` (§5.5's reversion) or `could not fund its arm`. `king_hotkey` above is the START-of-window king the duels faced; this is the throne after them |
 
@@ -583,3 +593,7 @@ tool-enabled benchmark appears in. The clock is not one-way. Spend the reversibl
 | every task excluded, allowance spent | a `--grade-dir` the daemon cannot read — run `--check` and `preflight` |
 | arms overrunning the clock | the socket tunnel is down and each container is opening its own SSH connection (2.73 s instead of 0.84 s); `systemctl status v3-docker-tunnel` |
 | `…produced no V3_CASES line` with an ssh warning in the text | grades overflowed `MaxSessions` on a per-call `ssh://` host and the fallback connections failed their host-key check; use the forwarded socket (§2) |
+| `weights kept at block B by the keeper (cadence \| new slate \| retry \| first write): K uids` | normal: the weight keeper, or the loop's idle `refresh`, re-submitted the current slate. One line every `WEIGHT_REFRESH_BLOCKS` during a stable reign, and more often only after a change |
+| `weight keeper: <Error>: …; will retry` | the keeper could not read the chain. Logged once per distinct failure, followed by `the chain answers again` when it recovers. The window is unaffected, but if it persists the slate is ageing toward the activity cutoff; check the chain endpoint |
+| `weight keeper: slate at block B rate-limited, retrying at block R` (or `weight refresh: …`) | a write arrived inside the chain's rate limit, often because another process wrote shortly before (a restart). Logged once per slate; the next attempt waits until block R |
+| `weight keeper: slate at block B not set, retrying at block R` (or `weight refresh: …`) | the chain refused the write for another reason; retried after 1, 2, 4 … blocks, capped at `WEIGHT_RETRY_MAX_BLOCKS`, and logged once per distinct error |

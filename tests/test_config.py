@@ -61,3 +61,23 @@ def test_the_price_probe_wait_is_bounded_by_the_clock_it_sits_inside():
     from thirtyspokes.v3.config import EPISODE_WALL_CLOCK_SECONDS, PRICE_PROBE_WAIT_SECONDS
 
     assert 0 < PRICE_PROBE_WAIT_SECONDS < EPISODE_WALL_CLOCK_SECONDS
+
+
+def test_a_reservation_wait_outlasts_the_call_it_waits_on_and_still_fits_the_episode():
+    """A waiter that gives up while the call holding its payer's money is still legitimately running
+    loses a funded delegate as a dead step — the harm the wait exists to remove. So the bound sits
+    above the longest a provider call can stay in flight, and a waiter plus its own call must still
+    fit inside the episode clock that contains both."""
+    from thirtyspokes.v3.config import (
+        EPISODE_WALL_CLOCK_SECONDS,
+        PRICE_PROBE_WAIT_SECONDS,
+        PROVIDER_CALL_OVERSHOOT_SECONDS,
+        PROVIDER_CALL_SECONDS,
+    )
+    from thirtyspokes.v3.openrouter import READ_SLICE_SECONDS, OpenRouterClient
+
+    in_flight = PROVIDER_CALL_SECONDS + PROVIDER_CALL_OVERSHOOT_SECONDS
+    assert PROVIDER_CALL_OVERSHOOT_SECONDS >= READ_SLICE_SECONDS
+    assert PRICE_PROBE_WAIT_SECONDS > in_flight
+    assert PRICE_PROBE_WAIT_SECONDS + in_flight < EPISODE_WALL_CLOCK_SECONDS
+    assert OpenRouterClient("k")._timeout == PROVIDER_CALL_SECONDS

@@ -360,19 +360,32 @@ class FakeBox:
     script's port that lists the script's served name — so readiness, aliases and the identity
     check all run against a real socket, and only the model is missing."""
 
-    def __init__(self, *, launches_serve: bool = True) -> None:
+    def __init__(self, *, launches_serve: bool = True,
+                 diagnosis: str = "process=alive\nport=closed\nmodels=unavailable\n---\n",
+                 diagnosis_raises: BaseException | None = None, pid: str = "4242") -> None:
         self.scripts: list[str] = []
         self.servers: dict[int, ThreadingHTTPServer] = {}
         self.launches_serve = launches_serve
+        # What the host answers at the readiness deadline (`serve._DIAGNOSE_PORT`): by default a
+        # process that is alive with nothing on its port, which is a load that did not finish.
+        self.diagnosis = diagnosis
+        self.diagnosis_raises = diagnosis_raises
+        self.pid = pid
 
     def __call__(self, script: str) -> str:
         self.scripts.append(script)
+        if script.startswith("# thirtyspokes serving probe"):
+            return "thirtyspokes-probe-ok\n"
+        if script.startswith("# thirtyspokes readiness diagnosis"):
+            if self.diagnosis_raises is not None:
+                raise self.diagnosis_raises
+            return self.diagnosis
         port = int(re.search(r"--port (\d+)", script).group(1))
         name = re.search(r"--served-model-name (\S+)", script).group(1)
         self.stop(port)
         if self.launches_serve:
             self.start(port, name)
-        return "4242\n"
+        return f"{self.pid}\n"
 
     def start(self, port: int, name: str) -> None:
         respond = canned(completion(model=name), names=(name,))
@@ -467,15 +480,146 @@ def test_a_third_tree_evicts_the_least_recently_used_card_and_an_evicted_conduct
         box.close()
 
 
-def test_a_card_that_never_comes_up_is_a_serve_error_naming_the_port_and_the_log():
-    """§8b.2's load check: a tree the host cannot serve — OOM, a bad launch line, a dead engine —
-    is refused here, with what to read, rather than waited on forever."""
+def test_a_card_that_never_comes_up_is_a_load_failure_naming_the_port_and_the_log():
+    """§8b.2's load timeout: the launched process is still alive at the deadline and nothing listens
+    on its port on the host itself, so the load did not finish — the one timeout that is the tree's.
+    Refused here, with what to read, rather than waited on forever."""
     box, ports = FakeBox(launches_serve=False), (_free_port(), _free_port())
     ticks = iter([0.0, 1.0, 2.0, 100.0, 200.0, 1000.0, 2000.0, 3000.0])
     serving = _serving(box, ports, ready_timeout=50.0, clock=lambda: next(ticks), sleep=lambda s: None)
-    with pytest.raises(ServeError, match=rf"port {ports[0]}.*did not serve 'v3-dead@9'.*vllm-{ports[0]}.log"):
+    with pytest.raises(LoadFailure, match=rf"port {ports[0]}.*did not serve 'v3-dead@9'.*vllm-{ports[0]}.log"):
         serving(Path("/t/dead"), "v3-dead@9")
     assert serving.cards[0].served is None
+    assert "kill -0 4242" in box.scripts[-1], "liveness is the pid the launch printed, not a pattern"
+
+
+# --- whose failure a readiness timeout was (§8b.2) --------------------------------------------------
+
+from thirtyspokes.v3.serve import (LOAD_ERROR_MARKERS, EndpointUnreachable, LoadFailure,
+                                   ServingOutage, readiness_verdict)
+
+
+def _timing_out(box: FakeBox, ports: tuple[int, int]) -> RemoteServing:
+    """A `RemoteServing` whose clock is already past the deadline at the first failed probe."""
+    ticks = iter(float(t) for t in range(0, 10_000, 100))
+    return _serving(box, ports, ready_timeout=50.0, clock=lambda: next(ticks), sleep=lambda s: None)
+
+
+def _diagnosis(process: str, port: str, models: str = "unavailable", tail: str = "") -> str:
+    return f"process={process}\nport={port}\nmodels={models}\n---\n{tail}"
+
+
+def test_nothing_listening_is_an_unreachable_endpoint_and_an_http_error_is_not():
+    """Only a response proves the path from this validator to the port works, so the two stay
+    distinguishable — and both stay `ServeError`s, so nothing that already catches one misses it."""
+    with pytest.raises(EndpointUnreachable):
+        ServedConductor(f"http://127.0.0.1:{_free_port()}/v1", SERVED).check_ready()
+    with stub(lambda path, body: (500, {"error": "engine dead"})) as (base_url, _):
+        with pytest.raises(ServeError) as caught:
+            ServedConductor(base_url, SERVED).check_ready()
+    assert not isinstance(caught.value, EndpointUnreachable)
+
+
+def test_a_card_whose_process_exited_with_a_load_error_is_a_load_failure_that_publishes_no_log():
+    """The tree's own fault, established by the host: the process `_RESTART_PORT` started has exited
+    and its log names a safetensors load error. The message names the marker; the log itself —
+    host paths, drivers, environment — travels only on `log_tail`, for the operator."""
+    tail = "INFO loading\n/root/vllm-env/lib/python3.12/site-packages/x.py\nSafetensorError: invalid offset\n"
+    box = FakeBox(launches_serve=False, diagnosis=_diagnosis("exited", "closed", tail=tail))
+    ports = (_free_port(), _free_port())
+    with pytest.raises(LoadFailure) as caught:
+        _timing_out(box, ports)(Path("/t/bad"), "v3-bad@1")
+    assert "SafetensorError" in str(caught.value) and "/root/vllm-env" not in str(caught.value)
+    assert "/root/vllm-env" in caught.value.log_tail
+
+
+def test_a_process_that_exited_without_a_recognisable_load_error_is_the_owners():
+    """Out of memory included, and on purpose: admission pins the tensor inventory, so an admitted
+    tree has the reference's footprint, and an OOM is far likelier a card the owner did not free."""
+    assert not any("memory" in marker.lower() for marker in LOAD_ERROR_MARKERS)
+    tail = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+    box = FakeBox(launches_serve=False, diagnosis=_diagnosis("exited", "closed", tail=tail))
+    with pytest.raises(ServeError, match="without a recognisable load error") as caught:
+        _timing_out(box, (_free_port(), _free_port()))(Path("/t/oom"), "v3-oom@1")
+    assert not isinstance(caught.value, LoadFailure)
+
+
+def test_a_stale_server_left_on_the_port_is_never_charged_to_the_tree():
+    """The port's pkill did not clear an old server, so the new one could not bind and exited, while
+    the old one answers `/v1/models` with somebody else's name. Liveness by a name pattern would
+    have found the OLD process alive and called that a load that never became ready; by the launched
+    pid it is an exit with no load error, and a live process beside a foreign listing is an outage."""
+    ports = (_free_port(), _free_port())
+    stale = json.dumps(models("v3-stale@0"))
+    for process, kind in (("exited", ServeError), ("alive", ServingOutage)):
+        box = FakeBox(launches_serve=False, diagnosis=_diagnosis(
+            process, "open", stale, tail="OSError: [Errno 98] Address already in use\n"))
+        box.start(ports[0], "v3-stale@0")
+        box.stop = lambda port: None                  # the pkill that did not take
+        try:
+            with pytest.raises(ServeError) as caught:
+                _timing_out(box, ports)(Path("/t/fresh"), "v3-fresh@1")
+        finally:
+            FakeBox.stop(box, ports[0])
+        assert type(caught.value) is kind, f"a stale server under a {process} pid was charged wrongly"
+
+
+def test_a_card_the_host_serves_but_the_forward_cannot_reach_is_an_outage():
+    """The dead-tunnel case a timeout alone cannot tell from a slow load: the host's own
+    `/v1/models` lists the name, so the load finished and the path from here is what broke."""
+    name = "v3-fine@1"
+    box = FakeBox(launches_serve=False,
+                  diagnosis=_diagnosis("alive", "open", json.dumps(models(name))))
+    with pytest.raises(ServingOutage, match="forward is down"):
+        _timing_out(box, (_free_port(), _free_port()))(Path("/t/fine"), name)
+
+
+def test_a_serving_host_the_runner_cannot_reach_at_the_deadline_is_an_outage():
+    import subprocess
+    box = FakeBox(launches_serve=False,
+                  diagnosis_raises=subprocess.TimeoutExpired(["ssh"], 180.0))
+    with pytest.raises(ServingOutage, match="did not answer the readiness diagnosis"):
+        _timing_out(box, (_free_port(), _free_port()))(Path("/t/x"), "v3-x@1")
+
+
+def test_an_unattributable_timeout_is_the_owners_and_not_a_load_failure():
+    """No pid printed, or an answer that does not parse: nothing ties the timeout to the tree."""
+    box = FakeBox(launches_serve=False, pid="")
+    with pytest.raises(ServeError, match="no process id") as caught:
+        _timing_out(box, (_free_port(), _free_port()))(Path("/t/x"), "v3-x@1")
+    assert not isinstance(caught.value, LoadFailure)
+    assert not any(s.startswith("# thirtyspokes readiness diagnosis") for s in box.scripts)
+
+    box = FakeBox(launches_serve=False, diagnosis="bash: line 1: syntax error\n")
+    with pytest.raises(ServeError, match="could not be read") as caught:
+        _timing_out(box, (_free_port(), _free_port()))(Path("/t/x"), "v3-x@1")
+    assert not isinstance(caught.value, LoadFailure)
+
+
+@pytest.mark.parametrize("output, kind", [
+    (_diagnosis("exited", "closed", tail="safetensors_rust.SafetensorError: HeaderTooLarge\n"),
+     LoadFailure),
+    (_diagnosis("exited", "closed", tail="Killed\n"), ServeError),
+    (_diagnosis("alive", "closed"), LoadFailure),
+    (_diagnosis("alive", "open", json.dumps(models(SERVED))), ServingOutage),
+    (_diagnosis("alive", "open", json.dumps(models("v3-other@0"))), ServingOutage),
+    (_diagnosis("alive", "open"), ServeError),
+    ("process=alive\n---\n", ServeError),
+    ("", ServeError),
+])
+def test_the_readiness_verdict_is_a_pure_function_of_the_hosts_answer(output, kind):
+    verdict = readiness_verdict(output, last=EndpointUnreachable("refused"), gpu=0, port=8001,
+                                served_model=SERVED, ready_timeout=900.0)
+    assert type(verdict) is kind
+
+
+def test_the_probe_asks_the_serving_host_for_nothing_but_an_answer():
+    box = FakeBox()
+    _serving(box, (_free_port(), _free_port())).probe()
+    assert box.scripts == ["# thirtyspokes serving probe\necho thirtyspokes-probe-ok\n"]
+    with pytest.raises(ServeError):
+        RemoteServing(lambda script: "", [Card(gpu=0, port=1, base_url="http://127.0.0.1:1/v1")],
+                      trees="/t").probe()
 
 
 def test_cards_are_parsed_from_the_command_line_and_reached_on_forwarded_ports():

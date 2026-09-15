@@ -447,6 +447,20 @@ MAX_DUELS_PER_WINDOW = 3
 # and accepting the money first makes it worse rather than kinder.
 MAX_QUEUE_DEPTH = 2 * MAX_DUELS_PER_WINDOW
 
+# §8b.2: an OWNER-SIDE failure at admission (the store, the trees disk, the serving host, the runner)
+# defers the entry with its shot intact, because the "Kind" property forbids spending a miner's one
+# submission on the owner's infrastructure. Unbounded, that kindness is a squat: a tree that
+# deterministically reproduces an owner-side-looking failure (a path the disk cannot create, a load
+# that dies without a recognisable error) would hold its queue slot forever. So each registration
+# may be deferred this many COUNTED windows; the (MAX_INFRA_DEFERRALS + 1)th counted window refuses
+# it and spends the shot. A window is COUNTED only when the failing stage demonstrably worked in that
+# window — another entry got past it, or a probe of that resource succeeded — so an outage that hits
+# every entry defers without counting, and cannot walk a queue of healthy trees toward refusal.
+# Three is of the order of the drain §8b.1 sizes immunity for: past it, "the owner keeps failing on
+# exactly this tree while working for everything else" is better explained by the tree. Not a
+# schedule input; it changes no committed root.
+MAX_INFRA_DEFERRALS = 3
+
 # --- the verdict (§5.2, D10) ----------------------------------------------------------------------
 # On the `final` scale (quality minus priced spend) — five points of benchmark score.
 #
@@ -503,13 +517,36 @@ EMISSION_KING = 0.85
 EMISSION_PENSION = (0.05, 0.04, 0.03, 0.02, 0.01)
 
 
-# How long a caller waits for the FIRST call of a gateway's life to settle and publish a price
-# (`OwnerGateway.call`). Before any call settles there is no per-call ceiling to reserve against, so
-# the first reserves the whole balance; a concurrent caller waits for it rather than being refused as
-# unfunded, which is a different and much worse thing to tell a miner who has paid. Bounded so a hung
-# provider degrades to the ordinary refusal instead of parking an arm: the episode and duel clocks
-# (§8b.2) are the outer bounds, and this sits well inside both.
-PRICE_PROBE_WAIT_SECONDS = 30.0
+# The whole-call budget of one provider call (`OpenRouterClient(timeout=...)`'s default): every
+# attempt and every backoff of a single worker call share it (§8b.3). Named here rather than left as
+# a literal in the client because the gateway's reservation wait below is sized against it — two
+# numbers that must stay ordered cannot live in two files as unrelated literals.
+PROVIDER_CALL_SECONDS = 300.0
+
+# A silent provider can hold a call past `PROVIDER_CALL_SECONDS` by up to one per-`recv` read slice
+# (`openrouter.READ_SLICE_SECONDS`, 30 s), so the longest a legitimate call can stay in flight is
+# the sum. This margin is that slice.
+PROVIDER_CALL_OVERSHOOT_SECONDS = 30.0
+
+# How long a call or a replay waits for THE GATEWAY'S OWN RESERVATIONS to come back
+# (`OwnerGateway.call`, `OwnerGateway.replay`) before it is refused — for callers of ANY model, not
+# only callers of the model being priced. A payer's balance can read zero for two unrelated reasons:
+# the allowance is spent, or it is held by calls still in flight — a price probe (the first call to a
+# model the journal has never settled reserves the whole balance, because nothing smaller is known
+# to be an upper bound) or ceiling-sized holds near exhaustion. The first is refused at once and
+# counted in `unfunded_calls` (§5.8); the second WAITS for a settle or a returned hold, because
+# refusing it would cost a funded arm a delegate as a dead step (§8b.3) for a reservation the miner
+# never asked for. Prices are seeded from the journal, so a restart does not re-probe any model the
+# journal has already settled.
+#
+# SIZED TO OUTLAST THE CALL BEING WAITED ON. A shorter bound gives up while that call is still
+# legitimately running — the refusal it produces is only "congestion" (never counted unfunded), but
+# the arm still loses the delegate, which is the harm the wait exists to remove. So it is at least the
+# longest a provider call can stay in flight, and small enough that a waiter plus its own call still
+# fits inside the episode clock (§8b.2); `test_config` pins both orderings. Expiry means the call it
+# waited on outlived its own timeout, which is a hung pool rather than congestion anyone should wait
+# out.
+PRICE_PROBE_WAIT_SECONDS = PROVIDER_CALL_SECONDS + PROVIDER_CALL_OVERSHOOT_SECONDS + 30.0
 
 
 # How much of its slice an arm must reach before it may take the CROWN (§4, §5.8, §5.2).

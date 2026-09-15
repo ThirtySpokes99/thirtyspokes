@@ -21,12 +21,16 @@ which the cheapest model dominates would make every test here pass for the wrong
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import shutil
 import socket
+import subprocess
 import threading
 import time
+import urllib.error
 from unittest import mock
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -48,12 +52,14 @@ from thirtyspokes.v3.config import (DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECO
                                      KING_ZERO_NAME,
                                      EPISODE_CONCURRENCY,
                                      EXCLUDED_REASON,
-                                     MAX_DUELS_PER_WINDOW, MAX_QUEUE_DEPTH, FUTILE_REASON)
+                                     MAX_DUELS_PER_WINDOW, MAX_INFRA_DEFERRALS, MAX_QUEUE_DEPTH,
+                                     FUTILE_REASON)
 from thirtyspokes.v3.devkit import suite_grade
-from thirtyspokes.v3.emissions import KING0
+from thirtyspokes.v3.emissions import KING0, emission_weights
 from thirtyspokes.v3.gateway import OwnerGateway
 from thirtyspokes.v3.openrouter import Completion
 from thirtyspokes.v3.scaffold import Scaffold
+from thirtyspokes.v3.serve import EndpointUnreachable, LoadFailure, ServeError, ServingOutage
 from thirtyspokes.v3.simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED,
                                       _GraderGuard, learned_router)
 from thirtyspokes.v3.store import (GRACE_SECONDS, MANIFEST_NAME, S3Bucket, build_manifest,
@@ -360,10 +366,11 @@ def harness(root: Path, benchmarks=LIVE, *, per_benchmark: int = 3, minimum: int
     nonces = {window: f"beacon-{window}" for window in CADENCE.windows}
 
     def serve(model_dir: Path, served_model: str) -> Conductor:
-        """§8b.2's load check: raise if this tree cannot be served."""
+        """§8b.2's load check: raise if this tree cannot be served — as the tree's fault, so a
+        `LoadFailure`, the one serving failure that spends a shot."""
         conductor = registry.get(Path(model_dir).name)
         if conductor is None:
-            raise RuntimeError(f"no server is holding {served_model}")
+            raise LoadFailure(f"no server is holding {served_model}")
         return conductor
 
     validator = Validator(
@@ -622,7 +629,7 @@ def test_admission_runs_before_the_kings_arm_so_a_broken_challenger_costs_the_ki
     assert spy.calls == 0
     assert refused.report.king is None and refused.report.king_results == ()
     assert outcome(refused, dud).status == REFUSED and outcome(refused, dud).shot_spent
-    assert "pickle archive refused" in outcome(refused, dud).detail
+    assert outcome(refused, dud).detail.startswith("artifact: pickle archive refused")
     assert dud in h.validator.history.judged
     assert h.gateway.balance(king) == pytest.approx(100.0)
 
@@ -835,6 +842,7 @@ def test_a_swapped_shard_is_caught_at_duel_time_and_spends_the_shot(tmp_path):
     reveal = h.run(1)
 
     assert outcome(reveal, hopeful).status == REFUSED
+    assert outcome(reveal, hopeful).detail.startswith("artifact: ")
     assert "hashes to" in outcome(reveal, hopeful).detail
     assert hopeful in h.validator.history.judged
     assert reveal.report.king is None                # and the king was never charged for it
@@ -1141,6 +1149,384 @@ def test_a_stable_reign_is_re_submitted_between_windows_so_it_does_not_age_out(t
     h.chain.block += 1
     h.validator.step()
     assert h.chain.weights_set_at == h.chain.block - 1
+
+
+# --- the weight keeper: the slate stays fresh while a window holds the loop --------------------------
+
+
+def _stop_after(steps: int):
+    ticks = {"n": 0}
+
+    def stop() -> bool:
+        ticks["n"] += 1
+        return ticks["n"] > steps
+
+    return stop
+
+
+def test_a_window_that_holds_the_loop_for_hours_still_has_its_slate_refreshed(tmp_path):
+    """A window with challengers is one blocking call lasting most of the activity cutoff — a tree
+    fetch, a king arm, every challenger arm. A refresh that only the loop could reach would age this
+    validator, and with it the subnet's whole incentive, out of consensus inside that call."""
+    h = harness(tmp_path)
+    h.run(1, at_block=CADENCE.opens_at(2) - 1)             # the last write is a block old
+    first_write = h.chain.weights_set_at
+    refreshed = threading.Event()
+    real_set_weights = h.chain.set_weights
+
+    def set_weights(weights, *, force=False):
+        real_set_weights(weights, force=force)
+        if h.chain.weights_set_at > first_write:
+            refreshed.set()
+
+    h.chain.set_weights = set_weights
+    inside: dict = {}
+
+    def run_window(window):
+        h.chain.block = first_write + daemon.WEIGHT_REFRESH_BLOCKS      # hours pass in one call
+        inside["refreshed"] = refreshed.wait(timeout=10)
+        inside["written_at"] = h.chain.weights_set_at
+        return None
+
+    h.validator.run_window = run_window
+    h.chain.block = CADENCE.opens_at(2)
+    h.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1), keeper_poll_seconds=0.001)
+
+    assert inside["refreshed"], "no refresh landed while the window held the loop"
+    assert inside["written_at"] == first_write + daemon.WEIGHT_REFRESH_BLOCKS
+    assert not h.validator._keeper.is_alive()
+
+
+def test_the_weight_keeper_stops_when_the_loop_stops_and_a_refused_launch_starts_none(tmp_path):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(3) + CADENCE.window_blocks         # past the schedule
+    h.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1), keeper_poll_seconds=0.001)
+
+    assert h.validator._keeper is not None and not h.validator._keeper.is_alive()
+    assert daemon.WEIGHT_KEEPER_THREAD not in {thread.name for thread in threading.enumerate()}
+
+    refused = harness(tmp_path / "refused")
+    refused.chain.rate_limit = 500                    # longer than the window: preflight refuses it
+    with pytest.raises(Exception, match="weights_rate_limit"):
+        refused.validator.run_forever(poll_seconds=0.0, should_stop=_stop_after(1))
+    assert refused.validator._keeper is None, "a misconfigured launch must write nothing"
+
+
+def test_the_keeper_and_the_loop_never_use_the_chain_at_the_same_time(tmp_path):
+    """The live seam is one websocket client that is not safe for concurrent use. A keeper tick
+    arriving while the loop is inside a chain call waits for it — and so does the window's beacon,
+    which drives the same client without going through the `Chain` methods."""
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    entered, release = threading.Event(), threading.Event()
+    guard = threading.Lock()
+    inside = {"now": 0, "most": 0}
+
+    def occupied(call):
+        def run(*args, **kwargs):
+            with guard:
+                inside["now"] += 1
+                inside["most"] = max(inside["most"], inside["now"])
+            try:
+                return call(*args, **kwargs)
+            finally:
+                with guard:
+                    inside["now"] -= 1
+        return run
+
+    real_set_weights = h.chain.set_weights
+
+    def slow_set_weights(weights, *, force=False):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = occupied(slow_set_weights)
+    h.chain.current_block = occupied(h.chain.current_block)
+    h.chain.metagraph = occupied(h.chain.metagraph)
+    loop = threading.Thread(target=h.validator.chain.set_weights, args=({0: 1.0},),
+                            kwargs={"force": True})
+    loop.start()
+    assert entered.wait(timeout=10)
+
+    ticked, nonce = threading.Event(), threading.Event()
+    threading.Thread(target=lambda: (h.validator._keep_weights_once(), ticked.set())).start()
+    threading.Thread(target=lambda: (h.validator.beacon(1), nonce.set())).start()
+    assert not ticked.wait(timeout=0.1), "the keeper used the chain while a write was in flight"
+    assert not nonce.wait(timeout=0.05), "the beacon used the chain while a write was in flight"
+
+    release.set()
+    assert ticked.wait(timeout=10) and nonce.wait(timeout=10)
+    loop.join(timeout=10)
+    assert inside["most"] == 1
+
+
+def test_a_refresh_writes_the_same_slate_the_window_wrote_while_king_zero_is_paid_at_a_uid(tmp_path):
+    """Every write path builds the slate through one function. The refresh used to leave out
+    `king_zero_uid`, so between two windows that each paid King₀'s share at its uid, the refresh
+    quietly moved it to the burn."""
+    h = harness(tmp_path)
+    seat = h.chain.register(address("genesis-seat"))
+    h.validator.king_zero_uid = seat
+    reveal = h.run(1)
+    assert reveal.report.weights[seat] == pytest.approx(0.85)
+
+    h.chain.block += daemon.WEIGHT_REFRESH_BLOCKS
+    assert h.validator._keep_weights_once()
+    assert h.chain.weights == reveal.report.weights
+
+    h.chain.block = CADENCE.opens_at(3) + CADENCE.window_blocks         # the loop's idle path
+    assert h.validator.step() is None
+    assert h.chain.weights_set_at == h.chain.block
+    assert h.chain.weights == reveal.report.weights
+
+
+def test_a_coronation_slate_is_retried_as_soon_as_the_rate_limit_allows_not_a_cadence_later(
+        tmp_path, capsys):
+    """A refresh that lands just before the window's write makes that write rate-limited. The new
+    king's slate must follow the first block the chain would accept it — not wait out the refresh
+    cadence with the old king still paid — and the ticks in between neither write nor log."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    refreshed_at = h.chain.weights_set_at
+
+    reveal = h.run(1)
+
+    assert reveal.report.crowned == strong and reveal.weights_written is False
+    note = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]["note"]
+    assert "rate-limited" in note and "identical" not in note
+    king_uid = h.chain.metagraph().resolve(strong).uid
+    assert king_uid not in h.chain.weights                      # the old slate is still paying
+    retry_at = refreshed_at + h.chain.rate_limit + 1
+    assert retry_at - refreshed_at < daemon.WEIGHT_REFRESH_BLOCKS
+
+    capsys.readouterr()
+    for block in range(refreshed_at + 1, retry_at):
+        h.chain.block = block
+        assert not h.validator._keep_weights_once()
+    assert capsys.readouterr().out == ""
+
+    h.chain.block = retry_at
+    assert h.validator._keep_weights_once()
+    assert h.chain.weights[king_uid] == pytest.approx(0.85)
+
+
+def test_a_rate_limited_refresh_is_attempted_and_logged_once_until_the_chain_would_accept_it(
+        tmp_path, capsys):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    attempts: list[int] = []
+    real_set_weights = h.chain.set_weights
+
+    def counting(weights, *, force=False):
+        attempts.append(h.chain.block)
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = counting
+    due = CADENCE.opens_at(1) + daemon.WEIGHT_REFRESH_BLOCKS
+    h.chain.weights_set_at = due - 10               # a write this process did not make
+    capsys.readouterr()
+
+    for block in range(due, due + 30):
+        h.chain.block = block
+        h.validator._keep_weights_once()
+
+    assert attempts == [due]
+    logged = [line for line in capsys.readouterr().out.splitlines() if "rate-limited" in line]
+    assert len(logged) == 1
+    h.chain.block = due - 10 + h.chain.rate_limit + 1
+    assert h.validator._keep_weights_once() and attempts[-1] == h.chain.block
+
+
+def test_keeper_exceptions_are_logged_once_and_retried_until_the_chain_recovers(tmp_path, capsys):
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    outages = {"left": 3}
+    real_metagraph = h.chain.metagraph
+
+    def flaky():
+        if outages["left"]:
+            outages["left"] -= 1
+            raise ConnectionError("websocket closed")
+        return real_metagraph()
+
+    h.chain.metagraph = flaky
+
+    class Ticks(threading.Event):
+        """`stop`, set after a fixed number of ticks, so the loop runs without sleeping."""
+
+        def __init__(self, ticks: int) -> None:
+            super().__init__()
+            self.left = ticks
+
+        def wait(self, timeout=None) -> bool:
+            self.left -= 1
+            if self.left <= 0:
+                self.set()
+            return self.is_set()
+
+    h.validator._keep_weights_forever(Ticks(5), 0.0)         # returns: nothing escaped
+
+    out = capsys.readouterr().out
+    assert out.count("weight keeper: ConnectionError") == 1
+    assert "the chain answers again" in out
+    assert h.chain.weights_set_at == h.chain.block
+
+
+def test_a_keeper_that_keeps_failing_never_takes_the_loop_or_the_window_down(
+        tmp_path, capsys, monkeypatch):
+    h = harness(tmp_path)
+    uncaught: list = []
+    monkeypatch.setattr(threading, "excepthook", uncaught.append)
+    failed = threading.Event()
+    failures = {"n": 0}
+    real_block = h.chain.current_block
+
+    def block():
+        if threading.current_thread().name == daemon.WEIGHT_KEEPER_THREAD:
+            failures["n"] += 1
+            if failures["n"] >= 3:
+                failed.set()
+            raise ConnectionError("websocket closed")
+        return real_block()
+
+    h.chain.current_block = block
+    windows: list[bool] = []
+
+    def run_window(window):
+        windows.append(failed.wait(timeout=10))
+        return None
+
+    h.validator.run_window = run_window
+    h.chain.block = CADENCE.opens_at(1)
+    h.validator.run_forever(poll_seconds=0.0, should_stop=lambda: bool(windows),
+                            keeper_poll_seconds=0.001)
+
+    assert windows == [True]
+    assert uncaught == []
+    assert not h.validator._keeper.is_alive()
+    assert capsys.readouterr().out.count("weight keeper: ConnectionError") == 1
+
+
+def test_a_keeper_tick_never_sees_a_half_settled_history(tmp_path):
+    """`_publish` moves the crown, settles, computes the slate and writes it as one step. A keeper
+    tick arriving between the coronation and the settle waits, and the only slate that reaches the
+    chain is the settled one."""
+    h = harness(tmp_path)
+    strong = h.enrol("router-b", block=11, conductor=router(h))
+    slates: list[dict] = []
+    real_set_weights = h.chain.set_weights
+
+    def recording(weights, *, force=False):
+        slates.append(dict(weights))
+        return real_set_weights(weights, force=force)
+
+    h.chain.set_weights = recording
+    computed = threading.Event()
+    real_slate = h.validator._slate
+
+    def watched(metagraph):
+        if threading.current_thread().name == "keeper-tick":
+            computed.set()
+        return real_slate(metagraph)
+
+    h.validator._slate = watched
+    tick = threading.Thread(target=h.validator._keep_weights_once, name="keeper-tick")
+    seen: dict = {}
+    real_settle = h.validator.history.settle
+
+    def settle(*args, **kwargs):
+        tick.start()                                  # the crown has moved; nothing is settled
+        seen["waited"] = not computed.wait(timeout=0.2)
+        return real_settle(*args, **kwargs)
+
+    h.validator.history.settle = settle
+    h.chain.block = CADENCE.opens_at(1)
+    reveal = h.run(1)
+    tick.join(timeout=10)
+
+    assert reveal.report.crowned == strong
+    assert seen["waited"], "the keeper computed a slate in the middle of _publish"
+    assert computed.is_set() and not tick.is_alive()
+    assert slates == [reveal.report.weights]
+
+
+def test_a_deregistered_king_is_paid_as_a_reversion_by_the_keeper_without_touching_history(tmp_path):
+    """§5.5's payout cannot wait for the window to end, and the keeper cannot record it: it runs
+    beside a window and never changes history. It pays King₀'s slate — pension ranks unshifted — and
+    the loop's idle path records the reversion later without writing the same slate twice."""
+    h = harness(tmp_path)
+    h.crown("old", router(h))
+    king = h.crown("king", router(h))
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+    h.chain.deregister(king)
+    reigns = [dict(reign) for reign in h.validator.history.reigns]
+
+    h.chain.block = CADENCE.opens_at(1) + h.chain.rate_limit + 1     # well inside the cadence
+    assert h.validator._keep_weights_once(), "a changed slate is due at once"
+
+    hotkey_of = h.chain.metagraph().hotkey_of
+    lineage = h.validator.history.lineage()
+    reverted = emission_weights(lineage, KING0, hotkey_of, burn_uid=0)
+    assert h.chain.weights == reverted
+    assert reverted != emission_weights(lineage, king, hotkey_of, burn_uid=0)
+    assert h.validator.history.crown.hotkey == king
+    assert h.validator.history.reigns == reigns
+
+    written_at = h.chain.weights_set_at
+    h.chain.block += 1
+    assert h.validator._refresh_weights(h.chain.block) is False     # recorded, not re-written
+    assert h.validator.history.crown.is_king_zero
+    assert h.validator.history.reigns[-2]["ended"] == "deregistered"
+    assert h.chain.weights_set_at == written_at
+
+
+def test_a_king_that_deregisters_mid_window_is_published_as_a_reversion_in_every_field(tmp_path):
+    """The window's own write pays §5.5's reversion only after recording it, so the signed reveal's
+    weights, pensioners, reign and history.json all describe the same throne."""
+    h = harness(tmp_path)
+    king = h.crown("king", router(h))
+    real_settle = h.validator.history.settle
+
+    def settle(*args, **kwargs):
+        h.chain.deregister(king)                      # after the window opened on a live king
+        return real_settle(*args, **kwargs)
+
+    h.validator.history.settle = settle
+    reveal = h.run(1)
+
+    assert reveal.report.king_hotkey == king                  # the king the window opened with
+    record = json.loads(h.store.get(reveal_path(1)))["record"]
+    assert record["reign"]["genesis"] is True
+    assert record["reign"]["previous"]["hotkey"] == king
+    assert record["reign"]["previous"]["reason"] == "deregistered"
+    assert reveal.report.pensioners == (king,)
+    assert reveal.report.weights == emission_weights(
+        h.validator.history.lineage(), KING0, h.chain.metagraph().hotkey_of, burn_uid=0)
+    assert json.loads(h.validator.history.path.read_text())["crown"]["hotkey"] == KING0
+
+
+def test_a_window_write_pre_empted_by_the_keeper_names_the_identical_slate_and_keeps_its_record(
+        tmp_path):
+    """Written=false stays true of the window's own write, and says the slate it computed is the one
+    on chain; a keeper write afterwards never rewrites what the reveal recorded."""
+    h = harness(tmp_path)
+    h.chain.block = CADENCE.opens_at(1)
+    assert h.validator._keep_weights_once()
+
+    reveal = h.run(1)
+
+    assert reveal.weights_written is False
+    record = json.loads(h.store.get(reveal_path(1)))["record"]["weights_set"]
+    assert "rate-limited" in record["note"]
+    assert f"an identical slate was written at block {CADENCE.opens_at(1)}" in record["note"]
+    h.chain.block += daemon.WEIGHT_REFRESH_BLOCKS
+    assert h.validator._keep_weights_once()
+    assert json.loads(h.validator._local_reveal(1).read_text())["weights_set"] == record
 
 
 def test_a_launch_the_chain_would_silently_defeat_is_refused_before_anything_is_scored(tmp_path):
@@ -1705,7 +2091,7 @@ def test_a_model_that_will_not_load_is_refused_before_the_king_spends_anything(t
     reveal = h.run(1)
 
     row = outcome(reveal, hotkey)
-    assert row.status == REFUSED
+    assert row.status == REFUSED and row.detail.startswith("artifact: ")
     assert hotkey in h.validator.history.judged, "an invalid artifact was judged: the shot is spent"
     # The king never ran, so the king never paid. (The reference arms DID run: they are the power
     # gate, they precede admission, and the owner pays for them — that is PHASE 2, not PHASE 4.)
@@ -2776,3 +3162,380 @@ def test_an_upload_nobody_committed_to_is_swept_and_a_real_submission_is_not(tmp
 
 def committed_of(h: Harness, hotkey: str) -> str:
     return next(c.ready.registration_id for c in h.chain.commitments() if c.hotkey == hotkey)
+
+
+# --- §8b.2: only the artifact's failures spend a shot at admission ----------------------------------
+
+def _failing_serve(h: Harness, failures: Mapping[str, BaseException], *,
+                   probe: bool | None = None) -> None:
+    """The harness's `serve`, with the named hotkeys' trees raising the given exception. `probe`
+    attaches the `Serve`'s optional probe, working (True) or down (False); None leaves it absent, so
+    the window's other entries are the only witness that serving worked."""
+    inner = h.validator.serve
+
+    def serve(model_dir: Path, served_model: str) -> Conductor:
+        for hotkey, failure in failures.items():
+            if served_model.startswith(f"v3-{hotkey}@"):
+                raise failure
+        return inner(model_dir, served_model)
+
+    if probe is not None:
+        def check() -> None:
+            if not probe:
+                raise ServeError("the serving host is down")
+        serve.probe = check
+    h.validator.serve = serve
+
+
+def test_an_owner_side_read_error_mid_hash_defers_the_entry_with_its_shot_intact(tmp_path,
+                                                                                 monkeypatch):
+    """The failure this rule exists for: the trees mount returns EIO part-way through re-hashing a
+    tree. Nothing about the tree is wrong, so the shot is not spent, the king is not charged, the
+    entry stays in the published queue, the mailbox is not touched again, and the next window duels
+    it. EIO is the link's errno, so the window does not count toward the cap either."""
+    h = harness(tmp_path)
+    spy = Spy(router(h))
+    h.crown("incumbent", spy)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    real = store_module.sha256_file
+    monkeypatch.setattr(store_module, "sha256_file", lambda path: (_ for _ in ()).throw(
+        OSError(errno.EIO, "Input/output error", "/var/lib/trees/secret-path")))
+
+    first = h.run(1)
+
+    row = outcome(first, hopeful)
+    assert row.status == DEFERRED and not row.shot_spent
+    assert row.detail.startswith("owner-side (outage, not counted): OSError while fetching and hashing")
+    assert "secret-path" not in row.detail, "an owner-side failure is published by type only"
+    assert hopeful not in h.validator.history.judged
+    assert first.report.king is None and spy.calls == 0
+    assert h.validator.history.infra_deferral_count(registration_id) == 0
+    h.validator._publish_queue(h.chain.block, 1)
+    assert hopeful in [entry["hotkey"] for entry in queue_record(h)["entries"]]
+    ledger = (h.root / "mailbox.json").read_text()
+
+    monkeypatch.setattr(store_module, "sha256_file", real)
+    second = h.run(2, at_block=CADENCE.opens_at(2))
+
+    assert outcome(second, hopeful).status == DUELLED
+    assert hopeful in h.validator.history.judged
+    assert (h.root / "mailbox.json").read_text() == ledger, "consumed once, re-queued unchanged"
+
+
+def test_a_bucket_that_will_not_answer_defers_rather_than_refuses(tmp_path, monkeypatch):
+    """A transport failure from the private models bucket is `StoreUnavailable`, never a
+    `StoreError`; and because the probe's own listing fails too, the outage is not counted."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    endpoint_down = type("EndpointConnectionError", (Exception,), {})
+    monkeypatch.setattr(h.private.client, "list_objects_v2",
+                        lambda **kwargs: (_ for _ in ()).throw(endpoint_down("https://r2.invalid")))
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED
+    assert row.detail.startswith("owner-side (outage, not counted): StoreUnavailable while fetching")
+    assert "r2.invalid" not in row.detail
+    assert hopeful not in h.validator.history.judged
+
+
+@pytest.mark.parametrize("failure", [subprocess.TimeoutExpired(["ssh", "serving-host"], 180.0),
+                                     ServeError("ssh serving-host: exit 255: connection refused")],
+                         ids=["timeout", "ssh-exit"])
+def test_a_runner_that_times_out_or_fails_at_load_defers_the_entry(tmp_path, failure):
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    _failing_serve(h, {hopeful: failure})
+
+    reveal = h.run(1)
+
+    row = outcome(reveal, hopeful)
+    assert row.status == DEFERRED and not row.shot_spent
+    assert row.detail.startswith(f"owner-side (outage, not counted): {type(failure).__name__} "
+                                 f"while loading")
+    assert "serving-host" not in row.detail
+    assert hopeful not in h.validator.history.judged and reveal.report.king is None
+
+
+def test_a_tree_the_serving_host_cannot_load_spends_the_shot(tmp_path):
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    _failing_serve(h, {hopeful: LoadFailure("vLLM exited with SafetensorError while loading")},
+                   probe=True)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == REFUSED and row.shot_spent
+    assert row.detail == "artifact: vLLM exited with SafetensorError while loading"
+    assert hopeful in h.validator.history.judged
+
+
+def test_an_exception_nobody_classified_is_treated_as_the_owners_and_counted_toward_the_cap(
+        tmp_path):
+    """A deliberate decision (§8b.2): an unforeseen failure is one the owner did not anticipate, and
+    a wrong deferral costs a bounded delay where a wrong refusal is permanent."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    _failing_serve(h, {hopeful: RuntimeError("unforeseen")}, probe=True)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED
+    assert row.detail.startswith("owner-side: RuntimeError while loading this submission")
+    assert f"(1 of MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS} counted)" in row.detail
+    assert hopeful not in h.validator.history.judged
+
+
+def test_a_tree_that_keeps_failing_alone_while_serving_works_is_refused_once_the_cap_is_spent(
+        tmp_path, monkeypatch):
+    """The abuse bound: a tree that deterministically reproduces an owner-side-looking failure, on
+    windows where the serving host demonstrably answers, cannot hold its queue slot forever."""
+    monkeypatch.setattr(validator_module, "MAX_INFRA_DEFERRALS", 1)
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    _failing_serve(h, {hopeful: ServeError("the process exited without a recognisable load error")},
+                   probe=True)
+
+    first = outcome(h.run(1), hopeful)
+    second = outcome(h.run(2, at_block=CADENCE.opens_at(2)), hopeful)
+
+    assert first.status == DEFERRED and "(1 of MAX_INFRA_DEFERRALS=1 counted)" in first.detail
+    assert second.status == REFUSED and second.shot_spent
+    assert second.detail.startswith("owner-side, deferral cap reached: ServeError while loading")
+    assert "more than MAX_INFRA_DEFERRALS=1" in second.detail
+    assert hopeful in h.validator.history.judged
+
+
+def test_an_outage_that_fails_every_entry_defers_them_all_without_spending_the_cap(tmp_path,
+                                                                                    monkeypatch):
+    """The cap must bound a TREE, not an outage: with the serving host down for everyone and its
+    probe failing, MAX + 1 windows later nobody has been refused and nothing has been counted."""
+    monkeypatch.setattr(validator_module, "MAX_INFRA_DEFERRALS", 1)
+    h = harness(tmp_path)
+    first = h.enrol("entry-a", block=10, conductor=router(h))
+    second = h.enrol("entry-b", block=11, conductor=router(h))
+    down = ServeError("ssh: connect to host: connection timed out")
+    _failing_serve(h, {first: down, second: down}, probe=False)
+
+    for window in (1, 2):
+        reveal = h.run(window, at_block=CADENCE.opens_at(window))
+        for hotkey in (first, second):
+            row = outcome(reveal, hotkey)
+            assert row.status == DEFERRED and "outage, not counted" in row.detail, row.detail
+
+    assert h.validator.history.judged == set()
+    assert h.validator.history.infra_deferrals == {}
+
+
+def test_an_owner_side_deferral_takes_no_duel_slot_and_counts_when_the_stage_worked_for_others(
+        tmp_path):
+    """Deferred, not admitted, so the whole duel cap goes to the entries behind it; and with no probe
+    on this `Serve`, the entries that were served are the witness that serving worked."""
+    h = harness(tmp_path)
+    hotkeys = [h.enrol(f"entry-{i:02d}", block=10 + i, conductor=router(h))
+               for i in range(MAX_DUELS_PER_WINDOW + 1)]
+    _failing_serve(h, {hotkeys[0]: ServeError("the forwarded port reset the connection")})
+
+    reveal = h.run(1)
+
+    row = outcome(reveal, hotkeys[0])
+    assert row.status == DEFERRED and f"(1 of MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS}" in row.detail
+    assert [outcome(reveal, hotkey).status for hotkey in hotkeys[1:]] == \
+        [DUELLED] * MAX_DUELS_PER_WINDOW
+    assert hotkeys[0] not in h.validator.history.judged
+
+
+def test_a_window_retried_after_it_raised_counts_one_deferral_not_two(tmp_path):
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    _failing_serve(h, {hopeful: RuntimeError("unforeseen")}, probe=True)
+
+    h.run(1)
+    retried = h.run(1)
+
+    assert "(1 of MAX_INFRA_DEFERRALS" in outcome(retried, hopeful).detail
+    assert History(h.validator.root / "history.json").infra_deferral_count(registration_id) == 1
+
+    # A retry of the same window that ADMITS the entry takes that window's count back.
+    h.validator.history.forget_infra_deferral(registration_id, 1)
+    assert History(h.validator.root / "history.json").infra_deferrals == {}
+
+
+def test_a_history_file_written_before_deferrals_were_counted_still_loads_and_round_trips(tmp_path):
+    """The live daemon's state file has no such field; a restart onto this code must read it, and
+    the version does not move because the field is additive."""
+    path = tmp_path / "history.json"
+    History(path).settle(4, crowned=None, judged=["synthetic-settled"], revealed=["t-1"])
+    state = json.loads(path.read_text())
+    del state["infra_deferrals"]
+    path.write_text(json.dumps(state))
+
+    restored = History(path)
+    assert restored.infra_deferrals == {} and restored.judged == {"synthetic-settled"}
+    restored.record_infra_deferral("cd" * 32, hotkey="synthetic-entry", window=5,
+                                   cause="StoreUnavailable")
+
+    written = json.loads(path.read_text())
+    assert written["version"] == daemon.STATE_VERSION == 1
+    assert written["infra_deferrals"] == {"cd" * 32: {"hotkey": "synthetic-entry", "windows": [5],
+                                                      "cause": "StoreUnavailable"}}
+
+
+def test_a_trees_mount_that_loses_the_tree_between_fetch_and_check_defers_rather_than_refuses(
+        tmp_path, monkeypatch):
+    """`Path.is_file` reads a vanished file as absent, so a mount that detached after the fetch would
+    reach admission as a tree with no config.json and be refused for it. Every named file is
+    stat'ed first, so the same absence is an `OSError` — the owner's."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    real = validator_module.fetch_submission
+
+    def fetch_then_lose(bucket, dest, **kwargs):
+        manifest = real(bucket, dest, **kwargs)
+        (dest / "config.json").unlink()
+        return manifest
+
+    monkeypatch.setattr(validator_module, "fetch_submission", fetch_then_lose)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED
+    assert row.detail.startswith("owner-side: FileNotFoundError while checking this submission")
+    assert hopeful not in h.validator.history.judged
+
+
+def test_a_trees_mount_that_detached_whole_is_an_outage_even_though_its_mountpoint_is_writable(
+        tmp_path, monkeypatch):
+    """A detached mount leaves an ordinary local directory behind, so the disk probe's sentinel write
+    succeeds. The tree directory the fetch created is gone with the mount, and that absence is what
+    keeps the window from counting against a tree that did nothing wrong."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    real = validator_module.fetch_submission
+
+    def fetch_then_detach(bucket, dest, **kwargs):
+        manifest = real(bucket, dest, **kwargs)
+        shutil.rmtree(dest)
+        return manifest
+
+    monkeypatch.setattr(validator_module, "fetch_submission", fetch_then_detach)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED
+    assert row.detail.startswith("owner-side (outage, not counted): FileNotFoundError while checking")
+    assert h.validator.history.infra_deferral_count(registration_id) == 0
+
+
+def test_a_mount_error_inside_a_download_is_an_uncounted_outage_while_small_probes_pass(
+        tmp_path, monkeypatch):
+    """The mount that fails a long write but answers a small one: the listing and the sentinel write
+    both work, yet the EIO from inside the download keeps its errno and so is never counted."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    monkeypatch.setattr(h.private.client, "download_file", lambda *args, **kwargs: (
+        _ for _ in ()).throw(OSError(errno.EIO, "Input/output error")))
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED and not row.shot_spent
+    assert row.detail.startswith("owner-side (outage, not counted): OSError while fetching")
+    assert h.validator.history.infra_deferral_count(registration_id) == 0
+    assert hopeful not in h.validator.history.judged
+
+
+def test_a_link_errno_anywhere_down_the_chain_marks_an_outage_and_nothing_else_does():
+    """A transport library wraps the socket's reset in a type of its own; the errno survives only as
+    the cause. A plain error, or one with a content errno, is not an outage on its face."""
+    def raised_from(outer: BaseException, inner: BaseException) -> BaseException:
+        try:
+            try:
+                raise inner
+            except BaseException:
+                raise outer
+        except BaseException as exc:
+            return exc
+
+    reset = OSError(errno.ECONNRESET, "Connection reset by peer")
+    assert validator_module._link_failure(reset)
+    assert validator_module._link_failure(raised_from(RuntimeError("wrapped"), reset))
+    assert not validator_module._link_failure(raised_from(RuntimeError("wrapped"), KeyError("x")))
+    assert not validator_module._link_failure(OSError(errno.ENOTDIR, "Not a directory"))
+    looped = RuntimeError("a")
+    looped.__cause__ = RuntimeError("b")
+    looped.__cause__.__cause__ = looped
+    assert not validator_module._link_failure(looped)
+    assert not validator_module._link_failure(raised_from(ServeError("verdict"), reset)), \
+        "a serving error's type is its verdict; a reset beneath it does not overrule it"
+
+
+def _readiness_verdict_over_a_reset(verdict: ServeError) -> ServeError:
+    """`verdict` chained exactly as `RemoteServing._launch` chains one: raised from the last
+    readiness error, an `EndpointUnreachable` that `ServedConductor` raised from urllib's `URLError`,
+    itself raised while handling the forward's ECONNRESET."""
+    try:
+        try:
+            try:
+                try:
+                    raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+                except OSError as reset:
+                    raise urllib.error.URLError(reset)
+            except urllib.error.URLError as exc:
+                raise EndpointUnreachable(f"http://127.0.0.1:8000/v1/models: {exc}") from exc
+        except ServeError as last:
+            raise verdict from last
+    except ServeError as raised:
+        return raised
+
+
+def test_a_diagnosed_load_failure_over_a_reset_forward_is_counted_not_an_uncounted_outage(tmp_path):
+    """The abuse bound in the load stage. The host answered the diagnosis and the process had died
+    with no recognisable marker — owner-side, but a thing a tree can reproduce, so it counts. The
+    ECONNRESET the dying forward left beneath the verdict must not turn it into an outage that never
+    reaches `MAX_INFRA_DEFERRALS`."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    verdict = _readiness_verdict_over_a_reset(
+        ServeError("the process exited without a recognisable load error"))
+    assert validator_module._link_failure(verdict.__cause__.__cause__), "the reset is in the chain"
+    _failing_serve(h, {hopeful: verdict}, probe=True)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED and not row.shot_spent
+    assert row.detail.startswith("owner-side: ServeError while loading this submission")
+    assert f"(1 of MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS} counted)" in row.detail
+    assert h.validator.history.infra_deferral_count(registration_id) == 1
+    assert hopeful not in h.validator.history.judged
+
+
+def test_a_diagnosed_serving_outage_over_a_reset_forward_is_still_uncounted(tmp_path):
+    """The other direction of the same rule: the verdict's type decides, so a `ServingOutage` stays an
+    uncounted outage whatever lies beneath it."""
+    h = harness(tmp_path)
+    hopeful = h.enrol("hopeful", block=10, conductor=router(h))
+    registration_id = committed(h, hopeful).ready.registration_id
+    _failing_serve(h, {hopeful: _readiness_verdict_over_a_reset(
+        ServingOutage("the serving host did not answer the readiness diagnosis"))}, probe=True)
+
+    row = outcome(h.run(1), hopeful)
+
+    assert row.status == DEFERRED
+    assert row.detail.startswith("owner-side (outage, not counted): ServingOutage while loading")
+    assert h.validator.history.infra_deferral_count(registration_id) == 0
+
+
+def test_local_serving_offers_a_probe_that_fails_when_an_endpoint_does_not_answer():
+    """`--serve-url` owns no load, so every failure there defers; the probe is what lets a name
+    nobody ever serves be counted, and refused at the cap, rather than queued forever."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    serve = validator_module.local_serving(f"http://127.0.0.1:{port}/v1", timeout=2.0)
+    with pytest.raises(ServeError):
+        serve.probe()

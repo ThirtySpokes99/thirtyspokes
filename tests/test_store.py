@@ -649,3 +649,85 @@ def test_an_upload_still_arriving_keeps_resetting_its_own_clock(tmp_path, bucket
     bucket.put(REGISTRATION.prefix + "model-late.safetensors", b"the next shard")
 
     assert unclaimed_plan(bucket, committed=(), now=1_000.0 + UNCLAIMED_GRACE_SECONDS) == ()
+
+
+# --- whose failure a duel-time fetch was (§8b.2) ----------------------------------------------------
+
+# Named as botocore names its transport failure, and defined here because boto3 is not installed:
+# nothing downstream may classify by the name, so a stand-in with the same name proves it does not.
+EndpointConnectionError = type("EndpointConnectionError", (Exception,), {})
+
+
+def test_a_bucket_read_that_fails_at_duel_time_is_unavailable_and_never_a_refusal(
+        tmp_path, bucket, monkeypatch):
+    """§8b.2 and `fetch_manifest`'s own promise: the owner's outage must not refuse a valid
+    submission. A failed read is `StoreUnavailable`, which is deliberately NOT a `StoreError` — the
+    validator spends a shot on `StoreError` — and its text names the type, never the cause's text,
+    which can carry the account endpoint into a public reveal."""
+    from thirtyspokes.v3.store import StoreUnavailable
+    _, manifest = submission(tmp_path, bucket)
+    signal = commitment(manifest.sha256)
+    endpoint = "https://account-0000.r2.example.invalid"
+
+    def down(**kwargs):
+        raise EndpointConnectionError(f"Could not connect to the endpoint URL: {endpoint}")
+
+    monkeypatch.setattr(bucket.client, "list_objects_v2", down)
+    with pytest.raises(StoreUnavailable) as caught:
+        fetch_submission(bucket, tmp_path / "pulled", commitment=signal, registration=REGISTRATION)
+    assert not isinstance(caught.value, StoreError)
+    assert "EndpointConnectionError" in str(caught.value) and endpoint not in str(caught.value)
+    assert isinstance(caught.value.__cause__, EndpointConnectionError)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(bucket.client, "download_file",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(EndpointConnectionError("gone")))
+    with pytest.raises(StoreUnavailable, match="could not download"):
+        fetch_submission(bucket, tmp_path / "pulled", commitment=signal, registration=REGISTRATION)
+
+
+def test_a_disk_error_inside_a_download_keeps_its_errno_rather_than_becoming_unavailable(
+        tmp_path, bucket, monkeypatch):
+    """`download_file` writes to the trees mount inside the call, so the mount's EIO arrives there.
+    It must reach the validator as the `OSError` it is: the errno is what marks it an outage that
+    never counts toward the deferral cap, and a wrapper would erase it."""
+    import errno
+    _, manifest = submission(tmp_path, bucket)
+    failure = OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(bucket.client, "download_file",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(failure))
+
+    with pytest.raises(OSError) as caught:
+        fetch_submission(bucket, tmp_path / "pulled", commitment=commitment(manifest.sha256),
+                         registration=REGISTRATION)
+    assert caught.value is failure and caught.value.errno == errno.EIO
+
+
+def test_every_other_bucket_caller_keeps_the_raw_error_it_classifies_by(tmp_path, bucket, monkeypatch):
+    """The wrapper is the duel-time fetch's alone. Upload's retry classifies the raw botocore class by
+    name, promotion publishes its type and `_absent` reads absence off it, so `S3Bucket` itself must
+    keep raising what the client raised."""
+    monkeypatch.setattr(bucket.client, "list_objects_v2",
+                        lambda **kwargs: (_ for _ in ()).throw(EndpointConnectionError("down")))
+    with pytest.raises(EndpointConnectionError):
+        bucket.list("submissions/")
+    with pytest.raises(KeyError):
+        bucket.get("submissions/absent")
+
+
+def test_a_file_the_manifest_names_but_the_prefix_lacks_is_refused_before_any_download(
+        tmp_path, bucket, monkeypatch):
+    """The second half of `fetch_submission`'s third refusal, checked against the listing. Without it
+    a named file that was never uploaded surfaced as the download's own error, which reads exactly
+    like the owner's failure and would be deferred rather than refused."""
+    _, manifest = submission(tmp_path, bucket)
+    missing = manifest.files[0].path
+    del bucket.client.objects[REGISTRATION.prefix + missing]
+    downloads: list[str] = []
+    monkeypatch.setattr(bucket.client, "download_file",
+                        lambda Bucket, Key, Filename, Config=None: downloads.append(Key))
+
+    with pytest.raises(StoreError, match=f"lacks files the manifest names: \\['{missing}'\\]"):
+        fetch_submission(bucket, tmp_path / "pulled", commitment=commitment(manifest.sha256),
+                         registration=REGISTRATION)
+    assert downloads == []

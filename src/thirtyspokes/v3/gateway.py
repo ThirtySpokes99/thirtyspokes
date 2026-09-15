@@ -54,8 +54,10 @@ WHAT IS REUSED, AND WHAT IS DELIBERATELY NOT.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
+import time
 
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -88,7 +90,8 @@ KEY_REFUSALS = frozenset({401, 402})
 
 class GatewayError(NotAnOutcome):
     """The gateway refused: no such token, a closed one, an exhausted allowance, a cost that is not
-    dollars.
+    dollars — or congestion, when a payer's money stayed held by the gateway's own calls in flight
+    for the whole bounded wait (`OwnerGateway.call`), which is not an exhausted allowance.
 
     Every one of these reaches the scaffold through `Worker.complete`, whose caller catches broadly
     and records a dead rung (§8b.3, `scaffold._call_worker`). That is the right outcome — an arm
@@ -137,6 +140,11 @@ class DuelLedger:
     fill with dead rungs and score zero, and not one of them carries `budget_exhausted`. That is a
     verdict decided by funding wearing the face of a flaky pool, which is precisely the confusion
     §5.8 requires the reveal to avoid, and this counter is the only place the difference exists.
+
+    SO IT COUNTS ONLY A PAYER THAT IS GENUINELY OUT: a call or replay that found the balance at
+    zero with nothing held for it, or a provider refusing the payer's key (`KEY_REFUSALS`). A
+    balance held by the gateway's own calls in flight is waited out, and if the wait expires the
+    refusal is congestion — never counted here, because the miner did not run out.
     """
 
     duel_id: str
@@ -187,7 +195,17 @@ class OwnerGateway:
     """
 
     def __init__(self, provider: Provider, signer: Signer | None = None,
-                 journal: Path | str | None = None) -> None:
+                 journal: Path | str | None = None, *,
+                 hold_wait_seconds: float = PRICE_PROBE_WAIT_SECONDS) -> None:
+        # How long a call or replay waits on this gateway's OWN reservations before it is refused as
+        # congestion (config: `PRICE_PROBE_WAIT_SECONDS`). Injectable so a test can prove the wait
+        # is bounded without sleeping for minutes. `not (0 < x < inf)` also refuses NaN: a NaN or
+        # negative bound would silently turn every held-up caller into an immediate refusal, and an
+        # infinite one overflows `Condition.wait`.
+        wait = float(hold_wait_seconds)
+        if not 0.0 < wait < math.inf:
+            raise ValueError(f"hold_wait_seconds must be a positive finite number, not {wait}")
+        self._hold_wait = wait
         self.provider = provider
         self._gw = signer or Signer()
         # WITHOUT THIS FILE THE ALLOWANCES ARE PROCESS MEMORY, and that is not a small thing: a
@@ -226,37 +244,119 @@ class OwnerGateway:
         # either appends. A counter handed out under the same lock gives the identical 0,1,2...
         # sequence the serial version produced, and gives it exactly once.
         self._issued: dict[str, int] = {}
-        # THE RESERVATION'S SIZE, learned rather than configured: the largest call this gateway has
-        # actually settled. None until the first one, which is what makes the first call reserve the
-        # whole balance and so run alone — the same reasoning `Validator._arm` gives for its first
-        # batch being one episode, because before it there is no price to reason with.
+        # THE RESERVATION'S SIZE, learned rather than configured: the largest call to a model that
+        # this journal has settled. None until the first one, which is what makes the first call
+        # reserve the whole balance and so run alone — the same reasoning `Validator._arm` gives for
+        # its first batch being one episode, because before it there is no price to reason with.
         # PER MODEL, because one number across every model is a lower bound on what is in flight,
         # not an upper one. The first version learned a single running max over SETTLED calls: a
         # gateway that had settled one $0.001 call then let sixteen concurrent $0.40 calls each
         # reserve $0.001, and metered $6.40 against a $0.50 allowance — the exact figure the fix was
-        # written to remove. A model whose price this gateway has never settled reserves the whole
-        # balance, which serialises the first call to it and nothing else.
+        # written to remove. A model whose price has never been settled reserves the whole balance,
+        # which serialises the first call to it and nothing else.
+        #
+        # SEEDED FROM THE JOURNAL (`_replay`), not process memory. As process memory every restart
+        # forgot every price, so the first call to each pool model after a deploy held its payer's
+        # whole balance again — and every other call on that payer found nothing free. The debit
+        # rows already carry the model and the true cost, so a restart reads back exactly the
+        # ceilings the live process had.
+        #
+        # LIVE ROWS FIRST, REPLAY ROWS ONLY AS A FALLBACK. A live debit (`call`) is ONE completion;
+        # a replay debit (§5.2c) is a delegate's TOTAL across its read loop, so it over-estimates a
+        # single call by up to the loop's length and would inflate every hold — more waiting, less
+        # concurrency — without adding information: a replay exists only because some arm filled
+        # that row through `call`, so a live row for the model is normally in the same journal. A
+        # replay row seeds a model only when no live row does (a fill whose own write never
+        # landed), where an over-estimate is still an upper bound and so still safe. `_live` is
+        # which models have a live row, so the first live row replaces a replay-seeded ceiling.
         self._ceiling: dict[str, float] = {}
+        self._live: set[str] = set()
         # Dollars currently RESERVED by calls in flight, per hotkey. A balance of zero means two
         # completely different things — the miner has spent their allowance, or their allowance is
         # entirely held by calls that have not settled yet — and `unfunded_calls` exists (§5.8) to
         # say the first. Without this the second was reported as the first.
         self._held: dict[str, float] = {}
-        # The first call of a gateway's life has no price to reserve against, so it reserves the
-        # whole balance and every concurrent caller would find nothing left. Refusing them would
-        # report a funded miner as unfunded; letting them through would be the check-then-act this
-        # reservation exists to remove. So they WAIT for the first call to settle, which is the only
-        # thing that can teach them a price. Bounded, so a hung provider degrades to the ordinary
-        # refusal rather than parking an arm forever.
-        self._priced = threading.Condition(self._money)
+        # HOW MANY calls hold money, per hotkey — the predicate "something is held", decided on a
+        # count rather than on `_held`'s float, which is a sum of additions and subtractions and can
+        # sit at 1e-17 with nothing in flight. A float predicate would make a genuinely exhausted
+        # payer wait out the whole bound and then be reported as congestion instead of unfunded.
+        self._holding: dict[str, int] = {}
+        # How many in-flight calls per hotkey are UNDER-RESERVED: a probe (price unknown, so the
+        # hold may be less than the cost), or a call that found less free than its model's ceiling
+        # and held what there was. These are the only calls that can overrun the allowance, and the
+        # "at most one call" bound (§4) is true only while at most ONE of them is in flight per payer
+        # — see `call`. Fully reserved calls (hold == ceiling) cannot overrun and are not counted.
+        self._short: dict[str, int] = {}
+        # EVERY CALLER BLOCKED ONLY BY THIS GATEWAY'S OWN RESERVATIONS WAITS HERE — a caller of an
+        # unpriced model behind the probe, and a caller of ANY model whose payer's balance is wholly
+        # held. The first version notified only when the probe settled and only waited callers of
+        # the same model, so a funded payer's calls to already-priced models, and its replays, were
+        # refused the moment a probe held the balance: a funded arm lost delegates as dead steps,
+        # and its replays were counted as the payer running out (§5.8). Bound to `_money`, and
+        # notified by every change that can free money or teach a price — each settle, each
+        # returned hold, a credit, a cap, a refresh, a close — so no waiter misses its wakeup.
+        self._freed = threading.Condition(self._money)
+        # Is a price probe in flight? Only the call that SET it clears it (`_release`): a caller
+        # whose wait expired proceeds as a second probe without owning the flag, and must not clear
+        # it while the first is still running. The flag decides who waits, not what is held — an
+        # unpriced call reserves the whole free balance whether or not it owns the flag.
         self._probing = False
         self._replay()
 
-    def _release(self, probing: bool) -> None:
+    def _release(self, owns_probe: bool) -> None:
         """End this call's turn as the price probe. Called with `_money` held, on every exit."""
-        if probing:
+        if owns_probe:
             self._probing = False
-            self._priced.notify_all()
+
+    def _learn(self, model_id: str, dollars: float, *, replay: bool) -> None:
+        """Raise `_ceiling` for one settled debit, live rows over replay rows (see `__init__`).
+
+        The one rule for the journal read back at construction and for this process's own settles,
+        so a live process and a restarted one hold the same ceilings. Called with `_money` held (or
+        from `__init__`), and only for a finite, non-negative debit — anything else is not a price.
+        """
+        if replay:
+            if model_id not in self._live:
+                self._ceiling[model_id] = max(self._ceiling.get(model_id, 0.0), dollars)
+        elif model_id in self._live:
+            self._ceiling[model_id] = max(self._ceiling[model_id], dollars)
+        else:
+            self._live.add(model_id)
+            self._ceiling[model_id] = dollars
+
+    def _unhold(self, hotkey: str, held: float, *, short: bool, owns_probe: bool,
+                dollars: float = 0.0) -> None:
+        """Return one call's hold, less what it cost, and wake everyone waiting. `_money` held.
+
+        EVERY exit of an in-flight call comes through here exactly once — settle, and each failure
+        path — because a hold that is returned without a notify is a lost wakeup: a waiter parked on
+        a balance this just refilled would sleep out the whole bound and be refused as congestion.
+        """
+        self._balances[hotkey] = self.balance(hotkey) + held - dollars
+        self._held[hotkey] = self._held.get(hotkey, 0.0) - held
+        if held > 0.0:
+            self._holding[hotkey] = self._holding.get(hotkey, 0) - 1
+            if self._holding[hotkey] <= 0:
+                # Nothing held: snap the float sum back to exactly zero, so its rounding residue
+                # never accumulates into money that looks reserved.
+                self._holding[hotkey] = 0
+                self._held[hotkey] = 0.0
+        if short:
+            self._short[hotkey] = self._short.get(hotkey, 0) - 1
+        self._release(owns_probe)
+        self._freed.notify_all()
+
+    def _wait_for_freed(self, deadline: float) -> bool:
+        """Park on `_freed` until notified or `deadline` (monotonic). False once it has passed.
+
+        Called with `_money` held, inside a predicate loop — `Condition.wait` releases the lock while
+        parked, so a waiter holds nothing the calls it waits on need.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        self._freed.wait(remaining)
+        return True
 
     def refresh(self) -> None:
         """Apply movements another process appended since this one last looked.
@@ -274,6 +374,7 @@ class OwnerGateway:
         """
         with self._money:
             self._replay()
+            self._freed.notify_all()        # a credit someone else wrote can release a waiter
 
     def _replay(self) -> None:
         """Apply journal rows from `_consumed` onward. Call with `_money` held."""
@@ -315,6 +416,15 @@ class OwnerGateway:
                 self._caps[hotkey] = int(row.get("window", 0))
             else:
                 self._balances[hotkey] = self._balances.get(hotkey, 0.0) + usd
+                model = row.get("model")
+                if row.get("op") == "debit" and isinstance(model, str):
+                    # Seed the ceiling this debit settled (see `__init__`). A debit is stored as
+                    # negative dollars; one that is not finite and non-negative once negated is not
+                    # a price, and credits, caps and debits written before rows named their model
+                    # carry nothing to learn. Balances read exactly as before either way.
+                    cost = -usd
+                    if math.isfinite(cost) and cost >= 0.0:
+                        self._learn(model, cost, replay=bool(row.get("replay")))
             consumed += len(chunk) + 1
         self._consumed = min(consumed, self._journal.stat().st_size)
 
@@ -364,6 +474,7 @@ class OwnerGateway:
         with self._money:
             self._balances[hotkey] = self._balances.get(hotkey, 0.0) + amount
             self._record(hotkey, amount, op="credit", ref=str(ref))
+            self._freed.notify_all()        # a top-up releases callers waiting on held money
             return self._balances[hotkey]
 
     def bind(self, hotkey: str, provider: Provider, cap_usd: float, *, window: int) -> float:
@@ -383,6 +494,7 @@ class OwnerGateway:
             raise GatewayError(f"cannot bind {hotkey} to a cap of {cap}: an allowance is dollars")
         with self._money:
             self._replay()
+            self._freed.notify_all()
             self._providers[hotkey] = provider
             if self._caps.get(hotkey) == int(window):
                 return self.balance(hotkey)
@@ -437,7 +549,12 @@ class OwnerGateway:
     def close(self, token: str) -> DuelLedger:
         """End the arm and return its bill. Every later call on this token is refused."""
         ledger = self._ledger(token)
-        ledger.closed = True
+        # Under the lock and notified: a call parked on this arm's held money must wake and see the
+        # arm is closed, rather than rely on `Validator._arm` happening to close only after every
+        # episode has joined.
+        with self._money:
+            ledger.closed = True
+            self._freed.notify_all()
         return ledger
 
     def ledger(self, duel_id: str) -> DuelLedger:
@@ -460,13 +577,20 @@ class OwnerGateway:
         documents for §4, and for the same reason: a cost is not knowable until it is spent. The
         hard stop underneath both is the owner's own provider credit.
 
+        THREE REFUSALS, AND ONLY ONE OF THEM SAYS THE PAYER RAN OUT. A balance at zero with nothing
+        held is an exhausted allowance: refused at once and counted in `unfunded_calls` (§5.8). A
+        balance held by this gateway's own calls in flight is not the miner's doing, so the call
+        WAITS (bounded by `hold_wait_seconds`) for a hold to come back; only if the bound expires
+        is it refused, as "congestion", and never counted — that reason reaches the reveal only as
+        the dead step's failure text, which is why the message says "congestion" verbatim. A closed
+        token is the third.
+
         A transport failure raises `WorkerError` out of the provider seam and is left to travel: it
         is data about that rung (§8b.3), the call was never priced, and a ledger row for it would be
         a receipt for work nobody was charged for.
         """
         ledger = self._ledger(token)
-        if ledger.closed:
-            raise GatewayError(f"duel {ledger.duel_id!r} is closed; its token buys nothing")
+        hotkey = ledger.hotkey
         # RESERVE, DO NOT MERELY CHECK. The allowance used to be read here and debited after the
         # provider returned, with a network round trip in between — a check-then-act straddling the
         # slowest thing in the system. `Validator._arm` drives `EPISODE_CONCURRENCY` episodes
@@ -477,86 +601,116 @@ class OwnerGateway:
         # standing in for this layer's rule about somebody's money.
         #
         # So the money moves BEFORE the call, under the lock, and settles to the true cost after.
-        # The reservation is the largest call settled so far, capped by what is actually there —
-        # capped, because taking only what exists reproduces the serial bound exactly: the balance
-        # reaches zero, every other in-flight call is refused, and the arm overruns by at most the
-        # one call that was already committed.
+        # The reservation is the model's ceiling, capped by what is actually free. A call that
+        # finds nothing free while holds are outstanding WAITS for one to come back rather than
+        # being refused, and is refused as unfunded only when nothing is held at all.
+        #
+        # AT MOST ONE UNDER-RESERVED CALL PER PAYER, and waiting is what makes that rule necessary.
+        # A hold smaller than the call's cost — a probe, or a call that found less free than its
+        # model's ceiling — is the only way an arm overruns. Refusals used to limit how often that
+        # happened; waiters would instead grab every sliver of slack a settle returns, each as a
+        # partial hold, and sixteen of them in flight overrun by up to sixteen calls. So a call
+        # that would be under-reserved also waits while another under-reserved call is in flight
+        # for this payer. Then every in-flight call but one is covered by its hold, and the one
+        # that is not started from a positive free balance — which is the serial bound exactly.
+        # Fully reserved calls are not held back by it, so this serialises only the tail of an
+        # allowance and the first call to an unpriced model. (A price above the model's historical
+        # maximum still overruns its hold; that exception predates this and is what `_learn` narrows
+        # on every settle.)
+        deadline = time.monotonic() + self._hold_wait
         with self._money:
-            while model_id not in self._ceiling and self._probing:
-                if not self._priced.wait(timeout=PRICE_PROBE_WAIT_SECONDS):
-                    break
-            balance = self.balance(ledger.hotkey)
-            if balance <= 0.0:
-                outstanding = self._held.get(ledger.hotkey, 0.0)
-                if outstanding > 0.0:
-                    # NOT UNFUNDED — FULLY RESERVED. The miner's money is held by calls in flight
-                    # and will mostly come back when they settle, so counting this in
-                    # `unfunded_calls` would report a funded miner as broke in the one field §5.8
-                    # relies on to tell those apart. It is congestion, and it says so.
+            while True:
+                if ledger.closed:
+                    raise GatewayError(f"duel {ledger.duel_id!r} is closed; its token buys nothing")
+                balance = self.balance(hotkey)
+                known = self._ceiling.get(model_id)
+                if balance <= 0.0 and self._holding.get(hotkey, 0) <= 0:
+                    # Checked FIRST, before any wait: an exhausted payer is refused and counted at
+                    # once, not after sitting out a probe some other payer is running. The fourth
+                    # read-modify-write on this contended object — latent under CPython's GIL and a
+                    # lost update the moment this runs free-threaded, on the counter that is the
+                    # only evidence distinguishing an unfunded arm from a dead pool.
+                    ledger.unfunded_calls += 1
                     raise GatewayError(
-                        f"{ledger.hotkey} has ${outstanding:.4f} reserved by calls still in "
-                        f"flight and nothing free right now; this is congestion, not an exhausted "
-                        f"allowance — retry once they settle")
-                # The fourth read-modify-write on this contended object, and the one the lock's own
-                # comment above enumerates three of. Latent under CPython's GIL and a lost update
-                # the moment this runs free-threaded — on the counter that is the only evidence
-                # distinguishing an unfunded arm from a dead pool.
-                ledger.unfunded_calls += 1
-                raise GatewayError(
-                    f"{ledger.hotkey} has no allowance left: {ledger.duel_id} has metered "
-                    f"${ledger.spend_usd:.4f} (§4)")
-            known = self._ceiling.get(model_id)
+                        f"{hotkey} has no allowance left: {ledger.duel_id} has metered "
+                        f"${ledger.spend_usd:.4f} (§4)")
+                short = known is None or balance < known
+                if balance <= 0.0:
+                    waiting_on = "held"         # nothing free; calls in flight will return some
+                elif short and self._short.get(hotkey, 0) > 0:
+                    waiting_on = "held"         # a second under-reserved call would break §4's bound
+                elif known is None and self._probing:
+                    waiting_on = "probe"        # another payer's probe may teach this price
+                else:
+                    break
+                if not self._wait_for_freed(deadline):
+                    if waiting_on == "probe":
+                        # Another payer's probe is slow. Waiting was only ever to learn a price;
+                        # this payer's money is safe without it (an unpriced call holds its whole
+                        # free balance), so proceed as a probe of its own rather than refuse.
+                        break
+                    raise self._congested(ledger)
             held = balance if known is None else min(known, balance)
-            probing = known is None
-            self._probing = self._probing or probing
-            self._balances[ledger.hotkey] = balance - held
-            self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) + held
+            owns_probe = known is None and not self._probing
+            if owns_probe:
+                self._probing = True
+            self._balances[hotkey] = balance - held
+            self._held[hotkey] = self._held.get(hotkey, 0.0) + held
+            if held > 0.0:
+                self._holding[hotkey] = self._holding.get(hotkey, 0) + 1
+            if short:
+                self._short[hotkey] = self._short.get(hotkey, 0) + 1
 
-        # D18: a bound hotkey's calls go to ITS provider; the request body is still the owner's
-        # pinned one (`chat_body` over `WORKER_PARAMS` and `PROVIDER_ROUTING`), which is what keeps
-        # the two arms' bytes identical even when the keys are not.
-        provider = self._providers.get(ledger.hotkey, self.provider)
+        # FROM HERE UNTIL THE SETTLE, EVERY EXIT RETURNS THE HOLD THROUGH `_unhold`, which notifies.
+        # The provider lookup is inside the try so nothing runs between the reservation and its
+        # recovery; `_money` is never held across `chat`, so a slow provider parks no one but the
+        # callers genuinely waiting on its money.
         try:
+            # D18: a bound hotkey's calls go to ITS provider; the request body is still the owner's
+            # pinned one (`chat_body` over `WORKER_PARAMS` and `PROVIDER_ROUTING`), which is what
+            # keeps the two arms' bytes identical even when the keys are not.
+            provider = self._providers.get(hotkey, self.provider)
             completion = provider.chat(model_id, task_text, WORKER_PARAMS)
-            # PARSED INSIDE THE TRY, and that is not tidiness. `cost_usd` crosses a seam this module
-            # does not control, so `float()` on it can raise — and outside this block it raised past
-            # every recovery path at once: the hold was never returned, `_held` kept it forever, and
-            # `_probing` stayed set so every later caller waited out the full probe timeout and was
-            # then refused. Measured: one unparseable cost took a $10.00 allowance to $0.00 and
-            # stranded the probe.
-            dollars = float(completion.cost_usd)
-        except (TypeError, ValueError) as exc:
-            with self._money:
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + held
-                self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) - held
-                self._release(probing)
-            raise GatewayError(
-                f"{model_id} reported a cost this gateway cannot read ({completion.cost_usd!r}); "
-                f"the call is refused and {ledger.hotkey} is not charged for it") from exc
         except WorkerError as exc:
             # Never priced either way, so the hold comes back. Then the one distinction D18 adds:
             # a 401/402 is the PAYER refused, and it is counted and raised as the meter's refusal
             # (`GatewayError`, not an outcome) — an empty account must not be memoised by the
             # window's table as `model_id` failing for every later arm (§5.2c).
             with self._money:
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + held
-                self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) - held
-                self._release(probing)
+                self._unhold(hotkey, held, short=short, owns_probe=owns_probe)
                 if exc.status in KEY_REFUSALS:
                     ledger.unfunded_calls += 1
             if exc.status in KEY_REFUSALS:
                 raise GatewayError(
-                    f"{ledger.hotkey}'s key was refused by the provider (HTTP {exc.status}) on "
+                    f"{hotkey}'s key was refused by the provider (HTTP {exc.status}) on "
                     f"{ledger.duel_id}: the account is unfunded or the key is dead, and the rung "
                     f"is not an outcome of {model_id}") from exc
             raise
         except BaseException:
             # A transport failure was never priced (§8b.3), so the hold must come back or a flaky
-            # pool would drain an allowance nobody was charged for.
+            # pool would drain an allowance nobody was charged for. A provider that RAISES
+            # TypeError/ValueError lands here too: that is a failed call, not an unreadable cost.
             with self._money:
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + held
-                self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) - held
-                self._release(probing)
+                self._unhold(hotkey, held, short=short, owns_probe=owns_probe)
+            raise
+        try:
+            # PARSED UNDER ITS OWN RECOVERY, and that is not tidiness. `cost_usd` crosses a seam
+            # this module does not control, so `float()` on it can raise — and outside a recovery
+            # block it raised past every path at once: the hold was never returned, `_held` kept it
+            # forever, and `_probing` stayed set so every later caller waited out the full probe
+            # timeout and was then refused. Measured: one unparseable cost took a $10.00 allowance
+            # to $0.00 and stranded the probe. Separate from the `chat` try because the message
+            # below reads `completion`, which a raising `chat` never bound.
+            dollars = float(completion.cost_usd)
+        except (TypeError, ValueError) as exc:
+            with self._money:
+                self._unhold(hotkey, held, short=short, owns_probe=owns_probe)
+            raise GatewayError(
+                f"{model_id} reported a cost this gateway cannot read ({completion.cost_usd!r}); "
+                f"the call is refused and {hotkey} is not charged for it") from exc
+        except BaseException:
+            with self._money:
+                self._unhold(hotkey, held, short=short, owns_probe=owns_probe)
             raise
         if not dollars >= 0.0:
             # `balance -= dollars` with a minus sign REFILLS the allowance, and a NaN disables the
@@ -569,22 +723,16 @@ class OwnerGateway:
             # Refused, and the hold comes back with it: like a transport failure this call was
             # never priced, so keeping the reservation would charge a miner for a refusal.
             with self._money:
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + held
-                self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) - held
-                self._release(probing)
+                self._unhold(hotkey, held, short=short, owns_probe=owns_probe)
             raise GatewayError(f"{model_id} reported a cost of {dollars}, which is not dollars")
 
         with self._money:
             # Settle: give back what was held and take what it cost. The journal records the true
             # cost, never the hold — a reservation is this process's bookkeeping, while the journal
             # is what a restart replays and what the owner reconciles against receipts.
-            self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + held - dollars
-            self._held[ledger.hotkey] = self._held.get(ledger.hotkey, 0.0) - held
-            self._ceiling[model_id] = max(self._ceiling.get(model_id, 0.0), dollars)
-            self._release(probing)
+            self._unhold(hotkey, held, short=short, owns_probe=owns_probe, dollars=dollars)
             try:
-                self._record(ledger.hotkey, -dollars, op="debit", duel=ledger.duel_id,
-                             model=model_id)
+                self._record(hotkey, -dollars, op="debit", duel=ledger.duel_id, model=model_id)
             except OSError as exc:
                 # THE DEBIT AND ITS RECEIPT MUST NOT COME APART. This write is the only disk I/O on
                 # the money path, and it sits between the balance moving and the receipt being
@@ -593,12 +741,15 @@ class OwnerGateway:
                 # records a dead rung, which is honest data about that rung (§8b.3), and the owner
                 # gets an error naming the actual fault rather than a mysterious shortfall.
                 # Undo the DEBIT only. The settle above already returned the hold, and returning
-                # it twice would credit a miner for money that was never taken.
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + dollars
+                # it twice would credit a miner for money that was never taken. No price is
+                # learned: a restart would not see this row, and live and restarted ceilings agree.
+                self._balances[hotkey] = self.balance(hotkey) + dollars
+                self._freed.notify_all()
                 raise GatewayError(
                     f"could not record the debit for {ledger.duel_id} in the allowance journal "
-                    f"({exc}); the call is refused and {ledger.hotkey} is not charged for it") \
-                    from exc
+                    f"({exc}); the call is refused and {hotkey} is not charged for it") from exc
+            # Learned only once the row is durable — the same row a restart seeds from.
+            self._learn(model_id, dollars, replay=False)
             self._calls += 1
             index = self._issued.get(ledger.duel_id, 0)
             self._issued[ledger.duel_id] = index + 1
@@ -612,7 +763,7 @@ class OwnerGateway:
         # (`completion.provider` — which endpoint actually served — has no field here either, and
         # belongs in the published trace where D15 puts the rest of the step record.)
         receipt = Receipt(
-            call_id=call_id, hotkey=ledger.hotkey,
+            call_id=call_id, hotkey=hotkey,
             model=model_id, prompt_hash=request_hash(model_id, task_text),
             response_hash=signing.sha256_hex(completion.text),
             tokens_in=completion.tokens_in, tokens_out=completion.tokens_out,
@@ -633,8 +784,11 @@ class OwnerGateway:
         allowance, D5, exhaustion, `remaining -= spend` and `final_b` do not know the table exists,
         and the miner guide's "you pay for the calls your Conductor makes" stays true. Only the
         owner's provider bill is untouched. The refusals are `call`'s: a closed token, an allowance
-        at zero (counted in `unfunded_calls`, §5.8), a cost that is not dollars, a journal that
-        cannot take the row. No reservation, because the price is known before the money moves.
+        at zero with nothing held (counted in `unfunded_calls`, §5.8), a cost that is not dollars, a
+        journal that cannot take the row — and congestion, when the balance stayed held by this
+        gateway's own calls for the whole wait, which is NOT counted: a replay refused because a
+        probe held the payer's money is not the payer running out. No reservation, because the price
+        is known before the money moves.
 
         The receipt is a real receipt for a real debit — scoped to the duel, signed by the gateway,
         summed by `audit` like every other — and its id is listed in `DuelLedger.replayed`, which
@@ -643,35 +797,50 @@ class OwnerGateway:
         sent; `response_hash` is the stored reply's.
         """
         ledger = self._ledger(token)
-        if ledger.closed:
-            raise GatewayError(f"duel {ledger.duel_id!r} is closed; its token buys nothing")
+        hotkey = ledger.hotkey
         dollars = float(cost_usd)
         if not dollars >= 0.0:
             raise GatewayError(f"a replayed row priced {dollars}, which is not dollars")
+        deadline = time.monotonic() + self._hold_wait
         with self._money:
-            balance = self.balance(ledger.hotkey)
-            if balance <= 0.0:
-                ledger.unfunded_calls += 1
-                raise GatewayError(
-                    f"{ledger.hotkey} has no allowance left: {ledger.duel_id} has metered "
-                    f"${ledger.spend_usd:.4f} (§4)")
-            self._balances[ledger.hotkey] = balance - dollars
+            while True:
+                if ledger.closed:
+                    raise GatewayError(f"duel {ledger.duel_id!r} is closed; its token buys nothing")
+                balance = self.balance(hotkey)
+                if balance <= 0.0 and self._holding.get(hotkey, 0) <= 0:
+                    ledger.unfunded_calls += 1
+                    raise GatewayError(
+                        f"{hotkey} has no allowance left: {ledger.duel_id} has metered "
+                        f"${ledger.spend_usd:.4f} (§4)")
+                # The same two waits as `call`. Nothing free while holds are out; or a debit that
+                # overruns what is free while an under-reserved call is still in flight — a replay
+                # debits at once, so it is itself the one under-covered movement §4's bound allows,
+                # and must not stack on another.
+                if balance > 0.0 and not (dollars > balance and self._short.get(hotkey, 0) > 0):
+                    break
+                if not self._wait_for_freed(deadline):
+                    raise self._congested(ledger)
+            self._balances[hotkey] = balance - dollars
             try:
-                self._record(ledger.hotkey, -dollars, op="debit", duel=ledger.duel_id,
+                self._record(hotkey, -dollars, op="debit", duel=ledger.duel_id,
                              model=model_id, replay=True)
             except OSError as exc:
-                self._balances[ledger.hotkey] = self.balance(ledger.hotkey) + dollars
+                self._balances[hotkey] = self.balance(hotkey) + dollars
+                self._freed.notify_all()
                 raise GatewayError(
                     f"could not record the replayed debit for {ledger.duel_id} in the allowance "
-                    f"journal ({exc}); the delegate is refused and {ledger.hotkey} is not charged "
+                    f"journal ({exc}); the delegate is refused and {hotkey} is not charged "
                     f"for it") from exc
+            # The same rule a restart applies to this row, so the two agree (a replay row only
+            # prices a model no live row has).
+            self._learn(model_id, dollars, replay=True)
             self._calls += 1
             index = self._issued.get(ledger.duel_id, 0)
             self._issued[ledger.duel_id] = index + 1
             call_id = f"{ledger.duel_id}/{index}"
             stamp = self._calls
         receipt = Receipt(
-            call_id=call_id, hotkey=ledger.hotkey, model=model_id,
+            call_id=call_id, hotkey=hotkey, model=model_id,
             prompt_hash=request_hash(model_id, task_text), response_hash=response_hash,
             tokens_in=int(tokens_in), tokens_out=int(tokens_out), cost_usd=dollars,
             ts=stamp).signed_by(self._gw)
@@ -679,6 +848,17 @@ class OwnerGateway:
             ledger.receipts.append(receipt)
             ledger.replayed.append(call_id)
         return receipt
+
+    def _congested(self, ledger: DuelLedger) -> GatewayError:
+        """The refusal for a payer whose money stayed held by this gateway's own calls for the whole
+        wait. Called with `_money` held. NOT counted in `unfunded_calls`: the miner did not run out,
+        and §5.8 publishes that counter as exactly that. The word "congestion" is the greppable mark
+        this leaves in a dead step's failure reason, the only place it reaches the reveal."""
+        return GatewayError(
+            f"congestion: {ledger.hotkey} has ${self._held.get(ledger.hotkey, 0.0):.4f} reserved "
+            f"by this gateway's own calls in flight on {ledger.duel_id} and nothing it could take "
+            f"came back within {self._hold_wait:.1f}s; this is not an exhausted allowance and is "
+            f"not counted as one")
 
     def _ledger(self, token: str) -> DuelLedger:
         if token not in self._tokens:

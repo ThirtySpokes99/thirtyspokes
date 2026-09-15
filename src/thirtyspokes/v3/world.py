@@ -147,10 +147,11 @@ def pins(*, exchange_path: Path | str, catalog: Catalog, benchmarks: Sequence[Be
     # ONE priced benchmark is not a launchable corpus either, and it used to pass this gate.
     # `duel` refuses a slice it cannot judge breadth on — leave-one-out over a single benchmark
     # scores the challenger on an empty slice — so with one benchmark admitted, `preflight` reports
-    # green and then EVERY duel raises, caught per challenger by `Validator._admit`'s broad handler
-    # and published as a refusal of the miner. The corpus would read as a field of broken
-    # challengers. Measured 2026-09-05: the full M3a run prices livecodebench and flags hle, which
-    # is exactly one, so this is the live case and not a hypothetical.
+    # green and then EVERY duel raises. Whatever catches that raise, an exception of no artifact
+    # type is the owner's (`validator.ARTIFACT_FAILURES`), so at best the field of challengers
+    # stalls on the corpus's fault and at worst is charged for it. Measured 2026-09-05: the full
+    # M3a run prices livecodebench and flags hle, which is exactly one, so this is the live case
+    # and not a hypothetical.
     if len(priced) < 2:
         drawn = {task.benchmark for task in tasks}
         flagged = [f"    {b}: {'; '.join(table[b].flags)}" for b in sorted(table) if table[b].flags]

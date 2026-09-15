@@ -554,7 +554,8 @@ def test_a_committed_file_missing_from_the_bucket_is_refused_before_the_host_is_
     item = shard(world["manifest"])
     del world["private"].objects[REGISTRATION.prefix + item.path]
 
-    with pytest.raises(StoreError, match="does not hold"):
+    # Either listing check may be the one that fires first; both refuse before any byte moves.
+    with pytest.raises(StoreError, match="does not hold|lacks files the manifest names"):
         fetch(world, host)
     body, metadata = world["private"].objects[REGISTRATION.prefix + world["manifest"].files[0].path]
     assert runner.calls == 0

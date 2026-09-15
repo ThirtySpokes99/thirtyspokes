@@ -728,8 +728,9 @@ def test_a_cheap_call_does_not_teach_the_gateway_that_expensive_calls_are_cheap(
     $0.50 allowance, the same figure the fix was written to remove.
 
     Per model, a price this gateway has never settled reserves the whole balance, so the first call
-    to a new model runs alone and the fifteen behind it are refused rather than funded on a cheaper
-    model's price.
+    to a new model runs alone and the fifteen behind it wait for its price rather than being funded
+    on a cheaper model's price — and once it settles, at most one of them may take the sliver left
+    under that price, so the tail still overruns by at most one call.
     """
     gateway = OwnerGateway(SlowProvider(answers={"cheap": "ok", "strong": "ok"},
                                         prices={"cheap": 0.001, "strong": 0.40}))
@@ -984,3 +985,522 @@ def test_a_credit_is_on_the_disk_and_not_just_in_the_kernel(tmp_path):
         OwnerGateway(FakeProvider(), journal=journal).fund("hk", 5.0)
 
     assert synced, "the credit was written but never synced"
+
+
+# --- the gateway's own reservations never refuse a funded payer ------------------------------------
+#
+# The first call to a model with no settled price reserves its payer's WHOLE balance, because nothing
+# smaller is known to bound it. While that hold was out, every other call on the payer — to a model
+# already priced, or a replay — found nothing free and was refused on the spot: a funded arm lost
+# delegates as dead steps, and its replays were counted as the payer running out (§5.8). Only callers
+# of the SAME model waited. And the prices lived in process memory, so every restart re-armed it.
+
+
+@dataclass
+class GatedProvider(FakeProvider):
+    """The `cold` model blocks until `release` is set, so a price probe is observably in flight."""
+
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def chat(self, model_id, task_text, params):
+        if model_id == "cold":
+            assert self.release.wait(10.0), "the test never released the probe"
+        return super().chat(model_id, task_text, params)
+
+
+def _count_parked(gateway: OwnerGateway) -> list[int]:
+    """Instrument `_freed.wait` so a test can release a gate only once waiters are really parked —
+    a thread that reaches the lock after the probe settled would succeed on the old code too, so
+    without this the test could pass without ever exercising the wait."""
+    parked = [0]
+    real = gateway._freed.wait
+
+    def wait(timeout=None):
+        parked[0] += 1
+        try:
+            return real(timeout)
+        finally:
+            parked[0] -= 1
+
+    gateway._freed.wait = wait
+    return parked
+
+
+def _until(predicate, seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, "the condition the test waits for never arrived"
+        time.sleep(0.005)
+
+
+def _run(target, n: int) -> list[threading.Thread]:
+    threads = [threading.Thread(target=target, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    return threads
+
+
+def test_a_first_call_to_an_unpriced_model_makes_its_fifteen_peers_wait_rather_than_refusing_them():
+    provider = GatedProvider(answers={"warm": "ok", "cold": "ok"},
+                             prices={"warm": 0.01, "cold": 0.02})
+    gateway = OwnerGateway(provider)
+    gateway.fund("hk", 5.0)
+    token = gateway.open_duel("hk", "w1-arm")
+    gateway.call(token, "warm", "learn a price")
+    parked = _count_parked(gateway)
+    receipts, errors = [], []
+
+    def call(i):
+        try:
+            receipts.append(gateway.call(token, "cold" if i == 0 else "warm", f"task {i}")[1])
+        except BaseException as exc:                       # noqa: BLE001 — recorded, asserted
+            errors.append(exc)
+
+    started = time.monotonic()
+    probe = _run(call, 1)
+    _until(lambda: gateway._probing and gateway.balance("hk") == 0.0)
+    peers = [threading.Thread(target=call, args=(i,)) for i in range(1, 16)]
+    for peer in peers:
+        peer.start()
+    _until(lambda: parked[0] == 15)                        # all fifteen are blocked by the probe
+    provider.release.set()
+    for thread in probe + peers:
+        thread.join()
+
+    ledger = gateway.ledger("w1-arm")
+    assert errors == [], f"a funded payer was refused because of its own probe: {errors[:1]}"
+    assert len(receipts) == 16 and ledger.unfunded_calls == 0
+    assert gateway._held["hk"] == 0.0 and gateway._probing is False
+    assert gateway.balance("hk") == pytest.approx(5.0 - ledger.spend_usd)
+    assert time.monotonic() - started < PRICE_PROBE_WAIT_SECONDS / 2
+
+
+def test_replays_during_a_price_probe_are_charged_and_never_counted_unfunded():
+    provider = GatedProvider(answers={"cold": "ok"}, prices={"cold": 0.02})
+    gateway = OwnerGateway(provider)
+    gateway.fund("hk", 5.0)
+    token = gateway.open_duel("hk", "w1-arm")
+    parked = _count_parked(gateway)
+    errors = []
+
+    def call(i):
+        try:
+            if i == 0:
+                gateway.call(token, "cold", "the probe")
+            else:
+                gateway.replay(token, "warm", f"task {i}", 0.02)
+        except BaseException as exc:                       # noqa: BLE001
+            errors.append(exc)
+
+    probe = _run(call, 1)
+    _until(lambda: gateway._probing and gateway.balance("hk") == 0.0)
+    replays = [threading.Thread(target=call, args=(i,)) for i in range(1, 9)]
+    for thread in replays:
+        thread.start()
+    _until(lambda: parked[0] == 8)
+    provider.release.set()
+    for thread in probe + replays:
+        thread.join()
+
+    ledger = gateway.ledger("w1-arm")
+    assert errors == [] and ledger.unfunded_calls == 0
+    assert len(ledger.replayed) == 8
+    assert gateway.balance("hk") == pytest.approx(5.0 - ledger.spend_usd)
+
+
+def test_a_probe_that_spends_the_whole_allowance_leaves_its_waiters_genuinely_unfunded():
+    """The wait must not launder a real exhaustion into congestion: once the probe settles and
+    nothing is held, the payer IS out, and every waiter says so in the counter §5.8 publishes."""
+    provider = GatedProvider(answers={"cold": "ok", "warm": "ok"},
+                             prices={"cold": 0.40, "warm": 0.01})
+    gateway = OwnerGateway(provider)
+    gateway.fund("hk", 0.30)
+    token = gateway.open_duel("hk", "w1-arm")
+    gateway._ceiling["warm"] = 0.01                        # priced, without spending the allowance
+    gateway._live.add("warm")
+    parked = _count_parked(gateway)
+    refused = []
+
+    def call(i):
+        try:
+            gateway.call(token, "cold" if i == 0 else "warm", f"task {i}")
+        except GatewayError as exc:
+            refused.append(str(exc))
+
+    probe = _run(call, 1)
+    _until(lambda: gateway._probing and gateway.balance("hk") == 0.0)
+    waiters = [threading.Thread(target=call, args=(i,)) for i in range(1, 16)]
+    for thread in waiters:
+        thread.start()
+    _until(lambda: parked[0] == 15)
+    provider.release.set()
+    for thread in probe + waiters:
+        thread.join()
+
+    ledger = gateway.ledger("w1-arm")
+    assert len(refused) == 15 and all("no allowance left" in reason for reason in refused)
+    assert ledger.unfunded_calls == 15
+    assert ledger.spend_usd <= 0.30 + 0.40 + 1e-9
+    assert gateway.balance("hk") == pytest.approx(-0.10) and gateway._held["hk"] == 0.0
+
+
+def test_sixteen_concurrent_callers_overrun_a_small_allowance_by_at_most_one_call():
+    gateway = OwnerGateway(SlowProvider(answers={"m": "ok"}, prices={"m": 0.40}))
+    gateway.fund("hk", 0.50)
+    token = gateway.open_duel("hk", "w1-arm")
+    reasons = []
+
+    def call(i):
+        try:
+            gateway.call(token, "m", f"task {i}")
+        except GatewayError as exc:
+            reasons.append(str(exc))
+
+    for thread in _run(call, 16):
+        thread.join()
+
+    ledger = gateway.ledger("w1-arm")
+    assert ledger.spend_usd <= 0.50 + 0.40 + 1e-9
+    assert ledger.unfunded_calls == len(reasons), "a refusal here was not the payer running out"
+    assert all("congestion" not in reason for reason in reasons)
+    assert gateway._held["hk"] == 0.0
+
+
+def test_waiters_grabbing_returned_slack_cannot_compound_the_overrun_past_one_call():
+    """Waiting replaces the refusals that used to limit an arm's tail. With prices that vary under a
+    ceiling set by the largest one settled, each settle returns a sliver of slack, and a queue of
+    waiters would take every sliver as a partial hold and spend a whole call on it — sixteen
+    under-covered calls in flight at once. Only one under-reserved call per payer may be in flight,
+    which is what keeps §4's bound true.
+
+    Deterministic rather than random: four calls hold the model's whole $0.25 ceiling each and
+    settle for $0.24, so each settle returns a $0.01 sliver to twelve parked callers, whose calls
+    then cost the full $0.25. Without the rule four slivers fund four $0.25 calls and the arm
+    overruns by $0.96; with it, one."""
+    provider, gateway, token = _slack_fixture()
+    parked = _count_parked(gateway)
+    tails = _run(lambda i: _swallow(lambda: gateway.call(token, "m", "tail")), 12)
+    _until(lambda: parked[0] == 12)
+
+    for gate in provider.setups:
+        gate.set()
+    _until(lambda: provider.settled == 4 and gateway._short.get("hk", 0) >= 1)
+    time.sleep(0.1)          # room for every waiter that COULD grab a sliver to do so; the
+    provider.tail.set()      # assertions below hold on the correct code regardless of it
+    for thread in tails:
+        thread.join()
+
+    _assert_one_call_of_overrun(gateway)
+
+
+def test_a_replay_cannot_overrun_what_is_free_while_an_under_reserved_call_is_in_flight():
+    """A replay debits at once with no hold, so a replay larger than what is free IS an
+    under-covered movement. Stacked on a partially reserved call still in flight, it is a second
+    call of overrun."""
+    provider, gateway, token = _slack_fixture()
+    parked = _count_parked(gateway)
+
+    short = _run(lambda i: _swallow(lambda: gateway.call(token, "m", "tail")), 1)
+    _until(lambda: parked[0] == 1)
+    provider.setups[0].set()                       # a $0.01 sliver: the call takes it, short
+    _until(lambda: gateway._short.get("hk", 0) == 1)
+    replays = _run(lambda i: _swallow(lambda: gateway.replay(token, "m", "a replay", 0.25)), 6)
+    time.sleep(0.1)          # room for a replay to (wrongly) debit against the sliver
+    for gate in provider.setups[1:]:
+        gate.set()
+    _until(lambda: provider.settled == 4)
+    time.sleep(0.1)
+    provider.tail.set()
+    for thread in short + replays:
+        thread.join()
+
+    _assert_one_call_of_overrun(gateway)
+
+
+@dataclass
+class SlackProvider(FakeProvider):
+    """`setup-<i>` calls block on their own gate and cost $0.24; `tail` calls block on one gate and
+    cost $0.25 — so each setup settle returns a one-cent sliver under a $0.25 ceiling."""
+
+    setups: list[threading.Event] = field(default_factory=lambda: [threading.Event()
+                                                                   for _ in range(4)])
+    tail: threading.Event = field(default_factory=threading.Event)
+    settled: int = 0
+
+    def chat(self, model_id, task_text, params):
+        if task_text.startswith("setup-"):
+            assert self.setups[int(task_text.split("-")[1])].wait(10.0)
+            self.settled += 1
+            cost = 0.24
+        else:
+            assert self.tail.wait(10.0)
+            cost = 0.25
+        return Completion(text="ok", cost_usd=cost, tokens_in=1, tokens_out=1,
+                          finish_reason="stop", served_model=model_id, provider="Fake")
+
+
+def _slack_fixture():
+    provider = SlackProvider(answers={"m": "ok"})
+    gateway = OwnerGateway(provider)
+    gateway.fund("hk", 1.0)
+    gateway._ceiling["m"] = 0.25                           # a warm model whose max price is known
+    gateway._live.add("m")
+    token = gateway.open_duel("hk", "w1-arm")
+    setups = _run(lambda i: gateway.call(token, "m", f"setup-{i}"), 4)
+    _until(lambda: gateway._holding.get("hk", 0) == 4 and gateway.balance("hk") == 0.0)
+    provider.setup_threads = setups
+    return provider, gateway, token
+
+
+def _swallow(attempt):
+    try:
+        attempt()
+    except GatewayError:
+        pass
+
+
+def _assert_one_call_of_overrun(gateway):
+    for thread in gateway_threads(gateway):
+        thread.join()
+    ledger = gateway.ledger("w1-arm")
+    assert ledger.spend_usd <= 1.0 + 0.25 + 1e-9, (
+        f"overran by more than one call: ${ledger.spend_usd:.2f} on a $1.00 allowance")
+    assert gateway._held["hk"] == 0.0 and gateway._short["hk"] == 0
+    assert gateway.balance("hk") == pytest.approx(1.0 - ledger.spend_usd)
+
+
+def gateway_threads(gateway):
+    return getattr(gateway.provider, "setup_threads", ())
+
+
+def test_a_restarted_gateway_already_knows_the_prices_its_journal_settled(tmp_path):
+    journal = tmp_path / "allowances.jsonl"
+    provider = FakeProvider(answers={"m": "ok", "shared": "ok"},
+                            prices={"m": 0.25, "shared": 0.10})
+    first = OwnerGateway(provider, journal=journal)
+    first.fund("hk", 10.0, ref="credit")
+    first.bind("hk_own", FakeProvider(), 3.0, window=1)        # a cap row: no model, no price
+    token = first.open_duel("hk", "w1-arm")
+    first.call(token, "m", "a live fill")
+    first.call(token, "shared", "a live fill")
+    first.replay(token, "shared", "a replayed delegate", 0.60)  # a read-loop total: not a price
+    first.replay(token, "only-replayed", "a replayed delegate", 0.70)
+    assert first._ceiling == {"m": 0.25, "shared": 0.10, "only-replayed": 0.70}
+
+    restarted = OwnerGateway(provider, journal=journal)
+    assert restarted._ceiling == first._ceiling, "a live process and a restarted one disagree"
+
+    seen = []
+
+    class Watching(FakeProvider):
+        def chat(self, model_id, task_text, params):
+            seen.append((restarted.balance("hk"), restarted._probing))
+            return super().chat(model_id, task_text, params)
+
+    restarted.provider = Watching(answers={"m": "ok"}, prices={"m": 0.25})
+    before = restarted.balance("hk")
+    restarted.call(restarted.open_duel("hk", "w2-arm"), "m", "after the restart")
+    assert seen == [(pytest.approx(before - 0.25), False)], (
+        "the first call after a restart held the whole balance as a probe")
+
+
+def test_seeding_ignores_debits_that_are_not_dollars_and_rows_without_a_model(tmp_path):
+    journal = tmp_path / "allowances.jsonl"
+    rows = [{"hotkey": "hk", "op": "credit", "usd": 10.0, "ref": ""},
+            {"hotkey": "hk_nan", "op": "debit", "usd": float("nan"), "model": "nan-model"},
+            {"hotkey": "hk", "op": "debit", "usd": 0.5, "model": "refund-model"},
+            {"hotkey": "hk", "op": "debit", "usd": -0.2},
+            {"hotkey": "hk", "op": "debit", "usd": -0.3, "model": 42}]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    gateway = OwnerGateway(FakeProvider(), journal=journal)
+
+    assert gateway._ceiling == {}, "a row that is not a settled price seeded a ceiling"
+    assert gateway.balance("hk") == pytest.approx(10.0 + 0.5 - 0.2 - 0.3), (
+        "seeding changed how balances read")
+
+
+def test_an_exhausted_allowance_is_refused_and_counted_at_once_without_waiting():
+    gateway = OwnerGateway(FakeProvider(prices={"m": 0.1}), hold_wait_seconds=5.0)
+    gateway.fund("hk_other", 5.0)
+    other = gateway.open_duel("hk_other", "w1-other")
+    token = gateway.open_duel("hk", "w1-arm")
+    gateway._probing = True                    # another payer's probe of an unpriced model
+
+    started = time.monotonic()
+    with pytest.raises(GatewayError, match="no allowance left"):
+        gateway.call(token, "m", "a task")
+    with pytest.raises(GatewayError, match="no allowance left"):
+        gateway.replay(token, "m", "a task", 0.1)
+
+    assert time.monotonic() - started < 0.5
+    assert gateway.ledger("w1-arm").unfunded_calls == 2
+    assert other and gateway.ledger("w1-other").unfunded_calls == 0
+
+
+def test_a_wait_on_the_gateways_own_holds_is_bounded_and_is_congestion_not_unfunded():
+    provider = GatedProvider(answers={"cold": "ok", "warm": "ok"},
+                             prices={"cold": 0.02, "warm": 0.01})
+    gateway = OwnerGateway(provider, hold_wait_seconds=0.2)
+    gateway.fund("hk", 5.0)
+    token = gateway.open_duel("hk", "w1-arm")
+    gateway.call(token, "warm", "learn a price")
+    probe = _run(lambda i: gateway.call(token, "cold", "the probe"), 1)
+    _until(lambda: gateway._probing and gateway.balance("hk") == 0.0)
+
+    for attempt in (lambda: gateway.call(token, "warm", "a task"),
+                    lambda: gateway.replay(token, "warm", "a task", 0.01)):
+        started = time.monotonic()
+        with pytest.raises(GatewayError, match="congestion"):
+            attempt()
+        assert 0.2 <= time.monotonic() - started < 2.0
+
+    assert gateway.ledger("w1-arm").unfunded_calls == 0
+    provider.release.set()
+    for thread in probe:
+        thread.join()
+    assert gateway._held["hk"] == 0.0 and gateway._probing is False
+
+
+def test_a_hold_wait_bound_that_is_not_a_positive_finite_number_is_refused():
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="hold_wait_seconds"):
+            OwnerGateway(FakeProvider(), hold_wait_seconds=bad)
+
+
+class Stop(BaseException):
+    """A failure no `except Exception` would catch, standing in for an interrupt mid-call."""
+
+
+def test_every_hold_comes_back_after_a_mix_of_successes_and_failures():
+    from thirtyspokes.v3.worker import WorkerError
+
+    outcomes = ("ok", "500", "402", "runtime", "stop", "unreadable", "negative")
+
+    class Mixed(FakeProvider):
+        def chat(self, model_id, task_text, params):
+            time.sleep(0.002)
+            kind = outcomes[int(task_text.split()[-1]) % len(outcomes)]
+            cost = {"unreadable": "n/a", "negative": -1.0}.get(kind, 0.05)
+            if kind in ("500", "402"):
+                raise WorkerError(f"HTTP {kind}", status=int(kind))
+            if kind == "runtime":
+                raise RuntimeError("the pool hung up")
+            if kind == "stop":
+                raise Stop()
+            return Completion(text="ok", cost_usd=cost, tokens_in=1, tokens_out=1,
+                              finish_reason="stop", served_model=model_id, provider="Fake")
+
+    gateway = OwnerGateway(Mixed())
+    gateway.fund("hk", 50.0)
+    token = gateway.open_duel("hk", "w1-arm")
+    key_refused = []
+
+    def call(i):
+        try:
+            gateway.call(token, "cold" if i == 0 else "m", f"task {i}")
+        except GatewayError as exc:
+            if "key was refused" in str(exc):
+                key_refused.append(i)
+        except BaseException:                              # noqa: BLE001 — the failure is the point
+            pass
+
+    started = time.monotonic()
+    for thread in _run(call, 32):
+        thread.join()
+
+    ledger = gateway.ledger("w1-arm")
+    assert gateway._held["hk"] == 0.0 and gateway._holding["hk"] == 0 and gateway._short["hk"] == 0
+    assert gateway._probing is False
+    assert gateway.balance("hk") == pytest.approx(50.0 - ledger.spend_usd)
+    assert ledger.unfunded_calls == len(key_refused) > 0
+    assert time.monotonic() - started < PRICE_PROBE_WAIT_SECONDS / 2, "a waiter timed out"
+
+
+def test_a_probe_whose_journal_write_fails_still_wakes_its_waiters(tmp_path):
+    provider = GatedProvider(answers={"cold": "ok", "warm": "ok"},
+                             prices={"cold": 0.02, "warm": 0.01})
+    gateway = OwnerGateway(provider, journal=tmp_path / "allowances.jsonl")
+    gateway.fund("hk", 5.0)
+    token = gateway.open_duel("hk", "w1-arm")
+    gateway.call(token, "warm", "learn a price")
+    parked = _count_parked(gateway)
+    real_record = OwnerGateway._record
+    failed = []
+
+    def record(self, hotkey, usd, **fields):
+        if fields.get("model") == "cold" and not failed:
+            failed.append(1)
+            raise OSError(28, "No space left on device")
+        return real_record(self, hotkey, usd, **fields)
+
+    outcomes = []
+
+    def call(i):
+        try:
+            gateway.call(token, "cold" if i == 0 else "warm", f"task {i}")
+            outcomes.append("ok")
+        except GatewayError as exc:
+            outcomes.append(str(exc))
+
+    before = gateway.balance("hk")
+    with mock.patch.object(OwnerGateway, "_record", record):
+        started = time.monotonic()
+        probe = _run(call, 1)
+        _until(lambda: gateway._probing and gateway.balance("hk") == 0.0)
+        waiters = [threading.Thread(target=call, args=(i,)) for i in range(1, 6)]
+        for thread in waiters:
+            thread.start()
+        _until(lambda: parked[0] == 5)
+        provider.release.set()
+        for thread in probe + waiters:
+            thread.join()
+
+    assert sum("allowance journal" in o for o in outcomes) == 1 and outcomes.count("ok") == 5
+    assert time.monotonic() - started < PRICE_PROBE_WAIT_SECONDS / 2
+    assert "cold" not in gateway._ceiling, "a price was learned from a row no restart will see"
+    assert gateway.balance("hk") == pytest.approx(before - 5 * 0.01)
+    assert gateway._held["hk"] == 0.0 and gateway._probing is False
+
+
+def test_a_provider_that_raises_a_type_error_returns_its_hold_and_propagates_as_a_dead_rung():
+    class Raising(FakeProvider):
+        def chat(self, model_id, task_text, params):
+            raise TypeError("the client was handed something it could not send")
+
+    gateway = OwnerGateway(Raising())
+    gateway.fund("hk", 5.0)
+    token = gateway.open_duel("hk", "w1-arm")
+
+    with pytest.raises(TypeError, match="could not send"):
+        gateway.call(token, "m", "a task")
+
+    assert gateway.balance("hk") == 5.0 and gateway._held["hk"] == 0.0
+    assert gateway._probing is False
+
+
+def test_a_credit_made_while_callers_wait_releases_them(tmp_path):
+    journal = tmp_path / "allowances.jsonl"
+    provider = GatedProvider(answers={"cold": "ok", "warm": "ok"},
+                             prices={"cold": 0.02, "warm": 0.01})
+    daemon = OwnerGateway(provider, journal=journal)
+    daemon.fund("hk", 1.0)
+    token = daemon.open_duel("hk", "w1-arm")
+    daemon.call(token, "warm", "learn a price")
+    parked = _count_parked(daemon)
+    done = threading.Event()
+
+    probe = _run(lambda i: daemon.call(token, "cold", "the probe"), 1)
+    _until(lambda: daemon._probing and daemon.balance("hk") == 0.0)
+    waiter = _run(lambda i: (daemon.call(token, "warm", "a task"), done.set()), 1)
+    _until(lambda: parked[0] == 1)
+
+    OwnerGateway(FakeProvider(), journal=journal).fund("hk", 2.0, ref="top-up")
+    daemon.refresh()
+
+    assert done.wait(5.0), "the top-up did not release a caller waiting on held money"
+    assert daemon._probing, "the waiter ran before the probe settled, as a credit should allow"
+    provider.release.set()
+    for thread in probe + waiter:
+        thread.join()
+    assert daemon._held["hk"] == 0.0

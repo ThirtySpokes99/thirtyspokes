@@ -623,3 +623,16 @@ def test_a_field_in_two_blocks_is_checked_in_both(tmp_path):
     (tree / "config.json").write_text(json.dumps(config))
 
     assert "partial_rotary_factor" in _refusal(tree, reference)
+
+
+@pytest.mark.parametrize("depth", [3_000, 200_000])
+def test_a_config_nested_past_the_parsers_limits_is_refused_as_the_trees_own_fault(
+        tree, reference, depth):
+    """A deterministic function of the bytes is a refusal, not a crash. Nested past `json.loads`'s
+    limit (the deep case) or past the recursive custom-code walk over a config `json.loads` accepted
+    (the shallow one), the checks raise `RecursionError` — which, left as itself, would reach the
+    validator as an exception of no artifact type, be treated as the owner's, and hold a queue slot
+    until the deferral cap."""
+    (tree / "config.json").write_text('{"a": ' * depth + "1" + "}" * depth)
+    with pytest.raises(AdmissionError, match="could not be parsed: RecursionError"):
+        admit(tree, reference)

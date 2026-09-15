@@ -402,6 +402,27 @@ The daemon now sweeps a prefix the chain never named once nobody has touched it 
 `UNCLAIMED_GRACE_SECONDS` (7 days), measured from the last object WRITTEN, so a slow upload keeps
 resetting its own clock and is never deleted mid-flight.
 
+The sweep deletes a prefix whole, sealed OpenRouter key included, so it does not trust one chain read
+to say what is unclaimed (WHITEPAPER §8b.7):
+
+- **Durable state protects.** A registration named by `history.json` or the mailbox ledger is never
+  swept, whatever the chain returns: every `judged_at` registration, the pending crown, the reigning
+  crown's tree (`<state>/trees/<registration id>`), every `infra_deferrals` entry, and every spent
+  shot in `mailbox.json`. A judged hotkey that deregisters keeps its prefix; its weights go on
+  §8b.7's 14-day rule and its manifest stays.
+- **A partial read deletes nothing.** If any `CommitmentOf` query raises on a poll, or the metagraph
+  read fails, the sweep skips that poll entirely. An empty slot or an undecodable payload does not
+  count as a failure and never blocks it. The queue is unaffected: it still lists every slot it could
+  read.
+
+What the operator sees: `retention: unclaimed sweep skipped — N commitment query/queries raised …`
+(or `could not survey unclaimed uploads …` for a metagraph or listing failure) once when the sweep
+starts skipping for that cause, `unclaimed sweep still skipped — the commitment queries for <hotkeys>
+keep raising …` once a day while it persists (`UNCLAIMED_SWEEP_STALL_RELOG_SECONDS`), and
+`unclaimed sweep resumed` once when it runs again. A line with the count of protected registrations
+appears when that count changes. A slot that raises every poll stalls cleanup indefinitely by design —
+there is no timeout that deletes anyway — so the daily line is the one to act on.
+
 Miners poll `https://store.thirtyspokes.ai` — the custom domain connected to the production bucket
 (2026-09-08) — and the dashboard reads reveals from it, so `--r2-bucket` here and on the daemon must
 name the bucket behind that domain, with public access on. Not the bucket's r2.dev address: Cloudflare

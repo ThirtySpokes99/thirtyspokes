@@ -418,6 +418,17 @@ filling and walked away from. It is measured from the last object WRITTEN, so a 
 takes two days keeps resetting its own clock and is never swept mid-flight.
 """
 
+UNCLAIMED_SWEEP_STALL_RELOG_SECONDS = 86_400
+"""How often a sweep that is STILL refusing to run says so again (§8b.7's completeness gate).
+
+The unclaimed sweep deletes nothing on a poll where any commitment query raised, because a slot the
+read could not see looks exactly like one nobody committed to. That gate must never time out into
+deleting anyway — a king's slot that stays unreadable must stay safe — so a slot that raises every
+poll (a value the SDK cannot decode, say) stalls cleanup for as long as it stays registered. One log
+line when that starts rotates out of the journal long before anyone asks why the bucket is growing;
+a daily reminder, naming the slots, does not, and is still not a line a minute.
+"""
+
 KING_ZERO_NAME = "thirtyspokes-genesis"
 """What King₀ is CALLED, as against `V3_KING0` which is the policy that implements it.
 

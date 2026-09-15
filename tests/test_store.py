@@ -640,6 +640,19 @@ def test_a_submission_the_chain_names_is_never_unclaimed(tmp_path, bucket):
                           now=1_000.0 + 10 * UNCLAIMED_GRACE_SECONDS) == ()
 
 
+def test_a_registration_durable_state_protects_is_never_unclaimed_even_when_no_read_names_it(
+        tmp_path, bucket):
+    """A chain read can miss a slot — a failed query, a deregistered hotkey — and a miss here is a
+    whole-prefix deletion. What the validator's own records name is exempt regardless."""
+    bucket.client.now = 1_000.0
+    submission(tmp_path, bucket)
+
+    assert unclaimed_plan(bucket, committed=(), protected={REGISTRATION.registration_id},
+                          now=1_000.0 + 10 * UNCLAIMED_GRACE_SECONDS) == ()
+    assert unclaimed_plan(bucket, committed=(), protected={"cd" * 32},
+                          now=1_000.0 + 10 * UNCLAIMED_GRACE_SECONDS) == (REGISTRATION.prefix,)
+
+
 def test_an_upload_still_arriving_keeps_resetting_its_own_clock(tmp_path, bucket):
     """70 GB takes hours to days. A sweep that counted from the FIRST byte would delete a transfer
     out from under the miner making it."""

@@ -1178,6 +1178,20 @@ public artifacts D14 makes derivable. A losing submission never leaves the priva
 weights are deleted 14 days after it is judged. The manifest hash and the history entry are retained
 forever regardless, so the *record* of every submission is permanent even when its weights are not.
 
+An upload nobody ever committed to is never judged, so the rule above never reaches it: its prefix is
+deleted whole once nobody has written to it for `UNCLAIMED_GRACE_SECONDS` (7 days). "Nobody
+committed to it" is an absence, and one chain read cannot prove an absence, so two guards bound that
+sweep. **The validator's own records protect, whatever the chain says:** it never deletes a
+registration its durable state names — the reigning king (whose prefix also holds the sealed
+OpenRouter key its arm is funded from), a pending crown, any judged submission (a loser, an ex-king, a
+pensioner, even after its hotkey deregisters and drops out of the metagraph), an entry deferred for an
+owner-side failure, or any shot the mailbox has spent. A judged prefix is left to the 14-day rule
+above, which keeps its manifest. **A partial read deletes nothing:** if any commitment query fails on a
+poll, or the metagraph cannot be read, the sweep does not run that poll at all; a slot that is empty or
+holds a payload that does not decode reads the same way every poll and does not stop it. The gate
+never times out into deleting anyway — a slot that stays unreadable stalls cleanup, and the validator
+says so again daily.
+
 ### 8b.8 Cold start
 
 Window 1 has no king and no pensioners. King₀ — the best fixed policy from M3a — is a policy in the

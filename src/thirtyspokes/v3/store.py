@@ -194,7 +194,7 @@ class ManifestFile:
             raise StoreError(f"unsafe manifest path: {path!r}")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise StoreError(f"manifest size is invalid for {path!r}: {size!r}")
-        if not isinstance(digest, str) or not _is_digest(digest):
+        if not isinstance(digest, str) or not is_digest(digest):
             raise StoreError(f"manifest sha256 is invalid for {path!r}: {digest!r}")
         return cls(path=path, size=size, sha256=digest)
 
@@ -287,7 +287,7 @@ class Manifest:
         if version == 2:
             check_model_name(name)
         registration = value["registration_id"]
-        if not isinstance(registration, str) or not _is_digest(registration):
+        if not isinstance(registration, str) or not is_digest(registration):
             raise StoreError("manifest registration_id is not a SHA-256 digest")
         if not isinstance(value["hotkey"], str) or not value["hotkey"]:
             raise StoreError("manifest hotkey is required")
@@ -890,7 +890,7 @@ def _verified(marker: Path, manifest: Manifest, dest: Path) -> bool:
 
 def public_model_prefix(manifest_sha256: str) -> str:
     """Where a promoted model lives in the public models bucket."""
-    if not _is_digest(manifest_sha256):
+    if not is_digest(manifest_sha256):
         raise StoreError(f"{manifest_sha256!r} is not a SHA-256 digest")
     return f"{PUBLIC_MODEL_ROOT}{manifest_sha256}/"
 
@@ -1042,15 +1042,21 @@ def apply_retention(bucket: S3Bucket, plan: Retention) -> int:
 
 def unclaimed_plan(bucket: S3Bucket, *, committed: Collection[str], now: float,
                    grace_seconds: float = UNCLAIMED_GRACE_SECONDS,
-                   prefix: str = "submissions/") -> tuple[str, ...]:
+                   prefix: str = "submissions/",
+                   protected: Collection[str] = ()) -> tuple[str, ...]:
     """Prefixes holding bytes no ready signal ever named, untouched for the grace window.
 
     KEYED OFF THE OBJECTS, NOT THE CREDENTIAL LEDGER. An upload still arriving keeps moving its own
     newest timestamp, so a 70 GB transfer spread over two days is never swept mid-flight, while a
     prefix abandoned after one shard is. A ledger-based rule would have to guess at both.
 
-    `committed` is the registration ids the chain names. A prefix among them is out of scope here
-    whatever its age: it is a submission, and §8b.7's grace applies to it once it has been judged.
+    Two sets exempt a prefix, whatever its age, and they answer different questions. `committed` is
+    the registration ids THIS chain read names: a submission, whose §8b.7 grace starts once it is
+    judged. `protected` is what the validator's DURABLE state says the subnet still depends on — the
+    crown, a pending crown, every judged or spent submission — whatever the chain read returned,
+    because a read can miss a slot (a failed query, a deregistered hotkey) and a miss here is a
+    deletion. Both are checked here, where a listing becomes deletions, so no caller can apply one
+    and forget the other.
     """
     newest: dict[str, float] = {}
     for key, (_size, modified) in bucket.listing(prefix).items():
@@ -1061,7 +1067,8 @@ def unclaimed_plan(bucket: S3Bucket, *, committed: Collection[str], now: float,
         newest[registration] = max(newest.get(registration, 0.0), modified)
     return tuple(sorted(f"{prefix}{registration}/"
                         for registration, seen in newest.items()
-                        if registration not in committed and now - seen >= grace_seconds))
+                        if registration not in committed and registration not in protected
+                        and now - seen >= grace_seconds))
 
 
 def delete_prefix(bucket: S3Bucket, prefix: str) -> int:
@@ -1069,7 +1076,8 @@ def delete_prefix(bucket: S3Bucket, prefix: str) -> int:
 
     Unlike `apply_retention` this keeps no `manifest.json`: that record exists so a JUDGED
     submission stays auditable forever, and nothing here was ever judged — there is no verdict for a
-    manifest to be the evidence of.
+    manifest to be the evidence of. It checks nothing itself: `unclaimed_plan` is the gate, and a
+    prefix reaches here only from that plan.
     """
     freed = 0
     for key, size in sorted(bucket.list(prefix).items()):
@@ -1078,7 +1086,7 @@ def delete_prefix(bucket: S3Bucket, prefix: str) -> int:
     return freed
 
 
-def _is_digest(value: str) -> bool:
+def is_digest(value: str) -> bool:
     return (len(value) == _HEX_DIGEST_LENGTH
             and all(char in "0123456789abcdef" for char in value))
 
@@ -1092,7 +1100,7 @@ __all__ = [
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
     "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
     "MODEL_NAME", "RESERVED_NAME_PREFIX", "check_model_name",
-    "UNCLAIMED_GRACE_SECONDS", "delete_prefix", "unclaimed_plan",
+    "UNCLAIMED_GRACE_SECONDS", "delete_prefix", "is_digest", "unclaimed_plan",
     "inventory", "r2_bucket", "retention_plan", "sha256_file", "tree_digest", "upload_tree",
     "usage",
 ]

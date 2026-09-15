@@ -483,6 +483,27 @@ class Mailbox:
         record = self._spent.get(hotkey)
         return None if record is None else Submission(**record)
 
+    def spent_registrations(self) -> frozenset[str]:
+        """The registration id of every spent shot — what §8b.7's unclaimed sweep must never delete.
+
+        `consume` is the moment a chain signal becomes a spent §7 shot, so every entry queued,
+        deferred, unfunded or waiting behind this window's duel cap is in here before any window has
+        judged it; a chain read that misses its slot must not turn that into a deletion. The
+        in-memory ledger is current: only `consume`, which only this daemon calls, ever ADDS to
+        `spent`, and the owner tool's writes re-read the file before persisting it (`_transaction`).
+
+        Read record by record with `.get`, not through `Submission(**record)`: a legacy record with a
+        missing or extra key must cost its own protection at most, never the whole sweep.
+        """
+        return frozenset(str(record["registration_id"]) for record in self._spent.values()
+                         if isinstance(record, Mapping) and record.get("registration_id"))
+
+    def issued_registration(self, hotkey: str) -> str | None:
+        """The registration id this hotkey was last issued a credential for, or None."""
+        record = self._issued.get(hotkey)
+        rid = record.get("registration_id") if isinstance(record, Mapping) else None
+        return str(rid) if rid else None
+
     def outstanding(self) -> tuple[Outstanding, ...]:
         """Every hotkey that holds issued generations, and whether its shot is already spent.
 

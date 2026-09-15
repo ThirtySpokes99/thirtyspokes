@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import pytest
 
-from thirtyspokes.v3.chain import (COMMITMENT_MAX_BYTES, ChainError, Commitment, Metagraph,
+from thirtyspokes.v3.chain import (COMMITMENT_MAX_BYTES, ChainError, Commitment,
+                                    CommitmentSurvey, Metagraph,
                                     MockChain, Neuron, ReadySignal, SerialisedChain,
                                     WeightRateLimited, check_weight_cadence, read_commitments,
-                                    read_metagraph, read_weights_rate_limit, serialised)
+                                    read_metagraph, read_weights_rate_limit, serialised,
+                                    survey_commitments)
 from thirtyspokes.v3.emissions import Lineage, emission_weights
 
 BURN_UID = 0
@@ -373,8 +375,10 @@ class _Scale:
 class _StubSubstrate:
     """The three substrate calls the live reads make, and a record of the block each was pinned to."""
 
-    def __init__(self, *, keys, registered, slots=None):
+    def __init__(self, *, keys, registered, slots=None, raising=()):
         self.keys, self.registered, self.slots = keys, registered, slots or {}
+        # Hotkeys whose `CommitmentOf` query fails the way a dropped RPC does.
+        self.raising = set(raising)
         self.pinned: list[tuple[str, str | None]] = []
 
     def get_block_hash(self, block: int) -> str:
@@ -388,6 +392,8 @@ class _StubSubstrate:
 
     def query(self, module, storage_function, params, block_hash=None):
         assert (module, storage_function) == ("Commitments", "CommitmentOf")
+        if params[1] in self.raising:
+            raise ConnectionError("websocket closed mid-request")
         return _Scale(self.slots.get(params[1]))
 
 
@@ -467,6 +473,85 @@ def test_a_slot_belonging_to_a_hotkey_that_holds_no_uid_is_not_queued():
     queued = read_commitments(substrate, NETUID, metagraph)
 
     assert [commitment.hotkey for commitment in queued] == ["hk_A"]
+
+
+def test_a_query_that_raises_is_reported_as_a_partial_read_while_the_other_slots_still_decode():
+    """§8b.7's unclaimed sweep deletes whatever a read does not name, so a slot the read could not
+    SEE must not look like a slot nobody committed to. The queue keeps its tolerance: the same stub
+    through `read_commitments` still lists the rest."""
+    signal = ReadySignal(REGISTRATION, MANIFEST)
+    substrate = _StubSubstrate(keys={5: "hk_A", 6: "hk_flaky"}, registered={5: 1, 6: 1},
+                               slots={"hk_A": _slot(signal.encode(), block=42),
+                                      "hk_flaky": _slot(signal.encode(), block=40)},
+                               raising={"hk_flaky"})
+    metagraph = read_metagraph(substrate, NETUID, block=50)
+
+    survey = survey_commitments(substrate, NETUID, metagraph)
+
+    assert survey.commitments == (Commitment("hk_A", 42, signal),)
+    assert survey.failed_queries == ("hk_flaky",) and not survey.complete
+    assert read_commitments(substrate, NETUID, metagraph) == survey.commitments
+
+
+def test_an_empty_or_undecodable_slot_is_a_complete_read_and_never_blocks_the_sweep():
+    """A slot that holds nothing, the owner's governance record, or bytes that are not even a field
+    reads the same way every poll. Counting it as a failed read would stall cleanup forever."""
+    signal = ReadySignal(REGISTRATION, MANIFEST)
+    substrate = _StubSubstrate(
+        keys={0: "hk_owner", 5: "hk_A", 6: "hk_silent", 7: "hk_garbage", 8: "hk_badhex"},
+        registered={0: 1, 5: 1, 6: 1, 7: 1, 8: 1},
+        slots={"hk_owner": _slot("kothgov1|" + "d" * 64, block=3),
+               "hk_A": _slot(signal.encode(), block=42),
+               "hk_garbage": {"info": "not a record"},
+               "hk_badhex": {"info": {"fields": [{"Raw4": "0xzzzz"}]}, "block": 9}})
+    metagraph = read_metagraph(substrate, NETUID, block=50)
+
+    survey = survey_commitments(substrate, NETUID, metagraph)
+
+    assert survey.complete and survey.failed_queries == ()
+    assert [commitment.hotkey for commitment in survey.commitments] == ["hk_A"]
+
+
+def test_the_mock_skips_a_failing_query_for_the_queue_and_reports_it_to_the_survey():
+    chain = arena()
+    signal = ReadySignal(REGISTRATION, MANIFEST)
+    chain.commit_ready("hk_king", signal)
+    chain.commit_ready("hk_f1", signal)
+    chain.failing_queries = {"hk_king"}
+
+    assert [c.hotkey for c in chain.commitments()] == ["hk_f1"]
+    survey = chain.commitment_survey()
+    assert [c.hotkey for c in survey.commitments] == ["hk_f1"]
+    assert survey.failed_queries == ("hk_king",) and not survey.complete
+
+    chain.deregister("hk_f1")
+    chain.failing_queries = set()
+    assert chain.commitment_survey() == CommitmentSurvey(
+        commitments=(Commitment("hk_king", 0, signal),)), "a deregistered slot is absent, not failed"
+
+
+def test_the_commitment_survey_runs_under_the_serialised_chains_one_lock():
+    """The sweep's read shares the SDK client with the weight keeper like every other call."""
+    import threading
+
+    chain = arena()
+    wrapped = SerialisedChain(chain)
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+
+    def slow():
+        entered.set()
+        assert release.wait(timeout=10)
+        return CommitmentSurvey(commitments=())
+
+    chain.commitment_survey = slow
+    reader = threading.Thread(target=wrapped.commitment_survey)
+    reader.start()
+    assert entered.wait(timeout=10)
+    threading.Thread(target=lambda: (wrapped.current_block(), done.set())).start()
+    assert not done.wait(timeout=0.1), "a second caller ran while the survey was inside the chain"
+    release.set()
+    assert done.wait(timeout=10)
+    reader.join(timeout=10)
 
 
 def test_a_weights_rate_limit_the_chain_cannot_report_fails_closed():

@@ -53,7 +53,8 @@ from thirtyspokes.v3.config import (DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECO
                                      EPISODE_CONCURRENCY,
                                      EXCLUDED_REASON,
                                      MAX_DUELS_PER_WINDOW, MAX_INFRA_DEFERRALS, MAX_QUEUE_DEPTH,
-                                     FUTILE_REASON)
+                                     FUTILE_REASON, UNCLAIMED_SWEEP_STALL_RELOG_SECONDS)
+from thirtyspokes.v3.funding import KEY_NAME
 from thirtyspokes.v3.devkit import suite_grade
 from thirtyspokes.v3.emissions import KING0, emission_weights
 from thirtyspokes.v3.gateway import OwnerGateway
@@ -3162,6 +3163,241 @@ def test_an_upload_nobody_committed_to_is_swept_and_a_real_submission_is_not(tmp
 
 def committed_of(h: Harness, hotkey: str) -> str:
     return next(c.ready.registration_id for c in h.chain.commitments() if c.hotkey == hotkey)
+
+
+# --- the unclaimed sweep never deletes what the subnet still depends on (§8b.7) --------------------
+
+PAST_UNCLAIMED_GRACE = UNCLAIMED_GRACE_SECONDS + 60.0
+
+
+def aged_upload(h: Harness, registration_id: str, name: str = "model.safetensors") -> str:
+    """An object under `submissions/<registration_id>/`, written at time 0 so any clock past the
+    grace window finds it untouched. Returns its key."""
+    key = f"submissions/{registration_id}/{name}"
+    h.private.client.objects[key] = (b"weights", {})
+    h.private.client.written[key] = 0.0
+    return key
+
+
+def sweep_lines(capsys) -> list[str]:
+    return [line for line in capsys.readouterr().out.splitlines()
+            if "unclaimed sweep" in line or "could not survey unclaimed" in line]
+
+
+def test_a_kings_slot_whose_query_raises_deletes_nothing_and_logs_one_skip(tmp_path, capsys):
+    """THE FAILURE THIS GATE EXISTS FOR. A read that silently skips the king's raising slot looks,
+    to a sweep, exactly like a king nobody committed to — and the sweep deletes the prefix whole,
+    sealed OpenRouter key included, so the next king arm cannot be funded. On a partial read NOTHING
+    is deleted, not even a genuinely abandoned upload, because the read cannot tell which is which."""
+    h = harness(tmp_path)
+    king = h.crown("king", router(h))
+    king_rid = committed_of(h, king)
+    key = aged_upload(h, king_rid, KEY_NAME)
+    abandoned = aged_upload(h, "ab" * 32)
+    before = set(h.private.client.objects)
+    h.chain.failing_queries = {king}
+    h.validator.now = lambda: PAST_UNCLAIMED_GRACE
+    capsys.readouterr()
+
+    h.validator._apply_retention()
+    h.validator._apply_retention()
+
+    assert set(h.private.client.objects) == before and key in before
+    lines = sweep_lines(capsys)
+    assert len(lines) == 1 and "skipped" in lines[0], lines
+
+    h.chain.failing_queries = set()
+    h.validator._apply_retention()
+
+    assert abandoned not in h.private.client.objects, "a complete read sweeps what nobody names"
+    assert key in h.private.client.objects, "and the reigning king's key is still never touched"
+    assert [line for line in sweep_lines(capsys) if "resumed" in line] == [
+        "[v3-validator] retention: unclaimed sweep resumed"]
+
+
+def test_a_sweep_stalled_by_a_query_that_keeps_raising_says_so_again_daily_naming_the_slot(
+        tmp_path, capsys):
+    """A slot that raises every poll stalls cleanup by design; the one line announcing it rotates
+    out of the journal, so the stall is repeated — daily, not every poll."""
+    h = harness(tmp_path)
+    flaky = h.enrol("flaky", block=10, conductor=router(h))
+    h.chain.failing_queries = {flaky}
+    now = [PAST_UNCLAIMED_GRACE]
+    h.validator.now = lambda: now[0]
+    capsys.readouterr()
+
+    h.validator._sweep_unclaimed()
+    now[0] += UNCLAIMED_SWEEP_STALL_RELOG_SECONDS - 1
+    h.validator._sweep_unclaimed()
+    assert len(sweep_lines(capsys)) == 1
+
+    now[0] += 1
+    h.validator._sweep_unclaimed()
+    reminder = sweep_lines(capsys)
+    assert len(reminder) == 1 and "still skipped" in reminder[0] and flaky in reminder[0]
+
+
+def test_a_metagraph_that_cannot_be_read_skips_the_sweep_and_deletes_nothing(tmp_path, capsys):
+    h = harness(tmp_path)
+    abandoned = aged_upload(h, "ab" * 32)
+    h.validator.now = lambda: PAST_UNCLAIMED_GRACE
+
+    def unreachable():
+        raise ConnectionError("metagraph read timed out")
+
+    h.chain.metagraph = unreachable
+    capsys.readouterr()
+    h.validator._sweep_unclaimed()
+    h.validator._sweep_unclaimed()
+
+    assert abandoned in h.private.client.objects
+    assert len(sweep_lines(capsys)) == 1, "one line per cause, not one a poll"
+
+
+def test_the_crowns_prefix_is_protected_even_when_a_complete_read_names_nothing_for_it(tmp_path):
+    """The chain is not the only witness. Here the read is COMPLETE and the king's slot simply no
+    longer holds a ready signal — the crown's own tree path still names its registration."""
+    h = harness(tmp_path)
+    king = h.crown("king", router(h))
+    king_rid = committed_of(h, king)
+    assert king not in h.validator.history.judged_at, "the model_dir alone must protect it"
+    key = aged_upload(h, king_rid, KEY_NAME)
+    king_files = {k for k in h.private.client.objects if k.startswith(f"submissions/{king_rid}/")}
+    h.chain._commit[king] = ("not a ready signal", 1)
+    assert h.chain.commitment_survey().complete
+    h.validator.now = lambda: PAST_UNCLAIMED_GRACE
+
+    h.validator._sweep_unclaimed()
+
+    assert key in king_files
+    assert {k for k in h.private.client.objects
+            if k.startswith(f"submissions/{king_rid}/")} == king_files
+
+
+def test_a_deregistered_judged_hotkey_keeps_its_prefix_until_retire_judged_keeps_only_its_manifest(
+        tmp_path):
+    """A loser that deregisters falls off the metagraph walk, so no chain read names it again. The
+    unclaimed sweep must leave it alone: its weights are `_retire_judged`'s, on the fortnight, and
+    its manifest is kept forever (§8b.7)."""
+    h = harness(tmp_path)
+    copy = h.enrol("copycat", block=12, conductor=Copier(h.validator.pins.king_zero))
+    judged_at = 1_000_000.0
+    h.validator.now = lambda: judged_at
+    reveal = h.run(1)
+    assert not outcome(reveal, copy).won
+    rid = committed_of(h, copy)
+    prefix = f"submissions/{rid}/"
+    aged_upload(h, rid, KEY_NAME)
+    before = sorted(k for k in h.private.client.objects if k.startswith(prefix))
+    h.chain.deregister(copy)
+
+    h.validator.now = lambda: judged_at + UNCLAIMED_GRACE_SECONDS
+    h.validator._apply_retention()
+    assert sorted(k for k in h.private.client.objects if k.startswith(prefix)) == before
+
+    h.validator.now = lambda: judged_at + GRACE_SECONDS
+    h.validator._apply_retention()
+    assert sorted(k for k in h.private.client.objects if k.startswith(prefix)) == [
+        prefix + MANIFEST_NAME]
+
+
+def test_a_malformed_commitment_payload_does_not_block_the_sweep(tmp_path, capsys):
+    h = harness(tmp_path)
+    h.chain.register(address("scribbler"))
+    h.chain._commit[address("scribbler")] = ("r2ready:v1|not-hex|also-not", 5)
+    abandoned = aged_upload(h, "ab" * 32)
+    h.validator.now = lambda: PAST_UNCLAIMED_GRACE
+    capsys.readouterr()
+
+    h.validator._sweep_unclaimed()
+
+    assert abandoned not in h.private.client.objects
+    assert not [line for line in sweep_lines(capsys) if "skipped" in line]
+
+
+def test_the_published_queue_still_skips_a_raising_slot_and_lists_the_rest(tmp_path):
+    """The completeness gate is the sweep's alone: a queue is re-read next poll, so one bad slot
+    must not hide every other challenger."""
+    h = harness(tmp_path)
+    first = h.enrol("router-a", block=10, conductor=router(h))
+    second = h.enrol("router-b", block=11, conductor=router(h))
+    h.chain.failing_queries = {first}
+
+    assert [entry["hotkey"] for entry in h.validator._queue_entries()] == [second]
+
+
+def _mailbox_with(root: Path, state: dict) -> Mailbox:
+    path = root / "mailbox-case.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    return Mailbox(path, signing.Signer(), _never_mint)
+
+
+RID = "7e" * 32
+
+
+@pytest.mark.parametrize("source, protected", [
+    ("judged_at", True),
+    ("pending_crown", True),
+    ("crown_model_dir", True),
+    ("infra_deferral", True),
+    ("spent_legacy_record", True),
+    ("issued_to_a_judged_hotkey_without_judged_at", True),
+    ("issued_but_never_judged", False),
+    ("a_hand_written_crown_path", False),
+    ("nothing", False),
+])
+def test_each_durable_record_protects_its_registration_on_its_own(tmp_path, source, protected):
+    """One source at a time, so a hole in any one of them cannot hide behind another — the harness's
+    real mailbox otherwise protects every queued hotkey through `spent` and masks the rest. The
+    prefix belongs to no chain commitment, so only durable state can save it."""
+    h = harness(tmp_path)
+    history = h.validator.history
+    h.validator.mailbox = None
+    if source == "judged_at":
+        history.judged.add("5Closer")
+        history.judged_at["5Closer"] = {"registration_id": RID, "at": 0.0}
+    elif source == "pending_crown":
+        history.pending_crown = {"window": 3, "hotkey": "5Cwinner", "registration_id": RID}
+    elif source == "crown_model_dir":
+        history.crown = Crown("5Cking", str(h.validator.root / "trees" / RID), "v3-5Cking@x")
+    elif source == "infra_deferral":
+        history.infra_deferrals[RID] = {"hotkey": "5Cwaiting", "cause": "serving", "windows": [2]}
+    elif source == "spent_legacy_record":
+        h.validator.mailbox = _mailbox_with(tmp_path, {"issued": {}, "spent": {
+            "5Cqueued": {"hotkey": "5Cqueued", "registration_id": RID, "unexpected": 1},
+            "5Cbroken": {"hotkey": "5Cbroken"}}})
+    elif source == "issued_to_a_judged_hotkey_without_judged_at":
+        history.judged.add("5Cold")
+        h.validator.mailbox = _mailbox_with(tmp_path, {"issued": {
+            "5Cold": {"registration_id": RID, "prefix": f"submissions/{RID}/", "generation": 1}},
+            "spent": {}})
+    elif source == "issued_but_never_judged":
+        h.validator.mailbox = _mailbox_with(tmp_path, {"issued": {
+            "5Cidle": {"registration_id": RID, "prefix": f"submissions/{RID}/", "generation": 1}},
+            "spent": {}})
+    elif source == "a_hand_written_crown_path":
+        history.crown = Crown("5Cking", "/srv/king", "v3-5Cking@x")
+    key = aged_upload(h, RID)
+    h.validator.now = lambda: PAST_UNCLAIMED_GRACE
+
+    assert (RID in h.validator._retained_registrations()) is protected
+    h.validator._sweep_unclaimed()
+
+    assert (key in h.private.client.objects) is protected
+
+
+def test_a_state_file_without_the_newer_fields_still_loads_and_names_its_crown(tmp_path):
+    """The live daemon's history.json predates several fields; protection must derive what it can
+    and raise on none of what is missing."""
+    path = tmp_path / "old-history.json"
+    path.write_text(json.dumps({"version": 1, "judged": ["5Cking"], "coronations": ["5Cking"],
+                                "crown": {"hotkey": "5Cking",
+                                          "model_dir": f"/var/state/trees/{RID}"}}),
+                    encoding="utf-8")
+    h = harness(tmp_path)
+    h.validator.history = History(path)
+
+    assert h.validator._retained_registrations() == frozenset({RID})
 
 
 # --- §8b.2: only the artifact's failures spend a shot at admission ----------------------------------

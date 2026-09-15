@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from .config import PROVIDER_CALL_SECONDS
 from .pool import snapshot
 from .types import Catalog
 from .worker import WorkerError
@@ -250,7 +251,7 @@ class OpenRouterClient:
     """
 
     def __init__(self, api_key: str, base_url: str = OPENROUTER_BASE_URL,
-                 timeout: float = 300.0, attempts: int = 3, backoff: float = 1.5,
+                 timeout: float = PROVIDER_CALL_SECONDS, attempts: int = 3, backoff: float = 1.5,
                  transport: object | None = None):
         import httpx  # noqa: PLC0415
 

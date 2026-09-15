@@ -50,13 +50,16 @@ Concretely, on the controller (measured 2026-09-01; the controller shipped with 
 ```bash
 apt-get install -y sshfs                       # fuse3 is already present
 sshfs -o reconnect,ServerAliveInterval=15,allow_other root@<gpu>:/var/v3/grade /var/v3/grade
-# and after EVERY sshfs mount that carries a model tree, raise the kernel read-ahead on it:
+# only if something still reads whole model trees THROUGH a mount (an owner-run submit from one):
 echo 16384 > /sys/class/bdi/$(grep " /var/v3/grade " /proc/self/mountinfo | awk '{print $3}')/read_ahead_kb
 ```
 
-The read-ahead line is not optional for the tree mounts. Measured 2026-09-08 on the owner's link: one
-sequential reader gets 3–7 MB/s at the default 128 KB and ~20 MB/s at 16 MB, and the value is fixed per
-open file, so set it before a fetch or a submit starts, not while one runs.
+**The daemon no longer reads tree bytes through the trees mount**, so the read-ahead line is not
+needed for fetching challengers or publishing a king: with `--serve-host` both run on the serving
+host (see *Fetch and promotion run on the serving host* below), and the mount carries only
+`admission`'s safetensors header reads, directory listings, and the `.verified` marker. The line
+still helps anything else that reads whole trees through a mount; the value is fixed per open file,
+so set it before such a read starts, not while one runs.
 
 and in `~/.ssh/config`, scoped to the one host so no other destination changes behaviour:
 
@@ -163,6 +166,52 @@ that daemon**, and the bind resolves. Anything else raises and names the fix. Ru
 reboot: neither an sshfs mount nor an ssh config survives one by default, and the failure mode is
 `preflight` refusing rather than a window grading wrongly.
 
+### Fetch and promotion run on the serving host
+
+A challenger's tree is tens of GB, and vLLM loads it from the serving host's own disk. Pulling it
+into `<state>/trees` from the controller would push every byte across the WAN into the mount and
+then read every byte back to hash it: hours per challenger, where the same objects pulled on the
+host take minutes. So whenever `--serve-host` is given (no new flag), `hosttrees.py` moves the bytes
+on the host and the controller keeps every decision:
+
+* **The controller checks first, as before**: the manifest, its digest against the on-chain
+  commitment, the hotkey and registration, the signature, and the bucket listing (no extra object,
+  no committed file missing or at the wrong size). Only then is the host asked for anything.
+* **The host gets presigned URLs, never a credential.** One GET URL per object, valid for
+  `hosttrees.PRESIGNED_TRANSFER_SECONDS`, sent inside the bash script on ssh's **stdin**; curl reads
+  each URL from a `/dev/fd` config written by a shell builtin, so no URL appears on any command
+  line, in `ps`, in curl's stderr (discarded) or in the daemon log.
+* **The host transfers and hashes; the controller judges.** Eight files at a time, each to
+  `<path>.thirtyspokes-partial-<pid>` in its own directory, `sha256sum`'d, and renamed into place
+  only at the committed size and digest — a final name never holds a partial file. A file already
+  present at its committed digest is kept, so a killed fetch resumes. Anything under
+  `<serve-trees>/<registration id>/` the manifest does not name (a killed run's partials, an older
+  downloader's temp files, any symlink) is removed first. The host prints one result line per file
+  and the controller compares every size and digest with the manifest itself.
+* **Only verified wrong bytes refuse a submission.** A file downloaded twice at the committed size
+  that hashes to another digest both times is refused with the same message a local fetch gives. A
+  curl failure, two downloads that disagree, a size different from what the bucket lists, missing or
+  unreadable output, a non-zero ssh exit or a timeout (`hosttrees.TREE_TRANSFER_TIMEOUT_SECONDS`,
+  hours, not the 180 s serving runner's) is the owner's failure.
+* **`--serve-trees` must be the directory behind `<state>/trees`.** After every fetch the
+  controller lists the tree through the mount, the way admission will, and requires exactly the
+  manifest's files at their sizes; it retries for about a minute to absorb sshfs's caches, so keep
+  the mount's `attr_timeout` and `dcache_timeout` well below that. A mismatch is an owner-side
+  error naming `--serve-trees`, and no `.verified` marker is written.
+* **Promotion never uses a server-side copy.** The controller aborts any upload a killed run left
+  open under the king's prefix, creates one multipart upload per file with its `sha256` metadata,
+  and presigns each part. The host re-hashes each file (and sends nothing for one that no longer
+  matches), then PUTs each 64 MiB part from a byte range and reports the part's MD5 beside the ETag
+  R2 returned. The controller completes a file only when its hash matches the manifest and every
+  ETag equals its part's MD5, aborts every upload it did not complete, writes `manifest.json` last
+  itself, and then runs the same post-conditions as before. The host only reads the tree.
+
+The host needs **bash ≥ 4.3, curl and coreutils** (`dd` with `iflag=skip_bytes`) and nothing else;
+check with `bash --version; curl --version; dd --version` before the first start on this code.
+Presigned URLs are bearer capabilities for one object until they expire, and bash may buffer the
+script's heredoc in a short-lived, private temp file on the host; that host already holds the
+trees and no credential.
+
 ---
 
 ## 2a. The owner's keys, with btcli 11
@@ -225,9 +274,11 @@ Three of these are worth understanding rather than copying:
   window launches about seven times (every challenger at admission, the king, every challenger
   again for its arm), a few minutes each; a Conductor whose card was given away is re-served on
   its next turn. `--serve-cards` names the cards and their ports, reached here on the forwarded
-  ports (§2); `--serve-trees` is the host-side directory behind `<state>/trees`; `--serve-preamble`
-  is the toolchain export the launch script runs first. **The host gets a launch script and
-  nothing else** — no Docker, no credential; weights are parsed by `safetensors` with no code
+  ports (§2); `--serve-trees` is the host-side directory behind `<state>/trees`, and the one
+  challenger trees are fetched and hashed into and a king is published from (§2, *Fetch and
+  promotion run on the serving host*); `--serve-preamble` is the toolchain export the launch
+  script runs first. **The host gets scripts and short-lived presigned URLs, and nothing else** —
+  no Docker, no credential; weights are parsed by `safetensors` with no code
   path, and §2.1 guarantees the model's output never reaches an executor. One server per distinct
   tree: vLLM answers every alias with its first served name, so two names on one server are
   refused by the identity check (measured 2026-09-08). **A load that does not come up is

@@ -58,6 +58,7 @@ import json
 import shlex
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -112,7 +113,42 @@ KERNEL_CONFIG = ('{"moe_backend":"triton","linear_backend":"triton",'
 
 
 class ServeError(Exception):
-    """The serving stack is unreachable, unhealthy, or serving weights we did not ask for."""
+    """The serving stack is unreachable, unhealthy, or serving weights we did not ask for.
+
+    A PLAIN `ServeError` IS THE OWNER'S FAILURE at admission (§8b.2): the runner's non-zero exit, an
+    endpoint that answered wrongly, a launch that could not be attributed. Only the `LoadFailure`
+    subclass says the tree itself could not be served, and only that one spends a shot.
+    """
+
+
+class EndpointUnreachable(ServeError):
+    """No HTTP response at all — refused, reset, timed out, unroutable. Distinct from an endpoint
+    that answered, because only a response proves the path from this validator to the port works.
+    It names the symptom in messages only: whose failure a readiness timeout was is decided by the
+    serving host's own answer (`readiness_verdict`), never by this type. Still a `ServeError`, so
+    every existing `except ServeError` keeps catching it."""
+
+
+class LoadFailure(ServeError):
+    """The serving host could not load THIS tree: the process exited with a recognisable load error,
+    or stayed alive with nothing listening on its port until the readiness deadline (§8b.2's load
+    timeout). Raised only from `RemoteServing`'s readiness path, after the host was asked why, so
+    it is the one serving failure the validator charges to the artifact.
+
+    `log_tail` is the end of the server's log, kept for the operator's log and never published: it
+    can carry the host's paths, driver and environment, and the reveal is public.
+    """
+
+    def __init__(self, message: str, *, log_tail: str = "") -> None:
+        super().__init__(message)
+        self.log_tail = log_tail
+
+
+class ServingOutage(ServeError):
+    """The readiness diagnosis PROVED the serving path itself is down: the host did not answer the
+    runner, or the host serves the name locally while this validator cannot reach it. Neither is a
+    thing a tree can cause, so the validator defers and does not count the window toward
+    `MAX_INFRA_DEFERRALS` — an outage must not walk healthy trees toward refusal."""
 
 
 # A proxy-free opener, deliberately. `urllib` honours `http_proxy`/`ALL_PROXY` from the environment,
@@ -242,11 +278,16 @@ class ServedConductor:
         try:
             with _OPENER.open(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode())
-        except (OSError, ValueError) as exc:
-            # `URLError` and `HTTPError` are both `OSError`s, and that width is deliberate: a 400
-            # from an over-long prompt, a 500 from a crashed engine, a refused connection and a body
-            # that is not JSON are the same kind of thing here — the validator's own infrastructure,
-            # never the miner's routing.
+        except urllib.error.HTTPError as exc:
+            # A 400 from an over-long prompt, a 500 from a crashed engine and a body that is not JSON
+            # are the same kind of thing here — the validator's own infrastructure, never the
+            # miner's routing — so all of them stay a `ServeError`. What is split off below is only
+            # the case with NO response, because readiness needs to know whether the path to the
+            # port works at all.
+            raise ServeError(f"{url}: {exc}") from exc
+        except OSError as exc:
+            raise EndpointUnreachable(f"{url}: {exc}") from exc
+        except ValueError as exc:
             raise ServeError(f"{url}: {exc}") from exc
         if not isinstance(payload, Mapping):
             raise ServeError(f"{url}: expected a JSON object, got {type(payload).__name__}")
@@ -367,9 +408,124 @@ nohup /root/launch-{port}.sh > /root/vllm-{port}.log 2>&1 &
 echo $!
 """
 
+# --- whose failure a readiness timeout is (§8b.2) ---------------------------------------------------
+#
+# A load that never comes up and a tunnel that died look identical from here: `/v1/models` does not
+# answer. §8b.2 charges the first to the tree and the "Kind" property forbids charging the second, so
+# at the deadline the host is ASKED, through the same runner, three things a dead tunnel cannot fake:
+# is the process `_RESTART_PORT` started (by the pid it printed, never by a name pattern, which would
+# find a stale server left on the port) still alive; does anything listen on its port on the host; and
+# what does the host's own `/v1/models` list. The log tail comes back beside them.
+#
+# The script carries no credential and names only a pid and a port; `curl` is optional (without it
+# the listing reads `unavailable` and a live listener is left unattributed, which is the safe side).
+_DIAGNOSIS_MARKER = "# thirtyspokes readiness diagnosis"
+DIAGNOSIS_LOG_LINES = 80
+_DIAGNOSE_PORT = _DIAGNOSIS_MARKER + """
+if kill -0 {pid} 2>/dev/null; then echo process=alive; else echo process=exited; fi
+if (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null; then echo port=open; else echo port=closed; fi
+models=$(curl -s -m 5 http://127.0.0.1:{port}/v1/models 2>/dev/null | tr -d '\\n')
+echo "models=${{models:-unavailable}}"
+echo ---
+tail -n {lines} /root/vllm-{port}.log 2>/dev/null || true
+"""
+_PROBE_MARKER = "# thirtyspokes serving probe"
+_PROBE = _PROBE_MARKER + "\necho thirtyspokes-probe-ok\n"
+
+# The load errors that are a fact about the TREE: the safetensors loader's own error names for a
+# file whose header or offsets it cannot honour (admission reads headers, not the offsets against
+# the file's length). A closed list, matched against the log tail of a process that EXITED.
+#
+# OUT OF MEMORY IS DELIBERATELY ABSENT. Admission pins every tensor's name, shape and dtype and the
+# launch pins the context, the concurrency and the memory fraction, so an admitted tree has the
+# reference's footprint to the byte — the king loads the same shape on the same card. An OOM is
+# therefore far more likely the owner's (a card not freed: an engine process that outlived the port's
+# pkill) than the tree's, and it is treated as owner-side, counted and capped. A stack upgrade that
+# rewords one of these names lands on the same safe side.
+LOAD_ERROR_MARKERS = ("SafetensorError", "HeaderTooLarge", "HeaderTooSmall",
+                      "InvalidHeaderDeserialization", "MetadataIncompleteBuffer", "InvalidOffset")
+
+
+def _launched_pid(output: str) -> str | None:
+    """The pid `_RESTART_PORT` printed on its last line, or None. Digits only: it is interpolated
+    into the diagnosis script, and anything else could not be attributed anyway."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines and lines[-1].isdigit() else None
+
+
+def _not_served(gpu: int, port: int, served_model: str, ready_timeout: float,
+                evicted: str | None) -> str:
+    return (f"card {gpu} (port {port}) did not serve {served_model!r} within {ready_timeout:.0f}s"
+            + (f" after evicting {evicted!r}" if evicted else ""))
+
+
+def readiness_verdict(output: str, *, last: BaseException, gpu: int, port: int,
+                      served_model: str, ready_timeout: float,
+                      evicted: str | None = None) -> ServeError:
+    """What the host's answer to `_DIAGNOSE_PORT` says a readiness timeout was. PURE: output in,
+    exception out, so every rule is testable without a socket.
+
+    * process EXITED with a `LOAD_ERROR_MARKERS` line in its log -> `LoadFailure` (the tree);
+    * process EXITED with no such line -> plain `ServeError` (owner-side: a killed process, a broken
+      toolchain, an OOM — see the markers' note);
+    * process ALIVE and the host's own `/v1/models` lists the name -> `ServingOutage`: the host
+      serves it and this validator cannot reach it, which is the forward;
+    * process ALIVE and the host lists OTHER names -> `ServingOutage`: another server holds the port,
+      which no tree can cause (a stale server the port's pkill did not clear);
+    * process ALIVE and nothing listens on the port at the deadline -> `LoadFailure`: the load did
+      not finish in time, which is §8b.2's load timeout;
+    * process ALIVE, the port open, the listing unreadable (no `curl`) -> plain `ServeError`: a slow
+      load cannot be told from a broken forward, so it is not charged to the tree;
+    * an answer that does not parse -> plain `ServeError`.
+    """
+    head, _, tail = output.partition("\n---\n")
+    fields = dict(line.split("=", 1) for line in head.splitlines() if "=" in line)
+    what = _not_served(gpu, port, served_model, ready_timeout, evicted)
+    log = f"; read /root/vllm-{port}.log on the serving host"
+    process, listening, listing = fields.get("process"), fields.get("port"), fields.get("models")
+    if process not in ("alive", "exited") or listening not in ("open", "closed") or listing is None:
+        return ServeError(f"{what}: the serving host's readiness diagnosis could not be read "
+                          f"({type(last).__name__}){log}")
+    if process == "exited":
+        marker = next((m for m in LOAD_ERROR_MARKERS if m in tail), None)
+        if marker is not None:
+            return LoadFailure(f"{what}: vLLM exited with {marker} while loading the tree{log}",
+                               log_tail=tail)
+        return ServeError(f"{what}: the process exited without a recognisable load error{log}")
+    names = _listed(listing)
+    if names is not None:
+        if served_model in names:
+            return ServingOutage(f"{what}: the serving host serves it, but this validator cannot "
+                                 f"reach it ({type(last).__name__}) — the forward is down")
+        return ServingOutage(f"{what}: another server holds the port on the serving host, "
+                             f"serving {names!r}")
+    if listening == "closed":
+        return LoadFailure(f"{what}: the process is alive and nothing listens on its port at the "
+                           f"deadline, so the load did not finish in time{log}", log_tail=tail)
+    return ServeError(f"{what}: the port is open on the serving host but its model listing could "
+                      f"not be read there, so a slow load cannot be told from a broken forward "
+                      f"({type(last).__name__}){log}")
+
+
+def _listed(listing: str) -> tuple[str, ...] | None:
+    """The model names in the host's own `/v1/models` body, or None if it did not answer one."""
+    try:
+        rows = json.loads(listing).get("data")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    return tuple(str(row.get("id")) for row in rows if isinstance(row, Mapping))
+
 
 def ssh_runner(host: str, *, timeout: float = 180.0) -> Runner:
-    """A `Runner` over ssh: the script goes to `bash -s` on stdin, stdout comes back."""
+    """A `Runner` over ssh: the script goes to `bash -s` on stdin, stdout comes back.
+
+    Every way this fails is the OWNER'S at admission (§8b.2), and it is left as its own type for the
+    validator to read: a non-zero exit is a plain `ServeError`, a hung link `subprocess.
+    TimeoutExpired`, a missing ssh binary an `OSError`. None of them is a `LoadFailure`, because none
+    of them says anything about the tree.
+    """
     import subprocess  # noqa: PLC0415
 
     def run(script: str) -> str:
@@ -437,6 +593,13 @@ class RemoteServing:
         self.ensure(Path(model_dir), served_model)
         return ManagedConductor(serving=self, model_dir=Path(model_dir), served_model=served_model)
 
+    def probe(self) -> None:
+        """Raise unless the serving host answers through the runner. The validator's cheap evidence
+        that a serve-stage failure happened while the serving path WORKED, which is what lets that
+        window count toward `MAX_INFRA_DEFERRALS`; an outage fails this and counts nothing."""
+        if "thirtyspokes-probe-ok" not in self.run(_PROBE):
+            raise ServeError("the serving host did not answer the probe")
+
     def ensure(self, model_dir: Path, served_model: str) -> ServedConductor:
         """The card serving `served_model`, launched if none is. Under the lock: one arm's
         `EPISODE_CONCURRENCY` threads all ask at once and exactly one launch must happen."""
@@ -457,7 +620,8 @@ class RemoteServing:
         line = launch_command(f"{self.trees}/{model_dir.name}", served_model, gpu=card.gpu,
                               port=card.port)
         script = _LAUNCH_SCRIPT.format(preamble=self.preamble, line=line)
-        self.run(_RESTART_PORT.format(port=card.port, script=script))
+        # A runner failure here propagates as itself (`ssh_runner`): the owner's, never the tree's.
+        pid = _launched_pid(self.run(_RESTART_PORT.format(port=card.port, script=script)))
         self.launches.append((card.gpu, card.port, served_model))
         conductor = ServedConductor(base_url=card.base_url, served_model=served_model,
                                     timeout=self.conductor_timeout)
@@ -468,20 +632,40 @@ class RemoteServing:
                 break
             except ServeError as exc:
                 if self.clock() >= deadline:
-                    raise ServeError(
-                        f"card {card.gpu} (port {card.port}) did not serve {served_model!r} "
-                        f"within {self.ready_timeout:.0f}s"
-                        + (f" after evicting {evicted!r}" if evicted else "")
-                        + f": {exc}; read /root/vllm-{card.port}.log on the serving host") from exc
+                    raise self._diagnose(card, served_model, pid, exc, evicted) from exc
                 self.sleep(self.poll_seconds)
         card.served, card.conductor = served_model, conductor
+
+    def _diagnose(self, card: Card, served_model: str, pid: str | None, last: ServeError,
+                  evicted: str | None) -> ServeError:
+        """Ask the host whose failure this timeout was (the section note above `_DIAGNOSE_PORT`).
+        Returned, not raised, so `_launch` chains it from the last readiness error."""
+        what = _not_served(card.gpu, card.port, served_model, self.ready_timeout, evicted)
+        if pid is None:
+            return ServeError(f"{what}: the launch printed no process id, so the failure cannot be "
+                              f"attributed to the tree ({last}); read /root/vllm-{card.port}.log "
+                              f"on the serving host")
+        try:
+            output = self.run(_DIAGNOSE_PORT.format(pid=pid, port=card.port,
+                                                    lines=DIAGNOSIS_LOG_LINES))
+        except Exception as exc:          # noqa: BLE001 — any runner failure means the host is gone
+            return ServingOutage(f"{what}: the serving host did not answer the readiness diagnosis "
+                                 f"({type(exc).__name__})")
+        return readiness_verdict(output, last=last, gpu=card.gpu, port=card.port,
+                                 served_model=served_model, ready_timeout=self.ready_timeout,
+                                 evicted=evicted)
 
 
 @dataclass
 class ManagedConductor:
     """A Conductor over a card that may be given away and taken back: every `act` goes through
     `RemoteServing.ensure`, so a challenger served in phase 3 and evicted by the king in phase 4 is
-    served again on its first turn in phase 5, on whichever card is least recently used."""
+    served again on its first turn in phase 5, on whichever card is least recently used.
+
+    A re-serve that fails in phase 5 propagates out of the window, which is retried whole. A
+    `LoadFailure` there for a tree phase 3 already loaded is contradictory evidence — the same bytes
+    loaded once — and is almost certainly the owner's; it is not a refusal, because nothing outside
+    phase 3 refuses."""
 
     serving: RemoteServing
     model_dir: Path

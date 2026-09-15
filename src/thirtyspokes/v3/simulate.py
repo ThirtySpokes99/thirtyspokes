@@ -525,6 +525,12 @@ class Validator:
         load timeout or an OOM — and §8b.2 gives them one consequence: the submission is invalid,
         the shot is spent, the king is not charged. Narrowing it to `AdmissionError` would let an
         OOM crash the window instead, which spends every OTHER queued miner's shot on our failure.
+
+        THE DAEMON IS NARROWER, AND DELIBERATELY SO. `validator.Validator._admit` has seams this
+        offline mechanism does not — a bucket, a trees mount, a serving host behind a runner — and
+        those fail for the OWNER's reasons, so it classifies by type (`validator.ARTIFACT_FAILURES`)
+        and defers anything that is not the artifact's, capped at `MAX_INFRA_DEFERRALS`. Here every
+        failure a `Submission` can raise is the submission's own, so one consequence is still right.
         """
         admit(sub.model_tree, self.reference)
         return sub.serve()

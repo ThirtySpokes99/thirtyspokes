@@ -1058,10 +1058,42 @@ is a denial-of-service on the validator and a drain on the king's allowance.
 | per-Conductor-call token cap | truncate; unparseable output counts as a parse failure |
 | per-episode wall clock | abandon the episode, score the task 0 for that arm |
 | per-duel wall clock | abandon remaining tasks; drop them from **both** arms of that duel and publish the count |
-| model load timeout / OOM | submission is **invalid**, shot spent, king not charged |
+| invalid artifact or genuine load failure — manifest not the committed one, missing or extra objects, a file's digest or size, a §1.1 check, a load that exits with the loader's own error or never becomes ready | submission is **invalid**, shot spent, king not charged |
+| owner-side failure during fetch, check or load — store transport or credentials, the local disk or trees mount, the serving host or its runner, the forwarded endpoint | **deferred**, shot intact; refused only after `MAX_INFRA_DEFERRALS` counted windows |
 
 The load check runs **before** the king's arm is touched, so a broken challenger never costs the
 king anything.
+
+**Whose failure it was is decided by its type, never by its message.** Exactly three failures are
+the artifact's: the bytes are not the committed submission, the tree is not the pinned architecture,
+or the serving host could not load it. Everything else at admission is the owner's — including a
+failure nobody anticipated, because the one-shot rule exists to protect miners from the owner's
+failures, and a wrong deferral costs a bounded delay where a wrong refusal is permanent.
+
+**A load timeout is not assumed; the serving host is asked.** A load that never finishes and a
+tunnel that died look identical from the validator: the endpoint does not answer. So at the deadline
+the validator asks the host, through the same runner that launched the server, whether the launched
+process (by its pid) is alive, whether anything listens on its port there, and what the host's own
+model listing says. A host that cannot be reached, or one that serves the model while the validator
+cannot see it, is an outage. A process that exited with the loader's own error, or that is alive with
+nothing listening at the deadline, is the tree's. **Out of memory is not counted as the tree's**: admission
+pins every tensor's name, shape and dtype and the launch pins the context and memory fraction, so an
+admitted tree has the reference's footprint, and an OOM is far likelier a card the owner did not
+free. It is treated as owner-side, counted and capped.
+
+**Why the deferral is capped, and what counts.** A deferred entry keeps its queue slot, so a tree
+that deterministically reproduced an owner-side-looking failure would otherwise hold it forever. An
+entry is refused on its `MAX_INFRA_DEFERRALS + 1`th **counted** window, and a window counts only when
+the failing stage demonstrably worked in it — another entry got past that stage, or a probe of that
+resource (the bucket, the trees disk, the serving host) succeeded — and the failure is not an outage
+on its face (a storage link error, a serving path the diagnosis proved down). A link error is read
+off the errno wherever it survives — on the exception itself, including a disk write inside a
+download, or as the cause a transport library wrapped, but never beneath a serving error, whose
+type already carries the readiness diagnosis's verdict and which a reset forward under it must not
+overrule — and the check stage's probe also asks for
+the tree directory the fetch just created, because a detached mount leaves a writable mountpoint
+behind. An outage that fails every entry therefore defers them all without counting, and cannot walk
+a queue of healthy trees toward refusal.
 
 **What the per-duel wall clock bounds, since a limit with no stated scope cannot be enforced.** It
 bounds **one arm**, not the pair: §5.4's sizing is per arm (~250 tasks at ~15 min with ~40-way

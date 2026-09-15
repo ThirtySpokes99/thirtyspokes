@@ -447,6 +447,20 @@ MAX_DUELS_PER_WINDOW = 3
 # and accepting the money first makes it worse rather than kinder.
 MAX_QUEUE_DEPTH = 2 * MAX_DUELS_PER_WINDOW
 
+# §8b.2: an OWNER-SIDE failure at admission (the store, the trees disk, the serving host, the runner)
+# defers the entry with its shot intact, because the "Kind" property forbids spending a miner's one
+# submission on the owner's infrastructure. Unbounded, that kindness is a squat: a tree that
+# deterministically reproduces an owner-side-looking failure (a path the disk cannot create, a load
+# that dies without a recognisable error) would hold its queue slot forever. So each registration
+# may be deferred this many COUNTED windows; the (MAX_INFRA_DEFERRALS + 1)th counted window refuses
+# it and spends the shot. A window is COUNTED only when the failing stage demonstrably worked in that
+# window — another entry got past it, or a probe of that resource succeeded — so an outage that hits
+# every entry defers without counting, and cannot walk a queue of healthy trees toward refusal.
+# Three is of the order of the drain §8b.1 sizes immunity for: past it, "the owner keeps failing on
+# exactly this tree while working for everything else" is better explained by the tree. Not a
+# schedule input; it changes no committed root.
+MAX_INFRA_DEFERRALS = 3
+
 # --- the verdict (§5.2, D10) ----------------------------------------------------------------------
 # On the `final` scale (quality minus priced spend) — five points of benchmark score.
 #

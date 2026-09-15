@@ -73,8 +73,10 @@ import concurrent.futures
 import threading
 
 import argparse
+import errno
 import hashlib
 import json
+import os
 import re
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
@@ -84,7 +86,7 @@ from pathlib import Path
 from ..gateway import signing
 from ..koth import holdout_feed
 from .access import AccessError, Mailbox, Registration
-from .admission import Reference, admit
+from .admission import AdmissionError, Reference, admit
 from .benchmarks.base import check_protocol
 from .chain import (Chain, Commitment, Metagraph, SerialisedChain, WeightRateLimited,
                     check_weight_cadence, same_weight_distribution, serialised)
@@ -95,7 +97,8 @@ from .config import (
     RETEST_MAX_USD,
     DUEL_WALL_CLOCK_REASON, DUEL_WALL_CLOCK_SECONDS, EPISODE_CONCURRENCY, EPS,
                      EXCLUDED_REASON, FUTILE_REASON, KING_ZERO_NAME, MAX_DUELS_PER_WINDOW,
-                     MAX_QUEUE_DEPTH, MIN_SLICE_REACHED, UNCLAIMED_GRACE_SECONDS)
+                     MAX_INFRA_DEFERRALS, MAX_QUEUE_DEPTH, MIN_SLICE_REACHED,
+                     UNCLAIMED_GRACE_SECONDS)
 from .duel import Contender
 from .emissions import KING0, Lineage, emission_weights
 from .funding import KEY_NAME, SealedKey, open_key
@@ -108,11 +111,12 @@ from .reference import ReferenceArm, power_gate, subsample
 # constructor here would be a second definition of that row, and the two would drift silently.
 from .scaffold import OutcomeTable, Scaffold, _unreached, task_order
 from .score import ArmScore, best_possible_final, score_arm
-from .serve import DEFAULT_PREAMBLE, ServedConductor, ServeError, remote_serving
+from .serve import (DEFAULT_PREAMBLE, LoadFailure, ServedConductor, ServeError, ServingOutage,
+                    remote_serving)
 from .simulate import (DEFERRED, DUELLED, REFUSED, SKIPPED, UNQUEUED, Outcome, Pins, WindowReport,
                        _clocked, _exhausted, _GraderGuard, _king_too_thin, _pairs, _why,
                        adjudicate, format_window, priced)
-from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, apply_retention,
+from .store import (GRACE_SECONDS, MANIFEST_NAME, Retention, S3Bucket, StoreError, apply_retention,
                     delete_prefix, fetch_manifest, fetch_submission, promote_submission,
                     retention_plan, unclaimed_plan)
 from .types import Action, EpisodeResult, Observation, StepRecord, ToolCall
@@ -163,6 +167,75 @@ PROMOTION_MAX_ATTEMPTS = 8
 # exponent capped at 8), so the eight attempts span a little over an hour. Retrying on every poll
 # instead would spend the whole budget inside a few minutes of an R2 blip.
 PROMOTION_RETRY_BASE_SECONDS = 30.0
+
+# §8b.2: WHOSE FAILURE AN ADMISSION FAILURE WAS, DECIDED BY TYPE AND NEVER BY MESSAGE. These three are
+# the only exceptions a tree decides, and the only ones that spend its shot:
+#
+#   `StoreError`     the bytes are not the committed submission: manifest digest, hotkey,
+#                    registration or signature mismatch, no manifest (an interrupted upload), extra
+#                    or missing objects, a file whose digest or size is not the manifest's;
+#   `AdmissionError` the tree is not the pinned architecture (§1.1), parser limits included;
+#   `LoadFailure`    the serving host could not load it, established by asking the host
+#                    (`serve.readiness_verdict`), never inferred from a timeout alone.
+#
+# EVERYTHING ELSE IS THE OWNER'S: `store.StoreUnavailable` (a bucket read that failed — deliberately
+# not a `StoreError`), `OSError` from the trees mount or the local disk, a plain `ServeError` (the
+# runner's non-zero exit, an endpoint that answered wrongly), `subprocess.TimeoutExpired`, and any
+# type nobody anticipated. The last is a decision, not a default: the one-shot rule exists to protect
+# miners from the owner's failures, an unclassified exception is by definition one the owner did not
+# foresee, and `MAX_INFRA_DEFERRALS` turns a wrong deferral into a bounded delay where a wrong
+# refusal would be permanent.
+#
+# This composes with a fetch that runs on the serving host through the runner: there a miner-caused
+# mismatch is still a plain `StoreError`, and a runner or transport failure still arrives as
+# `ServeError`, `TimeoutExpired` or `OSError`.
+ARTIFACT_FAILURES: tuple[type[BaseException], ...] = (StoreError, AdmissionError, LoadFailure)
+
+# The three stages of `_admit`, in order. An owner-side failure is attributed to the stage it
+# happened in, because that is the resource a probe has to check before the window may count.
+FETCH, CHECK, LOAD = "fetch", "check", "load"
+_STAGE_WORDS = {FETCH: "fetching and hashing", CHECK: "checking", LOAD: "loading"}
+
+# `errno`s that describe the LINK to storage, never its content: a tree cannot make a mount return
+# EIO or drop its transport. An `OSError` carrying one of these is an outage on its face and never
+# counts toward `MAX_INFRA_DEFERRALS`, however healthy a probe a moment later looks — the failure the
+# cap must not mistake for a tree is exactly an sshfs mount that EIOs through a long read and then
+# answers a small one.
+_TRANSPORT_ERRNOS = frozenset({errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.ETIMEDOUT,
+                               errno.ECONNABORTED, errno.ECONNRESET, errno.EHOSTUNREACH,
+                               errno.ENETUNREACH})
+
+# How far down an exception's `__cause__` / `__context__` chain a link errno is looked for. A
+# transport library wraps the socket's `OSError` (a reset under botocore, say) in a type of its own;
+# the chain is where the errno survives. Bounded, because a chain can loop.
+_CAUSE_DEPTH = 8
+
+
+def _link_failure(exc: BaseException) -> bool:
+    """True when `exc`, or anything it was raised from, is an `OSError` carrying a link errno.
+
+    A tree cannot put a socket reset or a mount's EIO into the chain of the exception it causes, so
+    finding one anywhere down the chain is as much an outage on its face as finding it on top.
+
+    THE WALK STOPS AT A `ServeError`, because the serving path states its own attribution by type
+    (§8b.2): `ServingOutage` for a path the diagnosis proved down, `LoadFailure` for the tree, a
+    plain `ServeError` for a failure it could not attribute. A readiness verdict is raised FROM the
+    last readiness error, and a forward whose remote end closed resets rather than refuses, so a
+    diagnosed "host answered, process died" would otherwise carry an ECONNRESET in its chain and be
+    read as an uncounted outage — a tree that reproducibly kills the server would then never reach
+    `MAX_INFRA_DEFERRALS`. The transport symptom under a verdict is what the diagnosis already
+    weighed; it must not overrule it.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(_CAUSE_DEPTH):
+        if current is None or id(current) in seen or isinstance(current, ServeError):
+            return False
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in _TRANSPORT_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -327,7 +400,10 @@ def chain_beacon(substrate, cadence: Cadence) -> Callable[[int], str]:
 # LOAD CHECK: it must raise if this tree cannot be served, because the daemon calls it for the whole
 # queue before the king's arm so that a broken challenger never costs the king money. An
 # implementation that defers the real load to the first `act()` satisfies the type and breaks the
-# rule.
+# rule. WHAT it raises decides whose failure it was (`ARTIFACT_FAILURES`): `serve.LoadFailure` for a
+# tree that cannot be served, anything else for the owner's own. An optional `probe()` attribute,
+# raising unless the serving path works, is what lets a serve-stage failure count toward
+# `MAX_INFRA_DEFERRALS` on a window where nothing else was served.
 Serve = Callable[[Path, str], Conductor]
 
 
@@ -357,9 +433,15 @@ def local_serving(base_url: str, *, timeout: float = 180.0) -> Serve:
     SEVERAL SERVERS, COMMA-SEPARATED. `serve.launch_command`'s own arrangement is two cards, two
     servers — the king on one, a challenger on the other — and a name is served by exactly one of
     them, so the first endpoint that lists it is the one used. With one URL every failure is
-    passed through untouched (the daemon records it as the refusal it is); with several, the
-    refusal names every endpoint asked. Measured 2026-09-08 on testnet 526: a third challenger
-    with different weights needed its own server, and one URL could not name it.
+    passed through untouched; with several, the refusal names every endpoint asked. Measured
+    2026-09-08 on testnet 526: a third challenger with different weights needed its own server, and
+    one URL could not name it.
+
+    NOTHING HERE IS A `LoadFailure`. This daemon does not own the load, so it cannot ask a host why
+    a name is absent, and an operator who has not launched a tree yet is not the tree's fault: a
+    failure here DEFERS (§8b.2). `probe` — every endpoint answers `/v1/models` at all — is what lets
+    a window count toward `MAX_INFRA_DEFERRALS`, so a name nobody ever serves is refused at the cap
+    rather than queued forever.
     """
     urls = [url.strip() for url in base_url.split(",") if url.strip()]
 
@@ -376,6 +458,12 @@ def local_serving(base_url: str, *, timeout: float = 180.0) -> Serve:
             raise refusals[0]
         raise ServeError(f"no endpoint serves {served_model!r}: "
                          + "; ".join(str(exc) for exc in refusals))
+
+    def probe() -> None:
+        for url in urls:
+            ServedConductor(base_url=url, served_model="", timeout=timeout)._json("models")
+
+    serve.probe = probe                   # type: ignore[attr-defined] — `Serve`'s optional probe
     return serve
 
 
@@ -570,6 +658,14 @@ class History:
     a settled window whose reveal was never published — and D15's entry ramp would lose a window's
     traces for good. The reveal is written locally as part of persisting, so the restart re-does only
     the publish.
+
+    `infra_deferrals` is the one exception to append-only, and it is a counter, not a verdict: per
+    registration, the windows in which an owner-side failure at admission was COUNTED against it
+    (§8b.2, `config.MAX_INFRA_DEFERRALS`). Keyed by registration rather than hotkey because the shot
+    it protects is a submission's; a SET of windows so a window retried after a crash counts once;
+    saved at once, because a crash before `settle` must not reset it. A state file written before it
+    existed loads with none, and `STATE_VERSION` does not move: the field is additive, as every
+    earlier one was.
     """
 
     def __init__(self, path: Path | str) -> None:
@@ -590,6 +686,8 @@ class History:
         # because a reign inferred from the per-window king cannot say WHY the last one ended —
         # §5.5's reversion and a dethroning look identical from the outside, and they are not.
         self.reigns: list[dict] = []
+        # registration_id -> {hotkey, windows, cause}: see the class docstring.
+        self.infra_deferrals: dict[str, dict] = {}
         self._restore()
 
     # --- reads ------------------------------------------------------------------------------
@@ -602,6 +700,10 @@ class History:
 
     def lineage(self) -> Lineage:
         return Lineage.from_coronations(self.coronations)
+
+    def infra_deferral_count(self, registration_id: str) -> int:
+        """How many windows have counted an owner-side admission failure against this entry."""
+        return len(self.infra_deferrals.get(registration_id, {}).get("windows", ()))
 
     # --- writes -----------------------------------------------------------------------------
     def settle(self, window: int, *, crowned: str | None, judged: Iterable[str],
@@ -623,6 +725,26 @@ class History:
         if crowned is not None:
             self.coronations.append(crowned)
         self.windows[window] = {"crowned": crowned, "published": False}
+        self.save()
+
+    def record_infra_deferral(self, registration_id: str, *, hotkey: str, window: int,
+                              cause: str) -> int:
+        """Count `window` against this entry (once, however often the window is retried) and
+        return how many windows now count."""
+        entry = self.infra_deferrals.setdefault(registration_id, {"windows": []})
+        entry.update(hotkey=hotkey, cause=cause,
+                     windows=sorted(set(entry.get("windows", ())) | {int(window)}))
+        self.save()
+        return len(entry["windows"])
+
+    def forget_infra_deferral(self, registration_id: str, window: int) -> None:
+        """A retry of `window` admitted the entry, so that window's owner-side failure did not stand."""
+        entry = self.infra_deferrals.get(registration_id)
+        if entry is None or int(window) not in entry.get("windows", ()):
+            return
+        entry["windows"] = [w for w in entry["windows"] if w != int(window)]
+        if not entry["windows"]:
+            del self.infra_deferrals[registration_id]
         self.save()
 
     def mark_published(self, window: int) -> None:
@@ -698,6 +820,8 @@ class History:
             "judged_at": {hotkey: dict(entry) for hotkey, entry in sorted(self.judged_at.items())},
             "purged": sorted(self.purged),
             "reigns": [dict(reign) for reign in self.reigns],
+            "infra_deferrals": {rid: dict(entry)
+                                for rid, entry in sorted(self.infra_deferrals.items())},
         }, sort_keys=True), encoding="utf-8")
         temporary.replace(self.path)
 
@@ -714,6 +838,10 @@ class History:
         self.judged_at = {str(k): dict(v) for k, v in state.get("judged_at", {}).items()}
         self.purged = set(state.get("purged", ()))
         self.reigns = [dict(reign) for reign in state.get("reigns", ())]
+        self.infra_deferrals = {
+            str(rid): {"hotkey": str(entry.get("hotkey", "")), "cause": str(entry.get("cause", "")),
+                       "windows": sorted({int(w) for w in entry.get("windows", ())})}
+            for rid, entry in state.get("infra_deferrals", {}).items()}
         if not self.reigns and self.windows:
             # A state file written before reigns were recorded. The crown it carries is reign 1, and
             # the earliest settled window is the earliest window it can honestly claim.
@@ -1240,17 +1368,24 @@ class Validator:
         admitted: list[tuple[Queued, Conductor]] = []
         judged: list[str] = []
         deferred = 0
+        # §8b.2's owner-side failures: (entry, exception, stage, probe result). Their outcome is
+        # decided AFTER the loop, because whether a window counts toward `MAX_INFRA_DEFERRALS` can
+        # rest on another entry getting past the same stage, and a later entry is as good a
+        # witness as an earlier one.
+        owner_side: list[tuple[Queued, Exception, str, bool | None]] = []
+        worked: set[str] = set()
         for queued in queue:
             if len(admitted) == MAX_DUELS_PER_WINDOW:
                 # §8b.1's DUEL cap. Deferred BEFORE `_admit`, so a full window costs the overflow the
                 # wait and not a ~72 GB pull, and counted against ADMITTED challengers — deferring a
                 # live one because somebody else's upload was broken would spend the clock on
-                # nothing. `_wait` is §8b.1's published queue wait.
+                # nothing. `_wait` is §8b.1's published queue wait; the rank includes this window's
+                # owner-side deferrals, which are ahead of the overflow in the next window's queue.
                 outcomes.append(Outcome(
                     queued.hotkey, queued.block, DEFERRED,
                     f"the window is full at MAX_DUELS_PER_WINDOW={MAX_DUELS_PER_WINDOW}; rolls over "
-                    f"with its shot unspent, expected wait {self._wait(deferred)} window(s) "
-                    f"(§8b.1)"))
+                    f"with its shot unspent, expected wait "
+                    f"{self._wait(deferred + len(owner_side))} window(s) (§8b.1)"))
                 deferred += 1
                 continue
             if self.gateway.balance(queued.hotkey) <= 0.0:
@@ -1274,15 +1409,38 @@ class Validator:
                         f"is not spent and the entry is judged in the first window after it is "
                         f"funded")))
                 continue
+            reached: list[str] = []
             try:
-                admitted.append((queued, self._admit(queued)))
-            except Exception as exc:      # noqa: BLE001 — see `_admit`: OOM and load timeouts too
-                # An invalid artifact SPENDS THE SHOT: it was judged, and the answer was no (§8b.2).
-                # That is not the same as `DEFERRED`, which our own failures produce, and the
-                # difference is the whole "Kind" property — so `judged` grows here and not only
-                # after a duel.
+                conductor = self._admit(queued, reached)
+            except Exception as exc:      # noqa: BLE001 — classified by type: `ARTIFACT_FAILURES`
+                stage = reached[-1] if reached else FETCH
+                worked.update(reached[:-1])
+                if isinstance(exc, ARTIFACT_FAILURES):
+                    # An invalid artifact SPENDS THE SHOT: it was judged, and the answer was no
+                    # (§8b.2). That is not the same as `DEFERRED`, which our own failures produce,
+                    # and the difference is the whole "Kind" property — so `judged` grows here and
+                    # not only after a duel.
+                    if getattr(exc, "log_tail", ""):
+                        self._log(f"window {opened.epoch}: {queued.hotkey} could not be loaded; "
+                                  f"the serving host's log ends:\n{exc.log_tail}")
+                    judged.append(queued.hotkey)
+                    outcomes.append(Outcome(queued.hotkey, queued.block, REFUSED,
+                                            f"artifact: {exc}"))
+                else:
+                    self._log(f"window {opened.epoch}: {queued.hotkey}: owner-side failure while "
+                              f"{_STAGE_WORDS[stage]} ({type(exc).__name__}: {exc})")
+                    owner_side.append((queued, exc, stage, self._stage_works(stage, queued)))
+            else:
+                admitted.append((queued, conductor))
+                worked.update(reached)
+                self.history.forget_infra_deferral(queued.registration.registration_id,
+                                                   opened.epoch)
+        for queued, exc, stage, probed in owner_side:
+            row = self._owner_side_outcome(queued, exc, stage=stage, window=opened.epoch,
+                                           works=stage in worked if probed is None else probed)
+            if row.shot_spent:
                 judged.append(queued.hotkey)
-                outcomes.append(Outcome(queued.hotkey, queued.block, REFUSED, str(exc)))
+            outcomes.append(row)
 
         # PHASE 4 — the king's arm, ONCE, and only if something is left to duel it (§5.2a, D13).
         king_results: tuple[EpisodeResult, ...] = ()
@@ -1613,29 +1771,126 @@ class Validator:
         """
         return rank // MAX_DUELS_PER_WINDOW + 1
 
-    def _admit(self, queued: Queued) -> Conductor:
+    def _admit(self, queued: Queued, reached: list[str] | None = None) -> Conductor:
         """§8b.2's pre-flight, run before the king's arm: bytes, then architecture, then the load.
 
         ORDER IS THE DESIGN, and it is `store.py`'s: the manifest is checked against the on-chain
         commitment first, so a tree that is not the one committed to is refused for the price of one
         small object rather than an hour of transfer; then every file is hashed as it lands, so a
         swapped shard is refused at that shard; then `admit` reads headers only (§1.1); then the
-        serving stack is asked to load it, which is where an OOM or a load timeout appears.
+        serving stack is asked to load it. Each stage's name is appended to `reached` as it starts,
+        so the caller knows which resource an owner-side failure happened on.
 
-        Every one of those is `REFUSED` at the call site: the submission is invalid, the shot is
-        spent, and the king is not charged (§8b.2). The `except` there is broad because these three
-        failures are of three different kinds and §8b.2 gives them one consequence — narrowing it
-        would let an OOM crash the window instead, which spends every OTHER queued miner's shot on
-        our failure.
+        WHAT A RAISE MEANS IS ITS TYPE (`ARTIFACT_FAILURES`, whose comment is the full audit). A
+        `StoreError`, an `AdmissionError` or a `LoadFailure` is the artifact's: REFUSED, the shot
+        spent, the king not charged. Anything else is the owner's — a bucket that would not answer,
+        a mount that returned EIO, a runner that timed out, a tunnel that died, a type nobody
+        anticipated — and DEFERS with the shot intact, up to `MAX_INFRA_DEFERRALS` counted windows.
+        The call site's `except` stays broad for the reason it always had: a raise that escaped it
+        would crash the window, and every OTHER queued miner would pay for our failure with a delay.
         """
-        dest = self.root / "trees" / queued.registration.registration_id
+        reached = [] if reached is None else reached
+        dest = self._tree_dir(queued)
+        reached.append(FETCH)
         manifest = fetch_submission(self.private_models, dest, commitment=queued.commitment,
                                     registration=queued.registration)
+        reached.append(CHECK)
+        # EVERY NAMED FILE IS STILL ON DISK, ASKED WITH `os.stat` SO THE ANSWER CANNOT BE SWALLOWED.
+        # `admit` asks `Path.is_file`, which reads ENOENT as "no such file" — so a trees mount that
+        # detached after the fetch would reach it as an empty tree and be refused as "config.json is
+        # missing", spending the shot on our mount. Here the same absence is an `OSError`: owner-side.
+        # The fetch already refused any tree whose files are not exactly the manifest's, so after
+        # this every "missing" refusal `admit` can still raise names a file the miner never uploaded.
+        for item in manifest.files:
+            os.stat(dest / item.path)
         admit(dest, self.reference)
         # Kept, not published: §7's name is the miner's, and D14 makes a submission public only if
         # it wins. It reaches a reveal through the crown and nowhere else.
         self._admitted_names[queued.hotkey] = manifest.model_name or ""
+        reached.append(LOAD)
         return self.serve(dest, served_name(queued.commitment))
+
+    def _tree_dir(self, queued: Queued) -> Path:
+        """Where `_admit` materialises this entry's tree, one directory per registration."""
+        return self.root / "trees" / queued.registration.registration_id
+
+    def _stage_works(self, stage: str, queued: Queued) -> bool | None:
+        """Probe, right after an owner-side failure, whether the stage's resource works NOW: the
+        bucket (a listing of this entry's prefix) and the trees disk (a write read back) for the
+        fetch; for the check, the disk and the entry's own tree directory, which the fetch that just
+        succeeded created; the `Serve`'s own `probe` for the load. None when the `Serve` offers no
+        probe, and the window's other entries are then the only witness.
+
+        WHY THE CHECK ALSO ASKS FOR THE TREE DIRECTORY. A trees mount that detaches leaves its
+        mountpoint behind as an ordinary writable local directory, so the sentinel write passes on
+        the wrong filesystem. The tree directory the fetch created is not there any more, and its
+        absence is what proves the storage, not the tree, lost the files.
+
+        Run at failure time rather than after the loop, because phase 3 lasts hours and the question
+        is whether the resource worked when THIS entry failed on it.
+        """
+        try:
+            if stage == LOAD:
+                probe = getattr(self.serve, "probe", None)
+                if probe is None:
+                    return None
+                probe()
+            else:
+                if stage == FETCH:
+                    self.private_models.list(queued.registration.prefix)
+                else:
+                    os.stat(self._tree_dir(queued))
+                trees = self.root / "trees"
+                trees.mkdir(parents=True, exist_ok=True)
+                sentinel = trees / ".probe"
+                sentinel.write_bytes(b"thirtyspokes")
+                if sentinel.read_bytes() != b"thirtyspokes":
+                    raise OSError(errno.EIO, "the trees probe read back different bytes")
+                sentinel.unlink()
+        except Exception as exc:          # noqa: BLE001 — any failure means the resource is down
+            self._log(f"probe of the {stage} stage failed ({type(exc).__name__}: {exc})")
+            return False
+        return True
+
+    def _owner_side_outcome(self, queued: Queued, exc: BaseException, *, stage: str, window: int,
+                            works: bool) -> Outcome:
+        """§8b.2's owner-side row: DEFERRED with the shot intact, unless the cap is spent.
+
+        A window COUNTS toward `MAX_INFRA_DEFERRALS` only when the failure could be the tree's: the
+        failing stage worked (`works`) and the failure is not an outage on its face (a
+        `ServingOutage`, or an `OSError` whose errno is the link's, on top of the exception or
+        down its chain as far as the first `ServeError`, whose type is the serving path's own
+        verdict — `_link_failure`). An outage that hits every entry
+        therefore defers them all without counting, and cannot walk healthy trees toward refusal;
+        a tree that reproduces the failure alone is refused on its (MAX + 1)th counted window.
+
+        PUBLISHED BY TYPE ONLY, as `_promote` publishes a store failure: the exception's text can
+        carry the account endpoint, a host path or ssh's stderr, and the reveal is public. The full
+        text is already in the operator's log.
+        """
+        registration_id = queued.registration.registration_id
+        cause, doing = type(exc).__name__, _STAGE_WORDS[stage]
+        outage = isinstance(exc, ServingOutage) or _link_failure(exc)
+        if outage or not works:
+            return Outcome(queued.hotkey, queued.block, DEFERRED,
+                           f"owner-side (outage, not counted): {cause} while {doing} this "
+                           f"submission, and that stage was not working for this window; the shot "
+                           f"is not spent and the entry is retried next window "
+                           f"({self.history.infra_deferral_count(registration_id)} of "
+                           f"MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS} counted)")
+        counted = self.history.record_infra_deferral(registration_id, hotkey=queued.hotkey,
+                                                     window=window, cause=cause)
+        if counted <= MAX_INFRA_DEFERRALS:
+            return Outcome(queued.hotkey, queued.block, DEFERRED,
+                           f"owner-side: {cause} while {doing} this submission; the shot is not "
+                           f"spent and the entry is retried next window ({counted} of "
+                           f"MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS} counted)")
+        return Outcome(queued.hotkey, queued.block, REFUSED,
+                       f"owner-side, deferral cap reached: {cause} while {doing} this submission "
+                       f"in {counted} windows in which that stage worked, more than "
+                       f"MAX_INFRA_DEFERRALS={MAX_INFRA_DEFERRALS}; a tree that keeps reproducing "
+                       f"an owner-side failure cannot hold its queue slot forever, so the shot is "
+                       f"spent")
 
     def _king_conductor(self, crown: Crown) -> Conductor:
         if crown.is_king_zero:

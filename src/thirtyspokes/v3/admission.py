@@ -169,12 +169,26 @@ def admit(root: Path, reference: Reference) -> None:
     consequences rather than a cause, and a miner reading the refusal should see the cause; within
     it the custom-code fields are refused before the architecture is compared, for the same reason
     the file checks come first.
+
+    EVERY FAILURE THE TREE DECIDES IS AN `AdmissionError`, including the parser's own limits. A
+    config or header nested past the recursion limit (in `json.loads`, or in the recursive
+    custom-code walk over a config `json.loads` accepted) raises `RecursionError`, and a number past
+    a float's range `OverflowError` — deterministic functions of the bytes, so they are refusals.
+    Left as themselves they would reach the validator as an unclassified exception, which §8b.2
+    treats as the owner's and retries until the deferral cap. `OSError` is NOT converted: a read
+    that fails on the trees mount is the owner's disk, not the miner's tree.
     """
-    _refuse_pickle_archives(root)
-    _refuse_bundled_code(root)
-    _check_config(root, reference)
-    _check_tensors(root, reference)
-    _check_tokenizer(root, reference)
+    try:
+        _refuse_pickle_archives(root)
+        _refuse_bundled_code(root)
+        _check_config(root, reference)
+        _check_tensors(root, reference)
+        _check_tokenizer(root, reference)
+    except (RecursionError, OverflowError, UnicodeError) as exc:
+        raise AdmissionError(
+            f"the tree could not be parsed: {type(exc).__name__} — a config.json or safetensors "
+            f"header nested or sized past what the parser accepts is not the pinned "
+            f"architecture") from exc
 
 
 # The two that name the whole artifact rather than one tower inside it.

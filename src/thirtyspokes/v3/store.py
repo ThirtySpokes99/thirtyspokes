@@ -136,6 +136,25 @@ class StoreError(Exception):
     """
 
 
+class StoreUnavailable(Exception):
+    """The bucket could not be READ while fetching a submission — a fact about the owner's link or
+    credentials, never about the tree (§8b.2: an owner-side failure defers, it does not refuse).
+    An `OSError` raised inside a read is not wrapped (`_read` says why): only errors that carry no
+    errno of their own become this type.
+
+    DELIBERATELY NOT A `StoreError`. `StoreError` means "this is not the committed submission" and
+    spends a shot; the validator classifies by type, and a subclass would make
+    `isinstance(exc, StoreError)` true during an outage, so any `except StoreError` that forgot to
+    test the subclass first would spend a miner's shot on the owner's downtime — the exact failure
+    this type exists to prevent. Raised only by `fetch_submission`'s reads: the other callers of
+    `S3Bucket` (upload's retry, promotion, retention, the absence checks) keep the raw exception
+    they classify by.
+
+    The message is built here from the operation, the key and the cause's TYPE, never `str(cause)`,
+    which can carry the account endpoint; the cause itself is chained for the operator's log.
+    """
+
+
 # --- the manifest --------------------------------------------------------------------------------
 
 
@@ -589,7 +608,8 @@ def fetch_manifest(bucket: S3Bucket, prefix: str) -> Manifest:
     The absence is read off a LISTING rather than off a failed GET, deliberately. A GET that threw
     would make "the object is not there" and "the owner's credentials expired" the same exception,
     and treating the second as the first would refuse a valid submission for an owner-side outage —
-    spending a hotkey's one shot on the owner's own downtime.
+    spending a hotkey's one shot on the owner's own downtime. At duel time `fetch_submission` makes
+    that distinction a type: a read that raises there is `StoreUnavailable`, which defers.
     """
     key = prefix + MANIFEST_NAME
     if key not in bucket.list(prefix):
@@ -618,10 +638,18 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
       appear under the prefix. An UNLISTED extra is refused rather than ignored, because "ignored"
       means the validator materialises a file the commitment does not cover. The one named
       exception is the `access.KEY_PREFIX` sub-prefix, which holds the miner's sealed OpenRouter
-      key, is read by the validator's funding step and never materialised.
+      key, is read by the validator's funding step and never materialised. A named file the
+      prefix lacks is refused BEFORE any download, so it surfaces as the artifact's fault rather
+      than as a failed GET that would read like the owner's.
+
+    WHAT IS NOT A REFUSAL (§8b.2). Every `StoreError` above is decided by what the miner uploaded.
+    A bucket read that raises is wrapped as `StoreUnavailable`, and an `OSError` from the local disk
+    or the trees mount (a hash read-back, a write, including the write inside a download) propagates
+    as itself with its errno; the validator defers both with the shot intact. The classification is by type, so this function never has to guess.
     """
     signal = commitment.ready
-    manifest = fetch_manifest(bucket, registration.prefix)
+    manifest = _read("read the manifest under", registration.prefix,
+                     lambda: fetch_manifest(bucket, registration.prefix))
     if manifest.sha256 != signal.manifest_sha256:
         raise StoreError(f"manifest digest {manifest.sha256} is not the committed "
                          f"{signal.manifest_sha256}")
@@ -634,7 +662,8 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
         raise StoreError(f"manifest is not signed by {manifest.hotkey}: {exc}") from exc
 
     prefix = registration.prefix
-    listed = {key[len(prefix):] for key in bucket.list(prefix) if key.startswith(prefix)}
+    listed = {key[len(prefix):] for key in _read("list", prefix, lambda: bucket.list(prefix))
+              if key.startswith(prefix)}
     # `KEY_PREFIX` is the ONE place beside `manifest.json` the manifest need not name: the miner's
     # sealed OpenRouter key lives there (`funding.py`), is not part of the tree, is never
     # materialised here, and is meant to be replaced after the commit — so it cannot be in a digest
@@ -646,6 +675,12 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
                    and not name.startswith(KEY_PREFIX))
     if extra:
         raise StoreError(f"{prefix} carries files the manifest does not name: {extra}")
+    # The other half of the same bullet. Checked against the listing, before any byte moves: a named
+    # file that was never uploaded would otherwise surface as the download's own 404 — an exception
+    # that reads exactly like an owner-side failure and would be deferred instead of refused.
+    missing = sorted(item.path for item in manifest.files if item.path not in listed)
+    if missing:
+        raise StoreError(f"{prefix} lacks files the manifest names: {missing}")
 
     dest.mkdir(parents=True, exist_ok=True)
     marker = dest.parent / f"{dest.name}{VERIFIED_MARKER}"    # beside the tree, never inside it
@@ -659,7 +694,8 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
         # a tree is pulled once and resident (§8b.1, §11-7).
         if not (target.is_file() and target.stat().st_size == item.size
                 and sha256_file(target) == item.sha256):
-            bucket.download_file(prefix + item.path, target)
+            _read("download", prefix + item.path,
+                  lambda key=prefix + item.path, path=target: bucket.download_file(key, path))
             observed = sha256_file(target)
             if observed != item.sha256:
                 raise StoreError(f"{item.path} hashes to {observed}, the committed manifest "
@@ -669,6 +705,33 @@ def fetch_submission(bucket: S3Bucket, dest: Path, *, commitment: Commitment,
                                  f"manifest says {item.size}")
     marker.write_text(manifest.sha256, encoding="utf-8")
     return manifest
+
+
+def _read(operation: str, key: str, call: Callable[[], Any]) -> Any:
+    """One bucket read on the admission path: a `StoreError` passes (the artifact's fault), an
+    `OSError` passes AS ITSELF, and anything else becomes `StoreUnavailable` (the owner's —
+    `StoreUnavailable` says why it is not a subclass).
+
+    WHY `OSError` IS NOT WRAPPED. `download_file` writes the object to the trees mount inside the same
+    call, so an EIO or ENOTCONN from that mount part-way through a long download surfaces here. The
+    validator reads a link `errno` as an outage on its face that never counts toward
+    `MAX_INFRA_DEFERRALS`; wrapping it would hide the errno, and a mount that fails long writes but
+    answers a small probe would then walk a valid tree toward refusal. An `OSError` is the owner's
+    either way (§8b.2), so letting it through loses nothing. What is wrapped is what carries no errno:
+    botocore's transport and credential errors.
+
+    Not `S3Bucket`'s own behaviour, on purpose: upload's retry classifies the raw botocore error by
+    class name, promotion publishes its type, and `_absent` reads absence off it. Here nobody needs
+    the raw class, and everybody needs to know whose failure it was. A 404 on a key the listing just
+    returned lands here too: a race, or a miner deleting after the commit, and the deferral cap
+    bounds the second.
+    """
+    try:
+        return call()
+    except (StoreError, OSError):
+        raise
+    except Exception as exc:        # noqa: BLE001 — classified into a type the validator reads
+        raise StoreUnavailable(f"could not {operation} {key}: {type(exc).__name__}") from exc
 
 
 def _verified(marker: Path, manifest: Manifest, dest: Path) -> bool:
@@ -873,6 +936,7 @@ __all__ = [
     "FILE_WORKERS", "GRACE_SECONDS", "MANIFEST_NAME", "MULTIPART_THRESHOLD", "Manifest",
     "UPLOAD_ATTEMPTS", "UPLOAD_BACKOFF_SECONDS",
     "ManifestFile", "PART_SIZE", "PART_STREAMS", "Retention", "S3Bucket", "StoreError",
+    "StoreUnavailable",
     "UploadReport", "apply_retention", "build_manifest", "fetch_manifest", "fetch_submission",
     "PUBLIC_MODEL_ROOT", "promote_submission", "public_model_prefix",
     "MODEL_NAME", "RESERVED_NAME_PREFIX", "check_model_name",

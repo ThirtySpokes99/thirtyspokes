@@ -280,8 +280,13 @@ runs — and so is a commit that landed past the queue's depth cap. When your wi
 file against your manifest, admits it, serves it, runs the king's arm and yours on the same slice,
 and publishes the verdict — `final`, the four conditions, per-benchmark deltas, and where your
 allowance ran out if it did — in the window's reveal and on the [dashboard](https://thirtyspokes.ai/dashboard).
-A refusal is final for that hotkey; a new attempt is a new hotkey, a new registration and a new
-70 GB.
+An artifact refusal (`refused`, detail starting `artifact:`) is final for that hotkey; a new
+attempt is a new hotkey, a new registration and a new 70 GB. A failure of the owner's own
+infrastructure while fetching, checking or loading your tree (detail starting `owner-side`) is
+**deferred** with the shot intact and retried next window. Such a deferral counts against your
+entry only on a window where that stage worked for everything else. After `MAX_INFRA_DEFERRALS` (3)
+counted windows, the next counted one refuses the entry, because a tree that alone keeps reproducing
+the failure cannot hold its queue slot forever.
 
 #### Downloading the king
 
@@ -329,6 +334,9 @@ any HTTP client that fetches the same paths will do.
 | `… has already committed manifest …` | this hotkey's shot is spent | a new hotkey |
 | the upload died mid-way (`SSL … EOF`, `Connection reset`) | the link dropped for longer than the retries cover | run `submit` again: it re-hashes the tree, then skips every file the bucket already holds with the right digest and sends only the rest; the shot is spent only when `manifest.json` lands and the ready signal is committed |
 | your entry shows `deferred` in the reveal | no key and no credit, or the queue was full | `register-key` (step 6); a deferred shot is intact |
+| `deferred` with `owner-side: …` or `owner-side (outage, not counted): …` | the owner's store, disk, serving host or tunnel failed while handling your tree | nothing; it is retried next window with the shot intact. `N of MAX_INFRA_DEFERRALS` counted is how many windows it failed alone |
+| `refused` with `artifact: …` | the tree is not the committed submission, not the pinned architecture, or could not be loaded | the shot is spent; the detail names the mismatch — a new attempt is a new hotkey |
+| `refused` with `owner-side, deferral cap reached` | the same owner-side-looking failure recurred alone on more than `MAX_INFRA_DEFERRALS` windows | the shot is spent; ask the owner, whose log holds the full error |
 | `deferred` with `OpenRouter refused the registered key (HTTP 401)` | the key is dead or mistyped | register a live one (`register-key` again) |
 | `deferred` with `has nothing to spend this window` | the account behind the key is empty, its limit is used up, or the cap is zero | add credits at openrouter.ai, raise the key's limit, or re-register with a larger `--cap-usd` |
 | `deferred` with `the registered OpenRouter key cannot be used` | the record was sealed to another owner key, or signed by another hotkey | re-run `register-key` from this wallet without `--owner-key` — on netuid 99 the pinned key is the right one |
@@ -439,7 +447,9 @@ and is a grant, not the rail.
 
 Register the key before your entry is judged: an arm with no key and no credit is **deferred**,
 not judged, and so is one whose key the provider refuses or whose account is empty — the shot stays
-intact and the entry is judged in the first window after it is funded. If an arm exhausts its cap
+intact and the entry is judged in the first window after it is funded. The same holds when the
+owner's own store, disk or serving host fails while handling your tree: that entry is deferred as
+`owner-side`, not refused (step 8 of §1a). If an arm exhausts its cap
 mid-slice, the remaining tasks are published as `budget_exhausted` and score zero — distinct in
 the reveal from a model that stalled and from a validator that ran out of clock, because those are
 three different findings. A 401 or 402 from the provider mid-arm is counted as `unfunded_calls`,
